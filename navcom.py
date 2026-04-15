@@ -580,9 +580,13 @@ def main():
             "\n"
             "  navcom --query \"drizzle\"                  Search everything, show context\n"
             "  navcom --query \"drizzle\" --compact         Just hits + snippets, one line each\n"
-            "  navcom --query \"drizzle\" --summary         Search + LLM summarizes each chunk\n"
-            "  navcom --query \"drizzle\" --summary --summary-mode reduce\n"
-            "                                             One consolidated summary across all\n"
+            "  navcom --query \"drizzle\" --solo             One fast summary across all hits\n"
+            "  navcom --query \"drizzle\" --summary         Per-chunk summaries (more detail)\n"
+            "\n"
+            "  TIP: --solo is the fastest way to catch up on a topic. Raw output\n"
+            "  (no --solo/--summary) is great when piping to your current LLM:\n"
+            "    navcom --query \"auth\" --compact | claude -p \"summarize this\"\n"
+            "    navcom --query \"auth\" --compact | gemini -p \"summarize this\"\n"
             "\n"
             "═══════════════════════════════════════════════════════════════════\n"
             " FILTER BY PROVIDER (default: all)\n"
@@ -598,24 +602,31 @@ def main():
             " SUMMARIZATION — who does the thinking?\n"
             "═══════════════════════════════════════════════════════════════════\n"
             "\n"
-            "  --summary                  Smart fallback: Claude → Gemini → Ollama\n"
-            "  --summary --llmgemini      Force Gemini to summarize (no Claude hooks)\n"
-            "  --summary --ollama         Force local Ollama (gemma3:4b, no cloud)\n"
-            "  --summary --summary-mode reduce\n"
-            "                             Combine all chunks into ONE summary\n"
+            "  --solo                     One fast consolidated summary (recommended)\n"
+            "  --solo --llmgemini         Use Gemini instead of Claude (cleaner, no hooks)\n"
+            "  --solo --ollama            Use local Ollama (offline, no cloud)\n"
+            "  --summary                  Per-chunk summaries (more detail, slower)\n"
+            "  --summary --llmgemini      Per-chunk via Gemini\n"
+            "\n"
+            "  LLM fallback chain: Claude sonnet → Gemini flash → Ollama → raw\n"
+            "  Engines that fail are cached for 1hr to avoid repeated timeouts.\n"
             "\n"
             "═══════════════════════════════════════════════════════════════════\n"
             " OUTPUT MODES\n"
             "═══════════════════════════════════════════════════════════════════\n"
             "\n"
-            "  (default)    Windowed turns around each hit. Tuned for real context.\n"
-            "               1 turn before/after, 200 char max per turn.\n"
+            "  (default)    Windowed turns around each hit. Raw text — your current\n"
+            "               LLM can always summarize if you pipe it.\n"
+            "               Best for: reading context yourself, or piping to an LLM.\n"
             "\n"
             "  --compact    One line per hit — conversation list + snippets.\n"
             "               Best for: \"which conversations mentioned X?\"\n"
             "\n"
-            "  --summary    LLM reads the full turns and writes a summary.\n"
+            "  --solo       One consolidated LLM summary across all hits (~6 seconds).\n"
             "               Best for: \"catch me up on what happened with X\"\n"
+            "\n"
+            "  --summary    Per-chunk LLM summaries (one per conversation file).\n"
+            "               Best for: detailed per-session breakdown.\n"
             "\n"
             "═══════════════════════════════════════════════════════════════════\n"
             " TUNING KNOBS\n"
@@ -631,23 +642,29 @@ def main():
             " REAL USE CASES\n"
             "═══════════════════════════════════════════════════════════════════\n"
             "\n"
-            "  # What happened with the Drizzle migration?\n"
-            "  navcom --query \"drizzle migration\" --summary --summary-mode reduce\n"
+            "  # Catch me up on the Drizzle migration\n"
+            "  navcom --query \"drizzle migration\" --solo\n"
+            "\n"
+            "  # Same but use Gemini to summarize (no Claude hook noise)\n"
+            "  navcom --query \"drizzle migration\" --solo --llmgemini\n"
             "\n"
             "  # Which Gemini sessions talked about Terraform?\n"
             "  navcom --query \"terraform\" --gemini --compact\n"
             "\n"
-            "  # Deep dive into a specific conversation\n"
-            "  navcom --query \"cognito auth\" --window-turns 5 --max-chars 0\n"
-            "\n"
-            "  # Get Gemini's take on what happened (no Claude hook noise)\n"
-            "  navcom --query \"deploy\" --summary --llmgemini --summary-mode reduce\n"
-            "\n"
             "  # Quick: what conversations exist about Prisma?\n"
             "  navcom --query \"prisma\" --compact\n"
             "\n"
+            "  # Deep dive into a specific conversation\n"
+            "  navcom --query \"cognito auth\" --window-turns 5 --max-chars 0\n"
+            "\n"
+            "  # Pipe raw output to your current LLM session\n"
+            "  navcom --query \"deploy\" --compact | claude -p \"summarize\"\n"
+            "\n"
             "  # Custom prompt for a specific kind of summary\n"
-            "  navcom --query \"schema\" --summary --prompt \"List every table name mentioned\"\n"
+            "  navcom --query \"schema\" --solo --prompt \"List every table name mentioned\"\n"
+            "\n"
+            "  # Detailed per-session breakdown\n"
+            "  navcom --query \"migration\" --summary --claude\n"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
@@ -685,6 +702,7 @@ def main():
     parser.add_argument("--max-chars", type=int, default=200, help="Max chars per turn output (default: 200, 0 = no limit).")
     parser.add_argument("--compact", action="store_true", help="Show only the banner + FTS snippets, no full turn expansion. Fast and concise.")
     parser.add_argument("--summary", action="store_true", help="Summarize the extracted window or transcript.")
+    parser.add_argument("--solo", action="store_true", help="One consolidated summary across all hits. Shortcut for --summary --summary-mode reduce.")
     parser.add_argument("--summary-model", default=SUMMARY_MODEL_DEFAULT, help="Summary model name.")
     parser.add_argument(
         "--summary-mode",
@@ -708,6 +726,9 @@ def main():
 
     if args.prompt:
         args.summary = True
+    if args.solo:
+        args.summary = True
+        args.summary_mode = "reduce"
 
     providers = []
     specific = args.codex or args.claude or args.gemini or args.this
