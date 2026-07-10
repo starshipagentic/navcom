@@ -10,6 +10,7 @@ Synthesize log_clean_quick + log_search_fts5 into one tool that:
 
 This file embeds full copies of both scripts for reference and function reuse.
 """
+# Repo lives under github.com/starshipagentic/navcom.
 
 import argparse
 import json
