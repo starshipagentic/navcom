@@ -189,10 +189,67 @@ def index_targets(conn, targets):
         index_clean_file(conn, target, provider)
 
 
+_FTS_SAFE_BAREWORD = re.compile(r'^[A-Za-z0-9_]+$')
+
+
+def _fts_cook_token(token):
+    """Turn one whitespace-delimited user token into a safe FTS5 query atom.
+
+    - AND/OR/NOT pass through as boolean operators.
+    - Tokens using explicit FTS5 syntax (``*``, ``(``, ``)``) are left untouched
+      so power users can still hand-write query expressions.
+    - Plain alphanumeric words get a trailing ``*`` for forgiving prefix matching.
+    - Anything containing punctuation (hyphens, periods, apostrophes like
+      ``don't``, colons, etc.) is wrapped in a double-quoted FTS5 string so the
+      MATCH parser treats it literally instead of as query syntax, then
+      prefix-matched on its trailing token.
+    - Punctuation-only tokens (``--``, ``...``) drop out — nothing to match.
+    """
+    upper = token.upper()
+    if upper in ("AND", "OR", "NOT"):
+        return token
+    if "*" in token or "(" in token or ")" in token:
+        return token
+    if _FTS_SAFE_BAREWORD.match(token):
+        return f"{token}*"
+    if not any(ch.isalnum() for ch in token):
+        return ""
+    escaped = token.replace('"', '""')
+    return f'"{escaped}"*'
+
+
+def fts_prefix_query(query):
+    """Prefix-cook a raw user query into a valid FTS5 MATCH expression.
+
+    Replaces the embedded ``apply_prefix_query``, which passed unquoted tokens
+    straight through and raised ``fts5: syntax error`` on hyphens, periods,
+    apostrophes, and colons (e.g. ``don't``, ``log-search``, ``v0.1.3``).
+    Explicit user ``"quoted phrases"`` are preserved and prefix-matched on the
+    trailing token. Returns an empty string when nothing indexable remains.
+    """
+    if not query:
+        return ""
+    parts = re.split(r'(".*?")', query)
+    out_parts = []
+    for part in parts:
+        if len(part) >= 2 and part.startswith('"') and part.endswith('"'):
+            inner = part[1:-1].strip()
+            if inner:
+                out_parts.append(f'"{inner}"*')
+        else:
+            for token in part.split():
+                cooked = _fts_cook_token(token)
+                if cooked:
+                    out_parts.append(cooked)
+    return " ".join(out_parts).strip()
+
+
 def search_hits(conn, query, providers=None, files=None, limit=20, snippet_tokens=250, no_prefix=False):
     cooked = query
     if not no_prefix:
-        cooked = fts_mod.apply_prefix_query(cooked)
+        cooked = fts_prefix_query(cooked)
+    if not cooked or not cooked.strip():
+        return []
     if providers:
         hits = []
         for provider in providers:
