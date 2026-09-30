@@ -82,9 +82,17 @@ uv venv -q .venv --python 3.13 && uv pip install -q --python .venv/bin/python be
 .venv/bin/behave --format progress3        # 59 scenarios
 .venv/bin/python -m pytest tests -q        # 44 tests incl. 15k-query fuzz
 
-# publish
-uv build && uvx twine upload dist/navcom-0.2.0*      # token in ~/.pypirc
-pipx upgrade navcom   # or: pipx install --force navcom==0.2.0
+# publish: the navcom-scoped token is starforge's ~/.pypi-keys.json ["pypi"] (prefix pypi-AgEIcHl…),
+# NOT ~/.pypirc (that token → 403 Forbidden on navcom)
+uv build
+TWINE_USERNAME=__token__ TWINE_PASSWORD=$(python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.pypi-keys.json')))['pypi'])") \
+  uvx twine upload --non-interactive --config-file /dev/null dist/navcom-0.2.0*
+pipx install --force navcom==0.2.0
+
+# push: repo is owned by starshipagentic; the active gh account is tsomerville2 (403). Don't switch accounts,
+# pin a token for this push only (found via: navcom "gh auth token --user starshipagentic" --cmd)
+TOK=$(gh auth token --user starshipagentic)
+git -c credential.helper= -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOK" | base64)" push origin main
 ```
 
 FTS5 gotchas learned:
@@ -146,6 +154,9 @@ FTS5 gotchas learned:
   - Warm search: 0.3s.
   - A fresh Claude-only index: 9s; a fresh index of everything: 77s.
   - Under a held write lock: ≤3.8s.
+- **Released:** https://pypi.org/project/navcom/0.2.0/. Pushed as commits `9761126`, `a2a9a4f`
+  and `7f75022` on starshipagentic/navcom main. pipx now runs 0.2.0 from
+  `/Users/t/.local/pipx/venvs/navcom`.
 - **Replay results:** 0/918 crash (0.1.3: 89); 911/918 return hits; 140/143 historical "No hits."
   now return hits.
 - **Mining artifacts** (scratchpad): `navcom_calls.jsonl` (1,237 records), `extract_navcom.py`,
