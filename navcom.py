@@ -2,17 +2,19 @@
 """
 navcom.py
 ==========
-Synthesize log_clean_quick + log_search_fts5 into one tool that:
-1) cleans turns using log_clean_quick logic
-2) indexes the cleaned turns with FTS5
-3) searches clean text and returns windows around hits
-4) optionally summarizes those windows
+Super-fast search over past AI coding-agent sessions (Claude Code, Codex,
+Gemini CLI, pi, omo, opencode, goose):
+1) cleans each session into user / assistant / cmd turns
+2) indexes the cleaned turns with SQLite FTS5 (incremental, shared index)
+3) searches them — compact hits by default, windows with --context, --open to read
+4) optionally summarizes those windows with whatever LLM CLI is around
 
-This file embeds full copies of both scripts for reference and function reuse.
+This file embeds full copies of log_clean_quick + log_search_fts5 for function reuse.
 """
 # Repo lives under github.com/starshipagentic/navcom.
 
 import argparse
+import io
 import json
 import shutil
 import subprocess
@@ -53,6 +55,20 @@ def load_module(code, name):
 clean_mod = load_module(LOG_CLEAN_QUICK_CODE, "log_clean_quick")
 fts_mod = load_module(LOG_SEARCH_FTS5_CODE, "log_search_fts5")
 
+NAVCOM_VERSION = "0.2.0"
+
+# Every harness navcom knows how to read. Order = display order in help/listings.
+ALL_PROVIDERS = ["claude", "codex", "gemini", "pi", "omo", "opencode", "goose"]
+PROVIDER_ALIASES = {
+    "claude-code": "claude", "cc": "claude",
+    "openai": "codex",
+    "gemini-cli": "gemini",
+    "pi-mono": "pi", "pi-dev": "pi",
+    "omo-ai": "omo", "oh-my-openagent": "omo",
+    "open-code": "opencode", "oc": "opencode",
+    "block-goose": "goose",
+}
+
 
 @dataclass
 class Hit:
@@ -89,182 +105,1315 @@ VERBOSITY_WINDOW = {
 }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Output styling — plain text unless stdout is a real terminal. LLM shell tools
+# capture stdout through a pipe, and raw ANSI escapes are pure noise to them.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _Style:
+    PROVIDER_CODES = {
+        "claude": "95", "gemini": "94", "codex": "93", "pi": "92",
+        "omo": "96", "opencode": "36", "goose": "33",
+    }
+
+    def __init__(self):
+        self.enabled = False
+
+    def configure(self, mode="auto"):
+        if mode == "always":
+            self.enabled = True
+        elif mode == "never":
+            self.enabled = False
+        elif os.environ.get("NO_COLOR"):
+            self.enabled = False
+        elif os.environ.get("FORCE_COLOR"):
+            self.enabled = True
+        else:
+            try:
+                self.enabled = sys.stdout.isatty()
+            except Exception:
+                self.enabled = False
+
+    def _wrap(self, code, text):
+        return f"\033[{code}m{text}\033[0m" if self.enabled else text
+
+    def dim(self, text):
+        return self._wrap("2", text)
+
+    def warn(self, text):
+        return self._wrap("93", text)
+
+    def role(self, text):
+        return self._wrap("96", text)
+
+    def provider(self, name, text=None):
+        return self._wrap(self.PROVIDER_CODES.get(name, "0"), name if text is None else text)
+
+    def highlight(self, snippet):
+        """Snippets arrive with «match» markers; color them on a TTY, keep the markers otherwise."""
+        if not self.enabled:
+            return snippet
+        return snippet.replace("«", "\033[1;33m").replace("»", "\033[0m")
+
+
+STYLE = _Style()
+
+
+def safe_print(text=""):
+    try:
+        print(text)
+    except BrokenPipeError:
+        try:
+            sys.stdout = open(os.devnull, "w")
+        except Exception:
+            pass
+        raise SystemExit(0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Where each harness keeps its sessions
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _env_path(*names):
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return Path(value).expanduser()
+    return None
+
+
+def _xdg_data_home():
+    return Path(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")).expanduser()
+
+
+def pi_sessions_root():
+    explicit = _env_path("PI_CODING_AGENT_SESSION_DIR")
+    if explicit:
+        return explicit
+    return (_env_path("PI_CODING_AGENT_DIR") or Path.home() / ".pi" / "agent") / "sessions"
+
+
+def omo_sessions_root():
+    explicit = _env_path("OMO_CODING_AGENT_SESSION_DIR")
+    if explicit:
+        return explicit
+    return (_env_path("OMO_CODING_AGENT_DIR") or Path.home() / ".omo" / "agent") / "sessions"
+
+
+def opencode_data_root():
+    return _env_path("OPENCODE_DATA_DIR") or _xdg_data_home() / "opencode"
+
+
+def goose_session_roots():
+    roots = []
+    path_root = _env_path("GOOSE_PATH_ROOT")
+    if path_root:
+        roots.append(path_root / "data" / "sessions")
+    roots.append(_xdg_data_home() / "goose" / "sessions")
+    roots.append(Path.home() / "Library" / "Application Support" / "Block" / "goose" / "sessions")
+    out, seen = [], set()
+    for root in roots:
+        key = str(root)
+        if key not in seen:
+            seen.add(key)
+            out.append(root)
+    return out
+
+
+def provider_roots():
+    """provider -> list of directories/databases navcom reads (for --where)."""
+    return {
+        "claude": [fts_mod.claude_projects_root()],
+        "codex": [fts_mod.codex_sessions_root()],
+        "gemini": [fts_mod.gemini_tmp_root()],
+        "pi": [pi_sessions_root()],
+        "omo": [omo_sessions_root()],
+        "opencode": [opencode_data_root() / "opencode.db", opencode_data_root() / "storage" / "message"],
+        "goose": [r / "sessions.db" for r in goose_session_roots()] + goose_session_roots(),
+    }
+
+
 def default_index_path():
+    explicit = _env_path("NAVCOM_INDEX")
+    if explicit:
+        return explicit
     codex_home = os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex"))
     return Path(codex_home) / "navcom-index.sqlite"
 
 
+# A log is (key, mtime, size, provider). For file-backed harnesses the key is the
+# file path; for database-backed ones (opencode, goose) it is "<db>#<session id>".
+_PROVIDER_BY_KEY = {}
+
+
 def detect_provider_from_path(path):
     path_str = str(path)
-    if path_str.endswith(".json"):
-        return "gemini"
+    if path_str in _PROVIDER_BY_KEY:
+        return _PROVIDER_BY_KEY[path_str]
+    if "opencode" in path_str:
+        return "opencode"
+    if "goose" in path_str:
+        return "goose"
     if "/.claude/" in path_str:
         return "claude"
-    if "/.codex/" in path_str:
-        return "codex"
+    if "/.omo/" in path_str:
+        return "omo"
+    if "/.pi/" in path_str:
+        return "pi"
+    if "/.gemini/" in path_str or path_str.endswith(".json"):
+        return "gemini"
     return "codex"
 
 
-def list_logs(providers, codex_root=None, claude_root=None, gemini_root=None):
+def _file_logs(paths, provider):
     logs = []
-    if "codex" in providers:
-        logs.extend(fts_mod.list_jsonl_logs(fts_mod.codex_sessions_root(codex_root), "codex"))
-    if "claude" in providers:
-        logs.extend(fts_mod.list_jsonl_logs(fts_mod.claude_projects_root(claude_root), "claude"))
-    if "gemini" in providers:
-        logs.extend(fts_mod.list_gemini_logs(fts_mod.gemini_tmp_root(gemini_root), "gemini"))
-    logs.sort(key=lambda x: x[1])
+    for path in paths:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        logs.append((str(path), stat.st_mtime, stat.st_size, provider))
     return logs
 
 
-def select_targets(logs, providers, recent=0, all_logs=False, file=None, latest=False):
-    if all_logs or recent == 0:
-        return [p for p, _, _, _ in logs]
-    if file:
-        if file.isdigit():
-            idx = int(file)
-            if idx < 0 or idx >= len(logs):
-                raise ValueError(f"Index out of range: {idx}")
-            return [logs[idx][0]]
-        return [Path(file).expanduser()]
-    if latest:
-        return [logs[-1][0]]
-    return fts_mod.select_recent_targets(logs, providers, recent)
+def _rglob(root, pattern):
+    try:
+        if not root.is_dir():
+            return []
+        return list(root.rglob(pattern))
+    except OSError:
+        return []
 
 
-def iter_clean_turns(path, provider, include_tools=False, include_cmds=True):
+def _ro_connect(db_path):
+    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+
+
+def _epoch_seconds(value):
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        value = float(value)
+        return value / 1000.0 if value > 1e11 else value
+    parsed = clean_mod.parse_ts(str(value).replace(" ", "T"))
+    if parsed is None:
+        return 0.0
+    if parsed.tzinfo is None:
+        from datetime import timezone
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def list_opencode_logs():
+    logs = []
+    base = opencode_data_root()
+    db = base / "opencode.db"
+    if db.exists():
+        try:
+            con = _ro_connect(db)
+            rows = con.execute(
+                "SELECT s.id, s.time_updated,"
+                " (SELECT count(*) FROM part p WHERE p.session_id = s.id),"
+                " (SELECT max(p.time_updated) FROM part p WHERE p.session_id = s.id)"
+                " FROM session s"
+            ).fetchall()
+            con.close()
+            for sid, updated, parts, part_updated in rows:
+                if not parts:
+                    continue
+                mtime = max(_epoch_seconds(updated), _epoch_seconds(part_updated))
+                logs.append((f"{db}#{sid}", mtime, int(parts), "opencode"))
+        except sqlite3.Error:
+            pass
+    # Pre-SQLite opencode kept one JSON file per message under storage/message/<session>/.
+    legacy = base / "storage" / "message"
+    if legacy.is_dir():
+        for session_dir in legacy.iterdir():
+            if not session_dir.is_dir():
+                continue
+            try:
+                stat = session_dir.stat()
+                count = sum(1 for _ in session_dir.glob("*.json"))
+            except OSError:
+                continue
+            if count:
+                logs.append((str(session_dir), stat.st_mtime, count, "opencode"))
+    return logs
+
+
+def list_goose_logs():
+    logs = []
+    for root in goose_session_roots():
+        db = root / "sessions.db"
+        if db.exists():
+            try:
+                con = _ro_connect(db)
+                rows = con.execute(
+                    "SELECT s.id, s.updated_at,"
+                    " (SELECT count(*) FROM messages m WHERE m.session_id = s.id),"
+                    " (SELECT max(m.created_timestamp) FROM messages m WHERE m.session_id = s.id)"
+                    " FROM sessions s"
+                ).fetchall()
+                con.close()
+                for sid, updated, count, last_created in rows:
+                    if not count:
+                        continue
+                    mtime = max(_epoch_seconds(updated), _epoch_seconds(last_created))
+                    logs.append((f"{db}#{sid}", mtime, int(count), "goose"))
+            except sqlite3.Error:
+                pass
+        # Goose before the SQLite move wrote one .jsonl per session.
+        logs.extend(_file_logs([p for p in _rglob(root, "*.jsonl")], "goose"))
+    return logs
+
+
+def list_logs(providers):
+    logs = []
+    if "codex" in providers:
+        logs.extend(_file_logs(_rglob(fts_mod.codex_sessions_root(), "*.jsonl"), "codex"))
+    if "claude" in providers:
+        logs.extend(_file_logs(_rglob(fts_mod.claude_projects_root(), "*.jsonl"), "claude"))
+    if "gemini" in providers:
+        root = fts_mod.gemini_tmp_root()
+        paths = _rglob(root, "chats/*.json")
+        if not paths and root.name == "chats":
+            paths = _rglob(root, "*.json")
+        logs.extend(_file_logs(paths, "gemini"))
+    if "pi" in providers:
+        logs.extend(_file_logs(_rglob(pi_sessions_root(), "*.jsonl"), "pi"))
+    if "omo" in providers:
+        logs.extend(_file_logs(_rglob(omo_sessions_root(), "*.jsonl"), "omo"))
+    if "opencode" in providers:
+        logs.extend(list_opencode_logs())
+    if "goose" in providers:
+        logs.extend(list_goose_logs())
+    logs.sort(key=lambda x: x[1])
+    for key, _, _, provider in logs:
+        _PROVIDER_BY_KEY[key] = provider
+    return logs
+
+
+def log_for_path(path_str):
+    """Build a log tuple for an explicit --file argument."""
+    if "#" in path_str and not Path(path_str).exists():
+        return (path_str, 0.0, 0, detect_provider_from_path(path_str))
+    path = Path(path_str).expanduser()
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    provider = detect_provider_from_path(str(path))
+    return (str(path), stat.st_mtime, stat.st_size, provider)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Turn extraction per harness → (role, text) with role in user/assistant/cmd
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _LinesSource:
+    """Duck-types the Path.open() the embedded iterators expect, over in-memory lines."""
+
+    def __init__(self, text):
+        self.text = text
+
+    def open(self, *args, **kwargs):
+        return io.StringIO(self.text)
+
+
+def _text_of(content):
+    if isinstance(content, str):
+        return content
+    parts = []
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type", "text") in ("text", "input_text", "output_text"):
+                if isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+    return "\n".join(p for p in parts if p)
+
+
+SHELL_TOOL_NAMES = ("bash", "shell", "exec_command", "run_command", "command", "terminal")
+
+
+def _is_shell_tool(name):
+    lower = (name or "").lower()
+    return any(tok in lower for tok in SHELL_TOOL_NAMES)
+
+
+def iter_pi_lines(lines):
+    """pi / omo session JSONL: {"type":"message","message":{role, content}} records."""
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(obj, dict) or obj.get("type") != "message":
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+        if role == "user":
+            text = _text_of(content)
+            if text:
+                yield "user", text
+        elif role == "assistant":
+            buf = []
+            for item in content if isinstance(content, list) else [content]:
+                if isinstance(item, str):
+                    buf.append(item)
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "text" and isinstance(item.get("text"), str):
+                    buf.append(item["text"])
+                elif item.get("type") == "toolCall" and _is_shell_tool(item.get("name")):
+                    args = item.get("arguments") or {}
+                    cmd = args.get("command") if isinstance(args, dict) else None
+                    if isinstance(cmd, str) and cmd.strip():
+                        if buf:
+                            yield "assistant", "\n".join(buf)
+                            buf = []
+                        yield "cmd", cmd
+            if buf:
+                yield "assistant", "\n".join(buf)
+        elif role == "bashExecution":
+            cmd = msg.get("command")
+            if isinstance(cmd, str) and cmd.strip():
+                yield "cmd", cmd
+
+
+def _goose_content_turns(role, content):
+    buf = []
+    for item in content if isinstance(content, list) else []:
+        if not isinstance(item, dict):
+            continue
+        itype = item.get("type")
+        if itype == "text" and isinstance(item.get("text"), str):
+            buf.append(item["text"])
+        elif itype == "toolRequest":
+            call = item.get("toolCall") or {}
+            value = call.get("value") if isinstance(call, dict) else None
+            if isinstance(value, dict) and _is_shell_tool(value.get("name")):
+                args = value.get("arguments") or {}
+                cmd = args.get("command") if isinstance(args, dict) else None
+                if isinstance(cmd, str) and cmd.strip():
+                    if buf:
+                        yield role, "\n".join(buf)
+                        buf = []
+                    yield "cmd", cmd
+    if buf:
+        yield role, "\n".join(buf)
+
+
+def iter_goose_lines(lines):
+    """Legacy goose .jsonl: first line is session metadata, then one Message per line."""
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(obj, dict) or obj.get("role") not in ("user", "assistant"):
+            continue
+        yield from _goose_content_turns(obj["role"], obj.get("content"))
+
+
+def iter_goose_db(key):
+    db, sid = key.split("#", 1)
+    try:
+        con = _ro_connect(db)
+        rows = con.execute(
+            "SELECT role, content_json FROM messages WHERE session_id=? ORDER BY created_timestamp, id",
+            (sid,),
+        ).fetchall()
+        con.close()
+    except sqlite3.Error:
+        return
+    for role, content_json in rows:
+        if role not in ("user", "assistant"):
+            continue
+        try:
+            content = json.loads(content_json)
+        except Exception:
+            continue
+        yield from _goose_content_turns(role, content)
+
+
+def _opencode_parts_turns(role, parts):
+    buf = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype == "text" and isinstance(part.get("text"), str):
+            if part.get("synthetic"):
+                continue
+            buf.append(part["text"])
+        elif ptype == "tool" and _is_shell_tool(part.get("tool")):
+            state = part.get("state") or {}
+            args = state.get("input") if isinstance(state, dict) else None
+            cmd = args.get("command") if isinstance(args, dict) else None
+            if isinstance(cmd, str) and cmd.strip():
+                if buf:
+                    yield role, "\n".join(buf)
+                    buf = []
+                yield "cmd", cmd
+    if buf:
+        yield role, "\n".join(buf)
+
+
+def iter_opencode_db(key):
+    db, sid = key.split("#", 1)
+    try:
+        con = _ro_connect(db)
+        messages = con.execute(
+            "SELECT id, data FROM message WHERE session_id=? ORDER BY time_created, id", (sid,)
+        ).fetchall()
+        parts = con.execute(
+            "SELECT message_id, data FROM part WHERE session_id=? ORDER BY time_created, id", (sid,)
+        ).fetchall()
+        con.close()
+    except sqlite3.Error:
+        return
+    by_message = {}
+    for mid, data in parts:
+        try:
+            by_message.setdefault(mid, []).append(json.loads(data))
+        except Exception:
+            continue
+    for mid, data in messages:
+        try:
+            role = json.loads(data).get("role")
+        except Exception:
+            continue
+        if role in ("user", "assistant"):
+            yield from _opencode_parts_turns(role, by_message.get(mid, []))
+
+
+def iter_opencode_legacy(key):
+    session_dir = Path(key)
+    part_root = session_dir.parent.parent / "part"
+    messages = []
+    for path in session_dir.glob("*.json"):
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+        created = ((obj.get("time") or {}).get("created")) or 0
+        messages.append((created, obj.get("id") or path.stem, obj.get("role")))
+    messages.sort()
+    for _, mid, role in messages:
+        if role not in ("user", "assistant"):
+            continue
+        parts = []
+        for ppath in sorted((part_root / mid).glob("*.json")):
+            try:
+                parts.append(json.loads(ppath.read_text(encoding="utf-8", errors="replace")))
+            except Exception:
+                continue
+        yield from _opencode_parts_turns(role, parts)
+
+
+def _read_complete_lines(path, offset):
+    """Read whole lines appended after `offset`. Returns (text, new_offset).
+
+    A half-written trailing line (the harness is mid-flush) is left for next time.
+    """
+    with open(path, "rb") as handle:
+        if offset:
+            handle.seek(offset)
+        data = handle.read()
+    cut = data.rfind(b"\n")
+    if cut == -1:
+        return "", offset
+    return data[: cut + 1].decode("utf-8", errors="replace"), offset + cut + 1
+
+
+JSONL_PROVIDERS = ("claude", "codex", "pi", "omo", "goose")
+_IS_META_RE = re.compile(r'"isMeta"\s*:\s*true')
+
+_SLASH_COMMAND_RE = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.DOTALL)
+_SLASH_ARGS_RE = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.DOTALL)
+
+
+def _rescue_slash_command(text):
+    """Claude logs slash commands as <command-name>/goal</command-name><command-args>…</command-args>.
+
+    The args are often the most important thing the user typed (a /goal, a /loop
+    prompt), so keep them as "/goal …" instead of discarding the whole turn.
+    """
+    name = _SLASH_COMMAND_RE.search(text)
+    args = _SLASH_ARGS_RE.search(text)
+    if not name or not args or not args.group(1).strip():
+        return None
+    return f"{name.group(1).strip()} {args.group(1).strip()}"
+
+
+def _raw_turns(key, provider, text_chunk=None):
+    if provider == "gemini":
+        return clean_mod.iter_gemini(Path(key), False, True)
+    if provider == "opencode":
+        return iter_opencode_db(key) if "#" in key else iter_opencode_legacy(key)
+    if provider == "goose" and "#" in key:
+        return iter_goose_db(key)
+    if text_chunk is None:
+        text_chunk, _ = _read_complete_lines(key, 0)
+    if provider in ("pi", "omo"):
+        return iter_pi_lines(text_chunk.splitlines())
+    if provider == "goose":
+        return iter_goose_lines(text_chunk.splitlines())
     if provider == "claude":
-        iterator = clean_mod.iter_claude(path, include_tools, include_cmds)
-    elif provider == "gemini":
-        iterator = clean_mod.iter_gemini(path, include_tools, include_cmds)
-    else:
-        iterator = clean_mod.iter_codex(path, include_tools, include_cmds)
-    for role, text in iterator:
-        if isinstance(text, list):
-            text = "\n".join(str(t) for t in text)
+        # isMeta lines are harness-injected (hook output, caveats), not the user speaking
+        kept = "".join(line for line in text_chunk.splitlines(True) if not _IS_META_RE.search(line))
+        return clean_mod.iter_claude(_LinesSource(kept), False, True)
+    source = _LinesSource(text_chunk)
+    return clean_mod.iter_codex(source, False, True)
+
+
+def iter_clean_turns(key, provider, text_chunk=None):
+    last = None
+    for role, text in _raw_turns(str(key), provider, text_chunk):
+        if role not in ("user", "assistant", "cmd"):
+            continue
+        if isinstance(text, (list, dict)):
+            # newer Gemini logs store content as a list of {"text": …} parts
+            text = _text_of(text if isinstance(text, list) else [text]) or ""
         if not isinstance(text, str):
             text = str(text)
         raw = clean_mod.clean_text(text)
         if not raw:
             continue
+        if role == "user" and "<command-name>" in raw:
+            rescued = _rescue_slash_command(raw)
+            if rescued:
+                raw = rescued
         if clean_mod.is_preamble(role, raw, provider):
             continue
-        raw = _strip_conversation_artifacts(raw)
+        raw = strip_ansi(_strip_conversation_artifacts(raw))
         if not raw:
             continue
+        dedupe_key = (role, raw)
+        if dedupe_key == last:
+            continue
+        last = dedupe_key
         yield role, raw
 
 
-def needs_reindex(conn, path, stat):
-    row = conn.execute("SELECT mtime, size FROM file_state WHERE file=?", (str(path),)).fetchone()
-    if not row:
-        return True
-    return not (row[0] == stat.st_mtime and row[1] == stat.st_size)
+# ─────────────────────────────────────────────────────────────────────────────
+# Session metadata: project (working dir) + a human title
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _project_from_key(key, provider):
+    """Best-effort working directory for a session without touching the index."""
+    path = Path(key.split("#", 1)[0])
+    if provider == "claude":
+        # ~/.claude/projects/<-Users-t-dev-navcom>/<uuid>.jsonl (subagents nest deeper)
+        parts = key.split("/.claude/projects/", 1)
+        if len(parts) == 2:
+            return parts[1].split("/", 1)[0]
+        return path.parent.name
+    if provider in ("pi", "omo"):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                header = json.loads(handle.readline())
+            if isinstance(header, dict) and header.get("cwd"):
+                return header["cwd"]
+        except Exception:
+            pass
+        root = pi_sessions_root() if provider == "pi" else omo_sessions_root()
+        try:
+            return path.relative_to(root).parts[0]
+        except (ValueError, IndexError):
+            return path.parent.name
+    if provider == "gemini":
+        return _gemini_project(path.parent.parent)
+    if provider == "codex":
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                first = handle.readline()
+            obj = json.loads(first)
+            payload = obj.get("payload") or {}
+            return payload.get("cwd") or ""
+        except Exception:
+            return ""
+    if provider == "opencode":
+        if "#" in key:
+            db, sid = key.split("#", 1)
+            try:
+                con = _ro_connect(db)
+                row = con.execute("SELECT directory FROM session WHERE id=?", (sid,)).fetchone()
+                con.close()
+                return row[0] if row else ""
+            except sqlite3.Error:
+                return ""
+        return _opencode_legacy_info(key).get("directory") or ""
+    if provider == "goose":
+        if "#" in key:
+            db, sid = key.split("#", 1)
+            try:
+                con = _ro_connect(db)
+                row = con.execute("SELECT working_dir FROM sessions WHERE id=?", (sid,)).fetchone()
+                con.close()
+                return row[0] if row else ""
+            except sqlite3.Error:
+                return ""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                return (json.loads(handle.readline()) or {}).get("working_dir") or ""
+        except Exception:
+            return ""
+    return ""
 
 
-def index_clean_file(conn, path, provider):
-    stat = path.stat()
-    if not needs_reindex(conn, path, stat):
-        return
-    conn.execute("DELETE FROM session_fts WHERE file=?", (str(path),))
-    msg_index = 0
-    for role, text in iter_clean_turns(path, provider, include_tools=False, include_cmds=True):
-        msg_index += 1
+_DECODED_DIRS = {}
+
+
+def decode_encoded_dir(name):
+    """'-Users-t-clients-syra-syrab2bdev' → '/Users/t/clients/syra/syrab2bdev' if that path exists.
+
+    Claude Code and pi flatten the working dir by turning '/' (and '.', '_') into '-',
+    which is ambiguous; walk the real filesystem to recover the original.
+    """
+    if name in _DECODED_DIRS:
+        return _DECODED_DIRS[name]
+    tokens = [t for t in name.strip("-").split("-")]
+    result = None
+    if tokens and all(tokens):
+        def walk(base, i, budget=[4000]):
+            if i == len(tokens):
+                return base
+            for j in range(len(tokens), i, -1):
+                budget[0] -= 1
+                if budget[0] <= 0:
+                    return None
+                chunk = tokens[i:j]
+                for joiner in ("-", ".", "_"):
+                    for lead in ("", "."):
+                        cand = base / (lead + joiner.join(chunk))
+                        if cand.is_dir():
+                            found = walk(cand, j)
+                            if found:
+                                return found
+                    if len(chunk) == 1:
+                        break
+            return None
+        found = walk(Path("/"), 0)
+        result = str(found) if found else None
+    _DECODED_DIRS[name] = result
+    return result
+
+
+_GEMINI_DIRS = None
+
+
+def _gemini_dir_map():
+    """Gemini names its per-project tmp dir after the project (projects.json) or sha256(path)."""
+    global _GEMINI_DIRS
+    if _GEMINI_DIRS is not None:
+        return _GEMINI_DIRS
+    import hashlib
+    mapping, candidates = {}, set()
+    gem = Path.home() / ".gemini"
+    try:
+        projects = json.loads((gem / "projects.json").read_text()).get("projects", {})
+        for path_str, name in projects.items():
+            mapping[name] = path_str
+            candidates.add(path_str)
+    except Exception:
+        pass
+    try:
+        candidates.update(json.loads((gem / "trustedFolders.json").read_text()).keys())
+    except Exception:
+        pass
+    # working dirs other harnesses recorded are good guesses too
+    try:
+        for child in fts_mod.claude_projects_root().iterdir():
+            decoded = decode_encoded_dir(child.name) if child.name.startswith("-") else None
+            if decoded:
+                candidates.add(decoded)
+    except OSError:
+        pass
+    candidates.update(_KNOWN_CWDS)
+    for cand in candidates:
+        for variant in (cand, cand.rstrip("/")):
+            mapping.setdefault(hashlib.sha256(variant.encode()).hexdigest(), variant)
+    _GEMINI_DIRS = mapping
+    return mapping
+
+
+_KNOWN_CWDS = set()
+
+
+def _gemini_project(project_dir):
+    marker = project_dir / ".project_root"
+    try:
+        if marker.is_file():
+            return marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    name = project_dir.name
+    resolved = _gemini_dir_map().get(name)
+    if resolved:
+        return resolved
+    return "" if re.fullmatch(r"[0-9a-f]{32,}", name) else name
+
+
+def pretty_project(project):
+    """Shorten a project label for display: /Users/t/dev/x → ~/dev/x, -Users-t-dev-x → ~/dev-x."""
+    if not project:
+        return ""
+    if project.startswith("-"):
+        project = decode_encoded_dir(project) or project
+    home = str(Path.home())
+    if project.startswith(home):
+        return "~" + project[len(home):]
+    encoded_home = home.replace("/", "-").replace(".", "-")
+    stripped = project.strip("-")
+    if ("-" + stripped).startswith(encoded_home):
+        rest = ("-" + stripped)[len(encoded_home):].lstrip("-")
+        return "~/" + rest if rest else "~"
+    return project
+
+
+def _norm_project(text):
+    norm = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    # macOS: /var, /tmp and /etc are symlinks into /private — harnesses record either form
+    return norm[len("private-"):] if norm.startswith("private-") else norm
+
+
+def _opencode_legacy_info(key):
+    """storage/session/<project>/<session>.json holds title + directory for legacy opencode."""
+    session_dir = Path(key)
+    for info in (session_dir.parent.parent / "session").glob(f"*/{session_dir.name}.json"):
+        try:
+            return json.loads(info.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+    return {}
+
+
+def session_ref(key):
+    """Short, stable handle for a session: the file stem / db session id."""
+    tail = key.split("#", 1)[1] if "#" in key else Path(key).name
+    for ext in (".jsonl", ".json"):
+        if tail.endswith(ext):
+            tail = tail[: -len(ext)]
+    # codex: rollout-2026-01-02T03-04-05-<uuid> → keep the uuid, it's what's unique
+    match = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$", tail)
+    if match:
+        return match.group(1)
+    match = re.search(r"_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$", tail)
+    return match.group(1) if match else tail
+
+
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-([0-9a-f])[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def short_ref(key):
+    ref = session_ref(key)
+    match = _UUID_RE.match(ref)
+    if not match:
+        return ref
+    # UUIDv7 (pi, omo, codex) starts with a timestamp, so its head collides across
+    # sessions started the same minute — use the random tail instead.
+    return ref[-12:] if match.group(1) == "7" else ref[:8]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Index: FTS5 table (shared with the embedded log_search_fts5) + side tables
+# ─────────────────────────────────────────────────────────────────────────────
+
+INDEX_SCHEMA_VERSION = 2
+# Bump when turn extraction changes; older rows get re-read gradually (see index_logs).
+PARSER_VERSION = 2
+UPGRADE_BUDGET_SECONDS = 1.0
+UPGRADE_BYTES_PER_SECOND = 40_000_000
+MAX_UPGRADE_REREAD_BYTES = 200_000_000
+
+
+def open_index(index_path):
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(index_path), timeout=60)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        pass
+    fts_mod.ensure_db(conn)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS turn_loc (file TEXT NOT NULL, msg_index INTEGER NOT NULL,"
+        " rid INTEGER NOT NULL, PRIMARY KEY (file, msg_index)) WITHOUT ROWID"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS file_meta (file TEXT PRIMARY KEY, provider TEXT, project TEXT, title TEXT)"
+    )
+    conn.execute("CREATE TABLE IF NOT EXISTS file_parser (file TEXT PRIMARY KEY, ver INTEGER NOT NULL)")
+    conn.commit()
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version < INDEX_SCHEMA_VERSION:
+        conn.execute("BEGIN IMMEDIATE")
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version < INDEX_SCHEMA_VERSION:
+            # turn_loc lets window/transcript lookups hit a B-tree instead of
+            # full-scanning the FTS table (which cannot index its columns).
+            conn.execute("DELETE FROM turn_loc")
+            conn.execute(
+                "INSERT OR REPLACE INTO turn_loc (file, msg_index, rid) SELECT file, msg_index, rowid FROM session_fts"
+            )
+            conn.execute("DELETE FROM session_fts WHERE rowid NOT IN (SELECT rid FROM turn_loc)")
+            conn.execute(f"PRAGMA user_version={INDEX_SCHEMA_VERSION}")
+        conn.commit()
+    # An older navcom (no turn_loc) may have appended rows since we last ran.
+    newest_row = conn.execute("SELECT max(rowid) FROM session_fts").fetchone()[0] or 0
+    newest_loc = conn.execute("SELECT max(rid) FROM turn_loc").fetchone()[0] or 0
+    if newest_row > newest_loc:
         conn.execute(
-            "INSERT INTO session_fts (text, role, file, ts, msg_index, provider) VALUES (?, ?, ?, ?, ?, ?)",
-            (text, role or "", str(path), "", msg_index, provider),
+            "INSERT OR REPLACE INTO turn_loc (file, msg_index, rid)"
+            " SELECT file, msg_index, rowid FROM session_fts WHERE rowid > ?",
+            (newest_loc,),
         )
+        conn.commit()
+    return conn
+
+
+def _delete_key(conn, key):
+    rids = [row[0] for row in conn.execute("SELECT rid FROM turn_loc WHERE file=?", (key,))]
+    for start in range(0, len(rids), 500):
+        chunk = rids[start : start + 500]
+        conn.execute(f"DELETE FROM session_fts WHERE rowid IN ({','.join('?' * len(chunk))})", chunk)
+    conn.execute("DELETE FROM turn_loc WHERE file=?", (key,))
+
+
+def index_log(conn, log, force=False):
+    """(Re)index one session. Appended JSONL is indexed incrementally from the stored offset."""
+    key, mtime, size, provider = log
+    row = conn.execute("SELECT mtime, size, offset, msg_index FROM file_state WHERE file=?", (key,)).fetchone()
+    if row and not force and row[0] == mtime and row[1] == size:
+        return False
+    is_file = provider in JSONL_PROVIDERS and "#" not in key
+    incremental = (
+        not force and is_file and row is not None
+        and row[2] and row[1] and size > row[1] and row[2] <= size and mtime >= row[0]
+    )
+    if incremental:
+        ver = conn.execute("SELECT ver FROM file_parser WHERE file=?", (key,)).fetchone()
+        # else one full re-read to pick up parser improvements — unless it's huge (multi-GB
+        # codex logs), where stalling this call matters more than the older parse
+        incremental = bool(ver and ver[0] >= PARSER_VERSION) or size > MAX_UPGRADE_REREAD_BYTES
+    if incremental:
+        offset, msg_index = row[2], row[3] or 0
+    else:
+        _delete_key(conn, key)
+        offset, msg_index = 0, 0
+    try:
+        text_chunk = None
+        if is_file:
+            text_chunk, offset = _read_complete_lines(key, offset)
+        else:
+            offset = size
+        for role, text in iter_clean_turns(key, provider, text_chunk):
+            msg_index += 1
+            cur = conn.execute(
+                "INSERT INTO session_fts (text, role, file, ts, msg_index, provider) VALUES (?, ?, ?, ?, ?, ?)",
+                (text, role or "", key, "", msg_index, provider),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO turn_loc (file, msg_index, rid) VALUES (?, ?, ?)",
+                (key, msg_index, cur.lastrowid),
+            )
+    except OSError as exc:
+        sys.stderr.write(f"[navcom] skipped unreadable log {key}: {exc}\n")
+        return False
     conn.execute(
         "INSERT OR REPLACE INTO file_state (file, mtime, size, offset, msg_index) VALUES (?, ?, ?, ?, ?)",
-        (str(path), stat.st_mtime, stat.st_size, stat.st_size, msg_index),
+        (key, mtime, size, offset, msg_index),
     )
+    if not incremental:
+        conn.execute("DELETE FROM file_meta WHERE file=?", (key,))
+        conn.execute("INSERT OR REPLACE INTO file_parser (file, ver) VALUES (?, ?)", (key, PARSER_VERSION))
+    return True
 
 
-def index_targets(conn, targets):
-    for target in targets:
-        if not target.exists():
-            print(f"Log not found: {target}")
-            continue
-        provider = detect_provider_from_path(target)
-        index_clean_file(conn, target, provider)
+def index_logs(conn, logs, force=False, progress=True, upgrade=True):
+    changed = 0
+    total = len(logs)
+    announced = False
+    for i, log in enumerate(logs, 1):
+        if index_log(conn, log, force=force):
+            changed += 1
+            if changed % 200 == 0:
+                conn.commit()
+                if progress and not announced:
+                    sys.stderr.write("[navcom] indexing new/changed sessions (first run takes a while)…\n")
+                    announced = True
+                if progress:
+                    sys.stderr.write(f"[navcom]   {i}/{total}\n")
+    conn.commit()
+    if upgrade and not force:
+        upgrade_stale_parses(conn, logs)
+    return changed
 
 
-_FTS_SAFE_BAREWORD = re.compile(r'^[A-Za-z0-9_]+$')
+def upgrade_stale_parses(conn, logs, budget=UPGRADE_BUDGET_SECONDS):
+    """Re-read sessions indexed by an older parser, newest first, within a small time budget.
 
-
-def _fts_cook_token(token):
-    """Turn one whitespace-delimited user token into a safe FTS5 query atom.
-
-    - AND/OR/NOT pass through as boolean operators.
-    - Tokens using explicit FTS5 syntax (``*``, ``(``, ``)``) are left untouched
-      so power users can still hand-write query expressions.
-    - Plain alphanumeric words get a trailing ``*`` for forgiving prefix matching.
-    - Anything containing punctuation (hyphens, periods, apostrophes like
-      ``don't``, colons, etc.) is wrapped in a double-quoted FTS5 string so the
-      MATCH parser treats it literally instead of as query syntax, then
-      prefix-matched on its trailing token.
-    - Punctuation-only tokens (``--``, ``...``) drop out — nothing to match.
+    Keeps every call fast after an upgrade while the index converges in the background
+    of normal use. `navcom --reindex` does it all at once.
     """
-    upper = token.upper()
-    if upper in ("AND", "OR", "NOT"):
-        return token
-    if "*" in token or "(" in token or ")" in token:
-        return token
-    if _FTS_SAFE_BAREWORD.match(token):
-        return f"{token}*"
-    if not any(ch.isalnum() for ch in token):
+    current = {row[0] for row in conn.execute("SELECT file FROM file_parser WHERE ver >= ?", (PARSER_VERSION,))}
+    stale = [log for log in logs if log[0] not in current]
+    if not stale:
+        return 0
+    import time
+    deadline = time.monotonic() + budget
+    done = 0
+    for log in reversed(stale):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        if "#" not in log[0] and log[2] > left * UPGRADE_BYTES_PER_SECOND:
+            continue  # too big for this call's budget; it upgrades on its next change or --reindex
+        index_log(conn, log, force=True)
+        done += 1
+    conn.commit()
+    return done
+
+
+def session_meta(conn, key, provider=None):
+    """(project, title) for a session, cached in file_meta."""
+    row = conn.execute("SELECT project, title FROM file_meta WHERE file=?", (key,)).fetchone()
+    if row and row[1] is not None:
+        return row[0] or "", row[1] or ""
+    provider = provider or detect_provider_from_path(key)
+    project = row[0] if row and row[0] is not None else _project_from_key(key, provider)
+    title = _native_title(key, provider)
+    if not title:
+        firsts = conn.execute(
+            "SELECT f.text FROM turn_loc l JOIN session_fts f ON f.rowid = l.rid"
+            " WHERE l.file=? AND f.role='user' ORDER BY l.msg_index LIMIT 5",
+            (key,),
+        ).fetchall()
+        texts = [re.sub(r"\s+", " ", strip_ansi(t[0])).strip() for t in firsts]
+        # skip throwaway openers ("hi", "hello", "continue") when something meatier follows
+        meaty = [t for t in texts if len(t) >= 20]
+        title = (meaty or texts or [""])[0][:160]
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO file_meta (file, provider, project, title) VALUES (?, ?, ?, ?)",
+            (key, provider, project, title),
+        )
+    except sqlite3.OperationalError:
+        pass  # index busy elsewhere; metadata is a cache, skip
+    return project, title
+
+
+def _native_title(key, provider):
+    """Titles some harnesses store themselves (opencode, goose)."""
+    if provider == "opencode" and "#" not in key:
+        return (_opencode_legacy_info(key).get("title") or "").strip()[:160]
+    if "#" not in key or provider not in ("opencode", "goose"):
         return ""
-    escaped = token.replace('"', '""')
+    db, sid = key.split("#", 1)
+    try:
+        con = _ro_connect(db)
+        if provider == "opencode":
+            row = con.execute("SELECT title FROM session WHERE id=?", (sid,)).fetchone()
+        else:
+            row = con.execute("SELECT name, description FROM sessions WHERE id=?", (sid,)).fetchone()
+            row = (row[0] or row[1],) if row else None
+        con.close()
+    except sqlite3.Error:
+        return ""
+    title = (row[0] or "") if row else ""
+    return "" if title.lower().startswith("new session") else title.strip()[:160]
+
+
+def session_date(conn, key, fallback_mtime=None):
+    row = conn.execute("SELECT mtime FROM file_state WHERE file=?", (key,)).fetchone()
+    mtime = row[0] if row else fallback_mtime
+    if not mtime:
+        return "????-??-??"
+    return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Query cooking — turn whatever an LLM (or human) typed into a VALID FTS5 query
+# ─────────────────────────────────────────────────────────────────────────────
+
+_FTS_SAFE_BAREWORD = re.compile(r"^\w+$", re.UNICODE)
+_SMART_QUOTES = str.maketrans({"“": '"', "”": '"', "„": '"', "«": '"', "»": '"', "‘": "'", "’": "'", "`": "'"})
+_OR_WORDS = {"OR", "or", "|", "||"}
+_AND_WORDS = {"AND", "and", "&", "&&", "+"}
+
+
+def _cook_term(token):
+    """One whitespace-free chunk of user text → FTS5 term (or '' if nothing to match)."""
+    word = token.strip("*")
+    if not word or not any(ch.isalnum() for ch in word):
+        return ""
+    if _FTS_SAFE_BAREWORD.match(word):
+        return f"{word}*"
+    # Anything with punctuation becomes a literal FTS5 string; the tokenizer then
+    # splits it the same way the indexed text was split (don't → don t, v0.1 → v0 1).
+    escaped = word.replace('"', '""')
     return f'"{escaped}"*'
 
 
-def fts_prefix_query(query):
-    """Prefix-cook a raw user query into a valid FTS5 MATCH expression.
-
-    Replaces the embedded ``apply_prefix_query``, which passed unquoted tokens
-    straight through and raised ``fts5: syntax error`` on hyphens, periods,
-    apostrophes, and colons (e.g. ``don't``, ``log-search``, ``v0.1.3``).
-    Explicit user ``"quoted phrases"`` are preserved and prefix-matched on the
-    trailing token. Returns an empty string when nothing indexable remains.
-    """
-    if not query:
+def _cook_phrase(inner):
+    words = [w for w in re.split(r"\s+", inner.strip()) if w]
+    if not words or not any(ch.isalnum() for ch in inner):
         return ""
-    parts = re.split(r'(".*?")', query)
-    out_parts = []
-    for part in parts:
-        if len(part) >= 2 and part.startswith('"') and part.endswith('"'):
-            inner = part[1:-1].strip()
-            if inner:
-                out_parts.append(f'"{inner}"*')
+    escaped = " ".join(words).replace('"', '""')
+    return f'"{escaped}"*'
+
+
+def _split_query(query):
+    """Split into ("phrase", text) / ("word", text) / ("op", AND|OR|NOT) / ("paren", ( or )) items."""
+    query = (query or "").translate(_SMART_QUOTES)
+    items = []
+    pos = 0
+    for match in re.finditer(r'"([^"]*)"', query):
+        items.extend(_split_words(query[pos : match.start()]))
+        items.append(("phrase", match.group(1)))
+        pos = match.end()
+    items.extend(_split_words(query[pos:]))
+    return items
+
+
+def _split_words(chunk):
+    items = []
+    # a stray (unbalanced) double quote is just punctuation
+    for raw in chunk.replace('"', " ").split():
+        if raw in _OR_WORDS:
+            items.append(("op", "OR"))
+            continue
+        if raw in ("AND", "&", "&&"):
+            items.append(("op", "AND"))
+            continue
+        if raw == "NOT":
+            items.append(("op", "NOT"))
+            continue
+        if raw in ("and", "+"):
+            continue  # implicit AND already
+        # peel grouping parens off the edges: "(auth" / "login)" but not "main()"
+        lead = ""
+        while raw.startswith("(") and not raw.startswith("()"):
+            lead += "("
+            raw = raw[1:]
+        trail = ""
+        while raw.endswith(")") and not raw.endswith("()"):
+            trail += ")"
+            raw = raw[:-1]
+        for _ in lead:
+            items.append(("paren", "("))
+        if raw:
+            items.append(("word", raw))
+        for _ in trail:
+            items.append(("paren", ")"))
+    return items
+
+
+def _assemble(items, force_or=False):
+    """Validate operator/paren placement so FTS5 never sees a syntax error."""
+    # drop parens unless they balance
+    depth, ok = 0, True
+    for kind, val in items:
+        if kind == "paren":
+            depth += 1 if val == "(" else -1
+            if depth < 0:
+                ok = False
+                break
+    if not ok or depth != 0:
+        items = [it for it in items if it[0] != "paren"]
+    out = []  # list of (kind, text) where kind in term/op/(/)
+    for kind, val in items:
+        if kind == "word":
+            term = _cook_term(val)
+            if term:
+                out.append(("term", term))
+        elif kind == "phrase":
+            term = _cook_phrase(val)
+            if term:
+                out.append(("term", term))
+        elif kind == "op":
+            out.append(("op", "OR" if force_or else val))
         else:
-            for token in part.split():
-                cooked = _fts_cook_token(token)
-                if cooked:
-                    out_parts.append(cooked)
-    return " ".join(out_parts).strip()
+            out.append((val, val))
+    # remove empty groups "( )" and operators that don't sit between two operands
+    cleaned = []
+    for kind, val in out:
+        if kind == "op":
+            if not cleaned or cleaned[-1][0] in ("op", "("):
+                continue
+        if kind == ")":
+            while cleaned and cleaned[-1][0] == "op":
+                cleaned.pop()
+            if cleaned and cleaned[-1][0] == "(":
+                cleaned.pop()
+                continue
+        if kind in ("term", "(") and cleaned and cleaned[-1][0] in ("term", ")"):
+            # adjacent operands: FTS5 allows implicit AND between plain terms but
+            # rejects it next to a parenthesis, so always spell the operator out
+            if force_or:
+                cleaned.append(("op", "OR"))
+            elif kind == "(" or cleaned[-1][0] == ")":
+                cleaned.append(("op", "AND"))
+        cleaned.append((kind, val))
+    while cleaned and cleaned[-1][0] in ("op", "("):
+        cleaned.pop()
+    # a NOT directly after "(" or at the start has no left operand; FTS5 rejects it
+    text = " ".join(val for _, val in cleaned)
+    return text.strip()
 
 
-def search_hits(conn, query, providers=None, files=None, limit=20, snippet_tokens=250, no_prefix=False):
-    cooked = query
-    if not no_prefix:
-        cooked = fts_prefix_query(cooked)
-    if not cooked or not cooked.strip():
-        return []
-    if providers:
-        hits = []
-        for provider in providers:
-            results = fts_mod.search(
-                conn,
-                cooked,
-                limit,
-                providers=[provider],
-                files=files,
-                snippet_tokens=snippet_tokens,
-            )
-            hits.extend(Hit(*row) for row in results)
-        return hits
-    results = fts_mod.search(conn, cooked, limit, providers=None, files=files, snippet_tokens=snippet_tokens)
-    return [Hit(*row) for row in results]
+def _comma_groups(query):
+    """Split "a b, c; d" into ["a b", "c", "d"] — separators must end a word, quotes are respected."""
+    query = (query or "").translate(_SMART_QUOTES)
+    groups, buf, in_quote = [], [], False
+    for i, ch in enumerate(query):
+        if ch == '"':
+            in_quote = not in_quote
+        nxt = query[i + 1] if i + 1 < len(query) else " "
+        if ch in ",;" and not in_quote and nxt.isspace():
+            groups.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    groups.append("".join(buf))
+    return [g for g in groups if any(c.isalnum() for c in g)]
+
+
+def fts_prefix_query(query):
+    """Cook a raw query into a valid FTS5 MATCH expression.
+
+    Words are ANDed and prefix-matched; comma/semicolon-separated groups are
+    alternatives ("drizzle, prisma, sequelize" → any of them, best matches first).
+    """
+    groups = _comma_groups(query)
+    if len(groups) > 1:
+        parts = [_assemble(_split_query(g)) for g in groups]
+        parts = [f"({p})" if " " in p else p for p in parts if p]
+        return " OR ".join(parts)
+    return _assemble(_split_query(query))
+
+
+def fts_any_query(query):
+    """Same terms, joined with OR — the fallback when no single turn has them all."""
+    items = [it for it in _split_query(query) if it[0] in ("word", "phrase")]
+    return _assemble(items, force_or=True)
+
+
+def fts_literal_query(query):
+    """Last-resort query: every word a quoted literal, no operators at all."""
+    words = re.findall(r"\w+", (query or "").translate(_SMART_QUOTES), re.UNICODE)
+    return " ".join(f'"{w}"*' for w in words)
+
+
+def fts_raw_query(query):
+    """--no-prefix: the user's own FTS5 syntax, but still immune to syntax errors."""
+    return query
+
+
+def term_count(query):
+    return sum(1 for kind, _ in _split_query(query) if kind in ("word", "phrase"))
+
+
+def has_operators(query):
+    if len(_comma_groups(query)) > 1:
+        return True
+    return any(kind in ("op", "paren") for kind, _ in _split_query(query))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Search
+# ─────────────────────────────────────────────────────────────────────────────
+
+# navcom finding its own earlier invocations is noise ("cmd: navcom --query foo").
+_NAVCOM_CMD_RE = re.compile(r"(^|[;&|(]\s*|\s)(\S*/)?navcom(\.py)?(\s|$)")
+
+SNIPPET_MAX_TOKENS = 64  # FTS5 hard limit
+
+
+def _key_filter_clause(conn, keys):
+    if keys is None:
+        return "", []
+    if len(keys) <= 400:
+        return f" AND file IN ({','.join('?' * len(keys))})", list(keys)
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS _navcom_keys (file TEXT PRIMARY KEY)")
+    conn.execute("DELETE FROM _navcom_keys")
+    conn.executemany("INSERT OR IGNORE INTO _navcom_keys (file) VALUES (?)", [(k,) for k in keys])
+    return " AND file IN (SELECT file FROM _navcom_keys)", []
+
+
+def run_match(conn, match, limit, providers=None, keys=None, snippet_tokens=32, role=None):
+    tokens = max(1, min(int(snippet_tokens), SNIPPET_MAX_TOKENS))
+    where = "session_fts MATCH ?"
+    params = [match]
+    if providers and set(providers) != set(ALL_PROVIDERS):
+        where += f" AND provider IN ({','.join('?' * len(providers))})"
+        params.extend(providers)
+    if role:
+        where += " AND role=?"
+        params.append(role)
+    clause, key_params = _key_filter_clause(conn, keys)
+    where += clause
+    params.extend(key_params)
+    params.append(limit)
+    sql = (
+        "SELECT ts, role, file, msg_index, provider, "
+        f"snippet(session_fts, 0, '«', '»', '…', {tokens}), text "
+        f"FROM session_fts WHERE {where} ORDER BY rank LIMIT ?"
+    )
+    return [Hit(*row) for row in conn.execute(sql, params).fetchall()]
+
+
+def search_hits(conn, query, providers=None, keys=None, limit=20, snippet_tokens=32,
+                no_prefix=False, role=None, any_terms=False, include_self=False):
+    """Returns (hits, cooked_query, note). Never raises on query syntax."""
+    attempts = []
+    if no_prefix:
+        attempts.append(fts_raw_query(query))
+    if any_terms:
+        attempts.append(fts_any_query(query))
+    else:
+        attempts.append(fts_prefix_query(query))
+    attempts.append(fts_literal_query(query))
+    hits, cooked, note = [], "", ""
+    fetch = limit * 3 + 30
+    for candidate in attempts:
+        if not candidate:
+            continue
+        try:
+            hits = run_match(conn, candidate, fetch, providers, keys, snippet_tokens, role)
+            cooked = candidate
+            break
+        except sqlite3.OperationalError as exc:
+            if "fts5" not in str(exc) and "syntax" not in str(exc) and "special query" not in str(exc):
+                raise
+            continue
+    if not hits and not any_terms and term_count(query) > 1 and not has_operators(query):
+        fallback = fts_any_query(query)
+        try:
+            hits = run_match(conn, fallback, fetch, providers, keys, snippet_tokens, role)
+        except sqlite3.OperationalError:
+            hits = []
+        if hits:
+            note = "no single turn contains ALL of those words — showing turns with ANY of them (best first)"
+            cooked = fallback
+    filtered, seen = [], set()
+    for hit in hits:
+        if not include_self and hit.role == "cmd" and _NAVCOM_CMD_RE.search(hit.text or ""):
+            continue
+        sig = (hit.role, re.sub(r"\s+", " ", (hit.text or "")[:400]))
+        if sig in seen:
+            continue
+        seen.add(sig)
+        filtered.append(hit)
+        if len(filtered) >= limit:
+            break
+    return filtered, cooked, note
 
 
 def window_ranges_for_hits(hits, window):
@@ -291,20 +1440,34 @@ def fetch_window_rows(conn, file_path, ranges):
     for start, end in ranges:
         rows.extend(
             conn.execute(
-                "SELECT msg_index, role, text FROM session_fts WHERE file=? AND msg_index BETWEEN ? AND ? ORDER BY msg_index",
+                "SELECT l.msg_index, f.role, f.text FROM turn_loc l JOIN session_fts f ON f.rowid = l.rid"
+                " WHERE l.file=? AND l.msg_index BETWEEN ? AND ? ORDER BY l.msg_index",
                 (file_path, start, end),
             ).fetchall()
         )
     return rows
 
 
-def format_turn(role, text, provider=None):
-    label = clean_mod.label_for_role(role, provider or "")
-    if not label and role == "assistant":
-        label = "assistant"
+def max_msg_index(conn, file_path):
+    row = conn.execute("SELECT max(msg_index) FROM turn_loc WHERE file=?", (file_path,)).fetchone()
+    return row[0] or 0
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\[[0-9;]{1,8}m(?=\S)")
+
+
+def strip_ansi(text):
+    """Drop terminal escape codes (and their orphaned "[2m" remains) from logged text."""
+    return _ANSI_RE.sub("", text) if text else text
+
+
+def format_turn(role, text, provider=None, msg_index=None):
+    text = strip_ansi(text)
+    label = clean_mod.label_for_role(role, provider or "") or "assistant"
+    prefix = f"#{msg_index} " if msg_index is not None else ""
     if label == "cmd":
-        return f"cmd: {clean_mod.format_cmd(text)}"
-    return f"{label}:\n{text}\n"
+        return f"{STYLE.dim(prefix)}{STYLE.role('cmd:')} {clean_mod.format_cmd(text)}"
+    return f"{STYLE.dim(prefix)}{STYLE.role(label + ':')}\n{text}\n"
 
 
 def ensure_markdown_prompt(prompt_template):
@@ -342,12 +1505,30 @@ def convert_dump_txt_to_md(dump_dir):
 def build_transcript_from_rows(rows, provider=None):
     parts = []
     for _, role, text in rows:
-        parts.append(format_turn(role, text, provider))
+        label = clean_mod.label_for_role(role, provider or "") or "assistant"
+        if label == "cmd":
+            parts.append(f"cmd: {clean_mod.format_cmd(text)}")
+        else:
+            parts.append(f"{label}:\n{text}\n")
     return "\n".join(parts).strip()
 
 
+def _scan_commits(conn, file_path):
+    rows = conn.execute(
+        "SELECT l.msg_index, f.text FROM turn_loc l JOIN session_fts f ON f.rowid = l.rid"
+        " WHERE l.file=? AND f.role=? ORDER BY l.msg_index",
+        (file_path, GIT_ROLE_DEFAULT),
+    ).fetchall()
+    found = []
+    for msg_index, text in rows:
+        hashes = fts_mod.find_commit_mentions(text, require_context=True, action_only=True)
+        if hashes:
+            found.append((msg_index, hashes, text))
+    return found
+
+
 def collect_git_summaries(conn, targets, limit=GIT_LIMIT_DEFAULT):
-    if not fts_mod.shutil.which("git"):
+    if not shutil.which("git"):
         return []
     git_roots = fts_mod.collect_git_roots([Path.cwd(), Path.cwd().parent])
     if not git_roots:
@@ -355,17 +1536,7 @@ def collect_git_summaries(conn, targets, limit=GIT_LIMIT_DEFAULT):
     seen = set()
     summaries = []
     for target in targets:
-        end_idx = fts_mod.max_msg_index(conn, str(target))
-        commits = fts_mod.scan_commits(
-            conn,
-            str(target),
-            1,
-            end_idx,
-            require_context=True,
-            role=GIT_ROLE_DEFAULT,
-            action_only=True,
-        )
-        for _, hashes, _ in commits:
+        for _, hashes, _ in _scan_commits(conn, str(target)):
             for sha in hashes:
                 if sha in seen:
                     continue
@@ -562,7 +1733,7 @@ def smart_summarize(text, use_ollama=False, use_gemini_first=False, ollama_model
                     _gemini_restore_mcp(gemini_backup)
             if summary:
                 if _print_engine:
-                    print(f"\033[2m[NavCom summary via {cfg['label']}]\033[0m")
+                    print(STYLE.dim(f"[NavCom summary via {cfg['label']}]"))
                 return summary, None
             else:
                 _mark_engine_broken(cfg["name"])
@@ -590,7 +1761,7 @@ def smart_summarize(text, use_ollama=False, use_gemini_first=False, ollama_model
                     _gemini_restore_mcp(gemini_backup)
             if summary:
                 if _print_engine:
-                    print(f"\033[2m[NavCom summary via {cfg['label'].replace('subscription', 'api-key')}]\033[0m")
+                    print(STYLE.dim(f"[NavCom summary via {cfg['label'].replace('subscription', 'api-key')}]"))
                 return summary, None
             else:
                 _mark_engine_broken(api_name)
@@ -599,21 +1770,21 @@ def smart_summarize(text, use_ollama=False, use_gemini_first=False, ollama_model
     if shutil.which("ollama"):
         model = ollama_model or SUMMARY_MODEL_DEFAULT
         if _print_engine:
-            print(f"\033[2m[NavCom summary via ollama/{model}]\033[0m")
+            print(STYLE.dim(f"[NavCom summary via ollama/{model}]"))
         return clean_mod.summarize_transcript(
             text, model, mode=summary_mode,
             dump_dir=dump_dir, prompt_template=prompt_template,
         )
 
     # All failed
-    print("\033[93m[NavCom: no summarization engine available — showing raw output]\033[0m")
+    print(STYLE.warn("[NavCom: no summarization engine available — showing raw output]"))
     return None, "no engine available"
 
 
 def summarize_text(text, model, prompt_template=None, summary_mode="chrono", dump_dir=None, use_ollama=False, use_gemini_first=False, _print_engine=True):
     if use_ollama:
         if _print_engine:
-            print(f"\033[2m[NavCom summary via ollama/{model}]\033[0m")
+            print(STYLE.dim(f"[NavCom summary via ollama/{model}]"))
         return clean_mod.summarize_transcript(
             text, model, mode=summary_mode,
             dump_dir=dump_dir, prompt_template=prompt_template,
@@ -625,208 +1796,637 @@ def summarize_text(text, model, prompt_template=None, summary_mode="chrono", dum
     )
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description=(
-            "NavCom — search and recall context from past CLI coding sessions.\n"
-            "Indexes Claude, Gemini, and Codex conversation logs. Searches with FTS5.\n"
-            "Optionally summarizes results via Claude, Gemini, Ollama, or any available LLM.\n"
-            "\n"
-            "═══════════════════════════════════════════════════════════════════\n"
-            " QUICK START\n"
-            "═══════════════════════════════════════════════════════════════════\n"
-            "\n"
-            "  navcom --query \"drizzle\"                  Search everything, show context\n"
-            "  navcom --query \"drizzle\" --compact         Just hits + snippets, one line each\n"
-            "  navcom --query \"drizzle\" --solo             One fast summary across all hits\n"
-            "  navcom --query \"drizzle\" --summary         Per-chunk summaries (more detail)\n"
-            "\n"
-            "  TIP: --solo is the fastest way to catch up on a topic. Raw output\n"
-            "  (no --solo/--summary) is great when piping to your current LLM:\n"
-            "    navcom --query \"auth\" --compact | claude -p \"summarize this\"\n"
-            "    navcom --query \"auth\" --compact | gemini -p \"summarize this\"\n"
-            "\n"
-            "═══════════════════════════════════════════════════════════════════\n"
-            " FILTER BY PROVIDER (default: all)\n"
-            "═══════════════════════════════════════════════════════════════════\n"
-            "\n"
-            "  navcom --query \"auth\" --claude              Only Claude sessions\n"
-            "  navcom --query \"auth\" --gemini              Only Gemini sessions\n"
-            "  navcom --query \"auth\" --claude --gemini     Both, no Codex\n"
-            "  navcom --query \"auth\"                       All providers (default)\n"
-            "  navcom --query \"auth\" --this                Auto-detect current provider\n"
-            "\n"
-            "═══════════════════════════════════════════════════════════════════\n"
-            " SUMMARIZATION — who does the thinking?\n"
-            "═══════════════════════════════════════════════════════════════════\n"
-            "\n"
-            "  --solo                     One fast consolidated summary (recommended)\n"
-            "  --solo --llmgemini         Use Gemini instead of Claude (cleaner, no hooks)\n"
-            "  --solo --ollama            Use local Ollama (offline, no cloud)\n"
-            "  --summary                  Per-chunk summaries (more detail, slower)\n"
-            "  --summary --llmgemini      Per-chunk via Gemini\n"
-            "\n"
-            "  LLM fallback chain: Claude sonnet → Gemini flash → Ollama → raw\n"
-            "  Engines that fail are cached for 1hr to avoid repeated timeouts.\n"
-            "\n"
-            "═══════════════════════════════════════════════════════════════════\n"
-            " OUTPUT MODES\n"
-            "═══════════════════════════════════════════════════════════════════\n"
-            "\n"
-            "  (default)    Windowed turns around each hit. Raw text — your current\n"
-            "               LLM can always summarize if you pipe it.\n"
-            "               Best for: reading context yourself, or piping to an LLM.\n"
-            "\n"
-            "  --compact    One line per hit — conversation list + snippets.\n"
-            "               Best for: \"which conversations mentioned X?\"\n"
-            "\n"
-            "  --solo       One consolidated LLM summary across all hits (~6 seconds).\n"
-            "               Best for: \"catch me up on what happened with X\"\n"
-            "\n"
-            "  --summary    Per-chunk LLM summaries (one per conversation file).\n"
-            "               Best for: detailed per-session breakdown.\n"
-            "\n"
-            "═══════════════════════════════════════════════════════════════════\n"
-            " TUNING KNOBS\n"
-            "═══════════════════════════════════════════════════════════════════\n"
-            "\n"
-            "  --limit N           Max search hits (default: 20)\n"
-            "  --window-turns N    Turns before/after each hit (default: 1)\n"
-            "  --max-chars N       Truncate each turn (default: 200, 0=unlimited)\n"
-            "  --recent N          Only N most recent sessions per provider (0=all)\n"
-            "  --prompt \"...\"      Custom summarization prompt (implies --summary)\n"
-            "\n"
-            "═══════════════════════════════════════════════════════════════════\n"
-            " REAL USE CASES\n"
-            "═══════════════════════════════════════════════════════════════════\n"
-            "\n"
-            "  # Catch me up on the Drizzle migration\n"
-            "  navcom --query \"drizzle migration\" --solo\n"
-            "\n"
-            "  # Same but use Gemini to summarize (no Claude hook noise)\n"
-            "  navcom --query \"drizzle migration\" --solo --llmgemini\n"
-            "\n"
-            "  # Which Gemini sessions talked about Terraform?\n"
-            "  navcom --query \"terraform\" --gemini --compact\n"
-            "\n"
-            "  # Quick: what conversations exist about Prisma?\n"
-            "  navcom --query \"prisma\" --compact\n"
-            "\n"
-            "  # Deep dive into a specific conversation\n"
-            "  navcom --query \"cognito auth\" --window-turns 5 --max-chars 0\n"
-            "\n"
-            "  # Pipe raw output to your current LLM session\n"
-            "  navcom --query \"deploy\" --compact | claude -p \"summarize\"\n"
-            "\n"
-            "  # Custom prompt for a specific kind of summary\n"
-            "  navcom --query \"schema\" --solo --prompt \"List every table name mentioned\"\n"
-            "\n"
-            "  # Detailed per-session breakdown\n"
-            "  navcom --query \"migration\" --summary --claude\n"
-        ),
-        formatter_class=argparse.RawTextHelpFormatter,
-    )
-    parser.add_argument(
-        "--query",
-        help="Search term or FTS query (AND/OR/phrases). Omit for full transcript (or pass a bare phrase).",
-    )
-    parser.add_argument("phrase", nargs="*", help="Phrase-only query when --query is omitted.")
-    parser.add_argument("--codex", action="store_true", help="Use Codex logs.")
-    parser.add_argument("--claude", action="store_true", help="Use Claude logs.")
-    parser.add_argument("--gemini", action="store_true", help="Use Gemini logs.")
-    parser.add_argument("--all", action="store_true", default=True, help="Search all providers (default). Use --claude/--gemini/--codex to narrow.")
-    parser.add_argument("--this", action="store_true", help="Search only the current provider (auto-detected from most recent session).")
-    parser.add_argument("--recent", type=int, default=0, help="Limit to N most recent logs per provider (default: 0 = all logs).")
-    parser.add_argument("--all-logs", action="store_true", help="(deprecated — all logs is now default)")
-    parser.add_argument("--file", help="Specific log file path or index from --list.")
-    parser.add_argument("--latest", action="store_true", help="Use latest log only (same as --recent 1).")
-    parser.add_argument("--list", action="store_true", help="List available logs with indexes.")
-    parser.add_argument("--index", help="SQLite index path (default: $CODEX_HOME/navcom-index.sqlite).")
-    parser.add_argument("--limit", type=int, default=20, help="Max search hits per provider (default: 20).")
-    parser.add_argument(
-        "--snippet-tokens",
-        type=int,
-        default=250,
-        help="Snippet token size per hit (preview only; default: 250).",
-    )
-    parser.add_argument("--no-prefix", action="store_true", help="Disable prefix matching (mountain -> mountain*).")
-    parser.add_argument(
-        "--verbosity",
-        type=int,
-        default=DEFAULT_VERBOSITY,
-        help=f"Window size 1-10 (default: {DEFAULT_VERBOSITY}).",
-    )
-    parser.add_argument("--window-turns", type=int, help="Override turns on each side of a hit.")
-    parser.add_argument("--max-chars", type=int, default=200, help="Max chars per turn output (default: 200, 0 = no limit).")
-    parser.add_argument("--compact", action="store_true", help="Show only the banner + FTS snippets, no full turn expansion. Fast and concise.")
-    parser.add_argument("--summary", action="store_true", help="Summarize the extracted window or transcript.")
-    parser.add_argument("--solo", action="store_true", help="One consolidated summary across all hits. Shortcut for --summary --summary-mode reduce.")
-    parser.add_argument("--summary-model", default=SUMMARY_MODEL_DEFAULT, help="Summary model name.")
-    parser.add_argument(
-        "--summary-mode",
-        default="chrono",
-        choices=["chrono", "reduce"],
-        help="Summary mode (chrono = per-chunk, reduce = consolidated).",
-    )
-    parser.add_argument("--ollama", action="store_true", help="Force ollama for summarization instead of CLI LLM.")
-    parser.add_argument("--llmgemini", action="store_true", help="Force gemini as the summarizer (runs before claude in the chain).")
-    parser.add_argument("--prompt", help="Inline summary prompt text (implies --summary).")
-    parser.add_argument(
-        "--prompt-file",
-        help="Prompt template file for summarization (use {{transcript}} placeholder).",
-    )
-    parser.add_argument(
-        "--dump-dir",
-        help="Dump dir for summary artifacts (chunk inputs/outputs + final summary).",
-    )
 
-    args = parser.parse_args()
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+HELP_TEXT = """\
+NavCom — super-fast search over your past AI coding sessions.
+Harnesses: Claude Code, Codex, Gemini CLI, pi, omo, opencode, goose.
+
+QUICK START
+  navcom drizzle migration          search every harness (compact: one line per hit)
+  navcom "drizzle migration"        same — quoting is optional, punctuation is safe
+  navcom --open 395e14b4:73         read the turns around hit #73 of session 395e14b4
+  navcom drizzle --context          expand every hit with the turns around it
+  navcom drizzle --solo             one LLM summary of everything that matched
+  navcom                            list your most recent sessions
+
+QUERY RULES (all forgiving — navcom never throws a syntax error)
+  words            all must appear in the same turn; each is prefix-matched (auth → authentication)
+  "exact phrase"   phrase match
+  a OR b           either (also: a | b); falls back to ANY-word automatically if ALL finds nothing
+  NOT x            exclude (uppercase)
+  punctuation      commas, semicolons, apostrophes, quotes, colons, parens, dots, slashes — all fine
+  awkward quoting? pipe it:  navcom - <<'EOF'
+                               it's the "weird"; query, (really)
+                             EOF
+
+NARROW IT
+  --claude --codex --gemini --pi --omo --opencode --goose   (or -p claude,pi)   default: all
+  --here               only sessions whose working dir is the current directory
+  --project NAME       only sessions whose project path contains NAME
+  --days N / --since 2026-09-01    only sessions active recently
+  --latest / --recent N / --file PATH    specific sessions
+  --this-session       only the conversation you're in (recall after context compaction)
+  --role user|assistant|cmd        only that kind of turn  (--user / --cmd shortcuts)
+  -n / --limit N       max hits (default 20)
+
+OUTPUT
+  (default)            compact: hits grouped by session, with date, harness, project, ref
+  --context            windowed turns around each hit (--window-turns N, --max-chars N)
+  --open REF[:N]       read a session (or turns around #N); REF = ref shown in results
+  --json               machine-readable hits
+  --newest             order sessions by date instead of relevance
+  --solo / --summary   LLM summary (one consolidated / per session)
+
+INDEX
+  --where              show where each harness's sessions live + index stats
+  --reindex            rebuild the index for the selected sessions
+  Index: $NAVCOM_INDEX or $CODEX_HOME/navcom-index.sqlite (sessions stay searchable
+  even after a harness deletes old transcripts).
+"""
+
+
+class NavcomArgumentParser(argparse.ArgumentParser):
+    """argparse, but unknown flags get a helpful hint instead of a bare usage dump."""
+
+    def error(self, message):
+        hint = ""
+        match = re.search(r"unrecognized arguments?: (.+)", message)
+        if match:
+            import difflib
+            known = [opt for action in self._actions for opt in action.option_strings]
+            suggestions = []
+            for bad in match.group(1).split():
+                if bad.startswith("-"):
+                    close = difflib.get_close_matches(bad.split("=")[0], known, n=2, cutoff=0.6)
+                    if close:
+                        suggestions.append(f"{bad} → did you mean {' or '.join(close)}?")
+            if suggestions:
+                hint = "\n  " + "\n  ".join(suggestions)
+        sys.stderr.write(f"navcom: {message}{hint}\n")
+        sys.stderr.write("Try: navcom <words>   ·   navcom --help   (search terms need no flag and no quotes)\n")
+        raise SystemExit(2)
+
+
+def build_parser():
+    parser = NavcomArgumentParser(
+        prog="navcom",
+        description=HELP_TEXT,
+        formatter_class=argparse.RawTextHelpFormatter,
+        allow_abbrev=True,
+    )
+    parser.add_argument("phrase", nargs="*", help="Search words (no flag needed). Use - to read the query from stdin.")
+    parser.add_argument("-q", "--query", "--search", "--q", dest="query", action="append",
+                        help="Search words (same as bare words; repeatable, combined with bare words).")
+
+    g = parser.add_argument_group("harnesses (default: all)")
+    for name in ALL_PROVIDERS:
+        g.add_argument(f"--{name}", action="store_true", help=f"Only {name} sessions.")
+    g.add_argument("-p", "--provider", "--providers", "--harness", "--source", "--agent", action="append",
+                   help="Harness(es) by name, comma-separated (e.g. -p claude,pi).")
+    g.add_argument("--all", action="store_true", help="All harnesses (default).")
+    g.add_argument("--this", action="store_true", help="Only the harness you are running inside (auto-detected).")
+
+    s = parser.add_argument_group("scope")
+    s.add_argument("--recent", type=int, default=0, help="Only the N most recent sessions per harness.")
+    s.add_argument("--latest", "--last", action="store_true", help="Only the single most recent session.")
+    s.add_argument("--this-session", "--current", "--current-session", "--me", dest="this_session", action="store_true",
+                   help="Only the session you are running inside (recall after context compaction).")
+    s.add_argument("--file", "--session", help="A specific log file/key, or an index from --list.")
+    s.add_argument("--days", "--last-days", type=float, help="Only sessions active in the last N days.")
+    s.add_argument("--since", "--after", help="Only sessions active since DATE (YYYY-MM-DD) or 12h / 3d / 2w.")
+    s.add_argument("--until", "--before", help="Only sessions last active before DATE (YYYY-MM-DD) or 12h / 3d / 2w.")
+    s.add_argument("--project", "--repo", "--dir", "--cwd", dest="project",
+                   help="Only sessions whose project/working dir contains this text.")
+    s.add_argument("--here", action="store_true", help="Only sessions whose working dir is the current directory.")
+    s.add_argument("--role", choices=["user", "assistant", "cmd"], help="Only this kind of turn.")
+    s.add_argument("--user", dest="role", action="store_const", const="user", help="Only what the user typed.")
+    s.add_argument("--cmd", "--cmds", "--commands", dest="role", action="store_const", const="cmd",
+                   help="Only shell commands the agent ran.")
+    s.add_argument("--all-logs", action="store_true", help=argparse.SUPPRESS)
+
+    o = parser.add_argument_group("output")
+    o.add_argument("-n", "--limit", "--max", "--top", "--max-results", "--head", type=int, default=None,
+                   help="Max hits (default 20; 0 = no limit). With --list: rows shown.")
+    o.add_argument("--compact", "--brief", "--short", action="store_true",
+                   help="Compact hit list (this is the default; accepted for compatibility).")
+    o.add_argument("--context", "--full", "--expand", "--verbose", "-v", action="store_true",
+                   help="Show the turns around each hit instead of one-line snippets.")
+    o.add_argument("--window-turns", "--window", "--turns", "--around", type=int,
+                   help="Turns before/after each hit (implies --context; default 1, --open default 3).")
+    o.add_argument("--verbosity", type=int, default=None, help=argparse.SUPPRESS)
+    o.add_argument("--max-chars", "--chars", "--width", type=int, default=None,
+                   help="Truncate each turn/snippet to N chars (0 = no limit).")
+    o.add_argument("--snippet-tokens", type=int, default=32, help="Snippet length in tokens (max 64).")
+    o.add_argument("--open", "--show", "--read", "--view", dest="open_ref",
+                   help="Read a session by ref (as printed in results), optionally REF:N or REF:A-B.")
+    o.add_argument("--json", action="store_true", help="Emit hits as JSON.")
+    o.add_argument("--newest", "--recent-first", "--sort-date", action="store_true",
+                   help="Order sessions newest first instead of by relevance.")
+    o.add_argument("--any", "--or", action="store_true", help="Match ANY of the words instead of all.")
+    o.add_argument("--no-prefix", "--exact", action="store_true",
+                   help="No prefix expansion; pass the query as raw FTS5 syntax (still error-proof).")
+    o.add_argument("--include-self", action="store_true", help="Include past navcom invocations in results.")
+    o.add_argument("--color", choices=["auto", "always", "never"], default="auto",
+                   help="Colors (default: only when writing to a terminal).")
+    o.add_argument("--no-color", dest="color", action="store_const", const="never", help=argparse.SUPPRESS)
+    o.add_argument("--list", "--ls", "--sessions", action="store_true", help="List sessions with --file indexes.")
+
+    x = parser.add_argument_group("index")
+    x.add_argument("--index", help="SQLite index path (default: $NAVCOM_INDEX or $CODEX_HOME/navcom-index.sqlite).")
+    x.add_argument("--reindex", action="store_true", help="Re-read the selected sessions from scratch.")
+    x.add_argument("--where", "--doctor", "--status", action="store_true",
+                   help="Show where each harness keeps sessions and what's indexed.")
+    x.add_argument("-V", "--version", action="version", version=f"navcom {NAVCOM_VERSION}")
+
+    m = parser.add_argument_group("summaries (LLM)")
+    m.add_argument("--summary", "--summarize", action="store_true", help="Per-session LLM summaries of the hits.")
+    m.add_argument("--solo", action="store_true", help="One consolidated LLM summary across all hits.")
+    m.add_argument("--summary-model", default=SUMMARY_MODEL_DEFAULT, help="Ollama model for summaries.")
+    m.add_argument("--summary-mode", default="chrono", choices=["chrono", "reduce"], help=argparse.SUPPRESS)
+    m.add_argument("--ollama", action="store_true", help="Summarize with local Ollama.")
+    m.add_argument("--llmgemini", action="store_true", help="Summarize with Gemini first.")
+    m.add_argument("--prompt", help="Custom summary prompt (implies --summary).")
+    m.add_argument("--prompt-file", help="Prompt template file ({{transcript}} placeholder).")
+    m.add_argument("--dump-dir", help="Write summary artifacts here.")
+    return parser
+
+
+def _parse_when(value):
+    """YYYY-MM-DD[ HH:MM] or relative 90m / 12h / 3d / 2w / 1mo → epoch seconds."""
+    text = (value or "").strip().lower()
+    rel = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(m|min|mins|minutes?|h|hr|hrs|hours?|d|days?|w|wk|weeks?|mo|months?)", text)
+    now = datetime.now().timestamp()
+    if rel:
+        n = float(rel.group(1))
+        unit = rel.group(2)
+        if unit.startswith("mo"):
+            seconds = n * 30 * 86400
+        elif unit.startswith("m"):
+            seconds = n * 60
+        elif unit.startswith("h"):
+            seconds = n * 3600
+        elif unit.startswith("w"):
+            seconds = n * 7 * 86400
+        else:
+            seconds = n * 86400
+        return now - seconds
+    if text in ("today",):
+        return datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    if text in ("yesterday",):
+        return datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp() - 86400
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y/%m/%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(value.strip(), fmt).timestamp()
+        except ValueError:
+            continue
+    raise ValueError(f"can't read date {value!r} — use YYYY-MM-DD or 12h / 3d / 2w")
+
+
+def _detect_current_provider(logs):
+    env = os.environ
+    if env.get("CLAUDECODE") or env.get("CLAUDE_CODE_ENTRYPOINT"):
+        return "claude"
+    if env.get("GEMINI_CLI"):
+        return "gemini"
+    if env.get("OPENCODE") or env.get("OPENCODE_BIN_PATH"):
+        return "opencode"
+    if env.get("GOOSE_TERMINAL") or env.get("GOOSE_SESSION_ID"):
+        return "goose"
+    if any(k.startswith("CODEX_") for k in env) and not env.get("CODEX_HOME_ONLY"):
+        if env.get("CODEX_SANDBOX") or env.get("CODEX_THREAD_ID") or env.get("CODEX_MANAGED_BY_NPM"):
+            return "codex"
+    if any(k.startswith("OMO_") for k in env):
+        return "omo"
+    if any(k.startswith("PI_CODING_AGENT") for k in env):
+        return "pi"
+    return logs[-1][3] if logs else None
+
+
+SESSION_ID_ENV = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID", "GOOSE_SESSION_ID",
+                  "OPENCODE_SESSION_ID", "PI_SESSION_ID", "OMO_SESSION_ID", "GEMINI_SESSION_ID")
+
+
+def current_session_log(logs):
+    """The log of the conversation navcom is being run from, if the harness tells us."""
+    for var in SESSION_ID_ENV:
+        sid = os.environ.get(var)
+        if not sid:
+            continue
+        for log in reversed(logs):
+            ref = session_ref(log[0])
+            if ref == sid or log[0].endswith("#" + sid) or sid in Path(log[0].split("#")[0]).name:
+                return log
+    detected = _detect_current_provider(logs)
+    same = [log for log in logs if log[3] == detected]
+    return same[-1] if same else (logs[-1] if logs else None)
+
+
+def resolve_providers(args, logs_for_detect=None):
+    chosen = [name for name in ALL_PROVIDERS if getattr(args, name, False)]
+    for spec in args.provider or []:
+        for raw in re.split(r"[,\s]+", spec):
+            name = PROVIDER_ALIASES.get(raw.strip().lower(), raw.strip().lower())
+            if not name:
+                continue
+            if name not in ALL_PROVIDERS:
+                raise ValueError(f"unknown harness {raw!r} — known: {', '.join(ALL_PROVIDERS)}")
+            if name not in chosen:
+                chosen.append(name)
+    if args.this:
+        detected = _detect_current_provider(logs_for_detect if logs_for_detect is not None else list_logs(ALL_PROVIDERS))
+        if detected and detected not in chosen:
+            chosen.append(detected)
+    return chosen or list(ALL_PROVIDERS)
+
+
+def _gather_query(args):
+    parts = []
+    for q in args.query or []:
+        parts.append(q)
+    parts.extend(args.phrase or [])
+    if any(p.strip() == "-" for p in parts):
+        parts = [p for p in parts if p.strip() != "-"]
+        try:
+            parts.append(sys.stdin.read())
+        except Exception:
+            pass
+    query = " ".join(p for p in parts if p is not None).strip()
+    # "navcom search foo" / "navcom find foo" — the verb isn't part of the query
+    first, _, rest = query.partition(" ")
+    if first.lower() in ("search", "find", "query", "grep", "lookup") and rest.strip():
+        query = rest.strip()
+    return query or None
+
+
+def _key_provider(conn, key):
+    return _PROVIDER_BY_KEY.get(key) or detect_provider_from_path(key)
+
+
+def filter_keys(conn, keys, providers, args):
+    """Apply provider/date/project filters over index keys. Returns list or None (= no filter)."""
+    since = until = None
+    if args.days is not None:
+        since = datetime.now().timestamp() - args.days * 86400
+    if args.since:
+        since = _parse_when(args.since)
+    if args.until:
+        until = _parse_when(args.until)
+    want_project = args.project or args.here
+    if keys is None and since is None and until is None and not want_project:
+        return None
+    if keys is None:
+        rows = conn.execute("SELECT file, mtime FROM file_state").fetchall()
+    else:
+        wanted = set(keys)
+        rows = [r for r in conn.execute("SELECT file, mtime FROM file_state").fetchall() if r[0] in wanted]
+    out = []
+    here_set = set()
+    if args.here:
+        real = os.path.realpath(os.getcwd())
+        pwd = os.environ.get("PWD")
+        for cand in (pwd if pwd and os.path.realpath(pwd) == real else None, os.getcwd(), real):
+            if cand:
+                here_set.add(_norm_project(cand))
+    needle = _norm_project(args.project) if args.project else None
+    project_cache = {}
+    if want_project:
+        project_cache = {f: p for f, p in conn.execute("SELECT file, project FROM file_meta")}
+        _KNOWN_CWDS.update(p for p in project_cache.values() if p and p.startswith("/"))
+    new_meta = []
+    for key, mtime in rows:
+        if _key_provider(conn, key) not in providers:
+            continue
+        if since is not None and (mtime or 0) < since:
+            continue
+        if until is not None and (mtime or 0) >= until:
+            continue
+        if want_project:
+            project = project_cache.get(key)
+            if project is None:
+                project = _project_from_key(key, _key_provider(conn, key))
+                new_meta.append((key, _key_provider(conn, key), project))
+            norm = _norm_project(project)
+            if here_set and not any(norm == h or norm.startswith(h + "-") for h in here_set):
+                continue
+            if needle is not None and needle not in norm:
+                continue
+        out.append(key)
+    if new_meta:
+        try:
+            conn.executemany(
+                "INSERT OR IGNORE INTO file_meta (file, provider, project, title) VALUES (?, ?, ?, NULL)", new_meta
+            )
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+    return out
+
+
+def _trim_snippet(snippet, max_chars):
+    text = re.sub(r"\s+", " ", strip_ansi(snippet or "")).strip()
+    if not max_chars or len(text) <= max_chars:
+        return text
+    mark = text.find("«")
+    if mark == -1 or mark < max_chars * 0.6:
+        return text[:max_chars].rstrip() + "…"
+    start = max(0, mark - max_chars // 3)
+    return "…" + text[start : start + max_chars].strip() + "…"
+
+
+def _group_hits(conn, hits, newest=False):
+    groups = {}
+    for rank, hit in enumerate(hits):
+        g = groups.setdefault(hit.file, {"key": hit.file, "best": rank, "hits": [], "provider": hit.provider})
+        g["hits"].append(hit)
+    ordered = list(groups.values())
+    for g in ordered:
+        row = conn.execute("SELECT mtime FROM file_state WHERE file=?", (g["key"],)).fetchone()
+        g["mtime"] = row[0] if row else 0
+        g["hits"].sort(key=lambda h: h.msg_index)
+    if newest:
+        ordered.sort(key=lambda g: -g["mtime"])
+    else:
+        ordered.sort(key=lambda g: g["best"])
+    return ordered
+
+
+def _session_header(conn, i, g):
+    project, title = session_meta(conn, g["key"], g["provider"])
+    date = session_date(conn, g["key"])
+    prov = g["provider"] or detect_provider_from_path(g["key"])
+    count = len(g["hits"])
+    proj = pretty_project(project) or "-"
+    hits_label = f"{count} hit" + ("s" if count != 1 else "")
+    return f"[{i}] {date}  {STYLE.provider(prov, f'{prov:8s}')} {proj}  ref {short_ref(g['key'])}  ({hits_label})"
+
+
+def print_compact(conn, groups, max_chars, total_hits, cooked, note):
+    sessions = len(groups)
+    safe_print(f"navcom: {total_hits} hit{'s' if total_hits != 1 else ''} in {sessions} session{'s' if sessions != 1 else ''} · query: {cooked}")
+    if note:
+        safe_print(STYLE.warn(f"note: {note}"))
+    for i, g in enumerate(groups, 1):
+        safe_print(_session_header(conn, i, g))
+        for hit in g["hits"]:
+            snippet = hit.snip if hit.snip else hit.text
+            snippet = _trim_snippet(snippet, max_chars)
+            safe_print(f"    {STYLE.dim('#' + str(hit.msg_index))} {STYLE.role(hit.role + ':')} {STYLE.highlight(snippet)}")
+    if groups:
+        first = groups[0]
+        safe_print(STYLE.dim(
+            f"→ read around a hit: navcom --open {short_ref(first['key'])}:{first['hits'][0].msg_index}"
+            "   · expand all: add --context"
+        ))
+
+
+def print_json(conn, groups, cooked, note):
+    out = {"query": cooked, "note": note or None, "sessions": []}
+    for g in groups:
+        project, title = session_meta(conn, g["key"], g["provider"])
+        out["sessions"].append({
+            "ref": short_ref(g["key"]),
+            "key": g["key"],
+            "provider": g["provider"],
+            "date": session_date(conn, g["key"]),
+            "project": project,
+            "title": title,
+            "hits": [
+                {"msg_index": h.msg_index, "role": h.role, "snippet": re.sub(r"\s+", " ", h.snip or "").strip()}
+                for h in g["hits"]
+            ],
+        })
+    safe_print(json.dumps(out, indent=2, ensure_ascii=False))
+
+
+def print_context(conn, groups, window, max_chars):
+    for i, g in enumerate(groups, 1):
+        prov = g["provider"] or detect_provider_from_path(g["key"])
+        spans = window_ranges_for_hits(g["hits"], window)[g["key"]]
+        safe_print(_session_header(conn, i, g))
+        safe_print(STYLE.dim(f"    {g['key']}"))
+        hit_ids = {h.msg_index for h in g["hits"]}
+        for msg_index, role, text in fetch_window_rows(conn, g["key"], spans):
+            if max_chars and len(text) > max_chars:
+                text = text[:max_chars] + "…"
+            marker = "▶ " if msg_index in hit_ids else ""
+            safe_print(marker + format_turn(role, text, prov, msg_index))
+        safe_print("")
+
+
+def resolve_ref(conn, ref, providers=None):
+    """REF → index key. Accepts a full key/path, a file stem, a uuid prefix or an opencode/goose id."""
+    ref = ref.strip()
+    if conn.execute("SELECT 1 FROM file_state WHERE file=?", (ref,)).fetchone():
+        return ref, []
+    like = "%" + ref.replace("%", "").replace("_", "\\_") + "%"
+    rows = conn.execute(
+        "SELECT file, mtime FROM file_state WHERE file LIKE ? ESCAPE '\\' ORDER BY mtime DESC", (like,)
+    ).fetchall()
+    matches = [
+        r for r in rows
+        if session_ref(r[0]).startswith(ref) or session_ref(r[0]).endswith(ref)
+        or Path(r[0].split("#")[-1]).stem.startswith(ref)
+    ]
+    if not matches:
+        matches = rows
+    if providers:
+        scoped = [r for r in matches if _key_provider(conn, r[0]) in providers]
+        matches = scoped or matches
+    if not matches:
+        return None, []
+    return matches[0][0], [m[0] for m in matches[1:]]
+
+
+def cmd_open(conn, args, providers):
+    ref = args.open_ref
+    lo = hi = None
+    match = re.match(r"^(.*?)[:#](\d+)(?:-(\d+))?$", ref)
+    if match and not Path(ref).exists():
+        ref, lo = match.group(1), int(match.group(2))
+        hi = int(match.group(3)) if match.group(3) else None
+    key, others = resolve_ref(conn, ref, providers)
+    if not key:
+        safe_print(f"navcom: no session matches ref {ref!r}. Refs are printed in search results (e.g. 'ref 395e14b4').")
+        return 1
+    prov = _key_provider(conn, key)
+    last = max_msg_index(conn, key)
+    if lo is None:
+        span = (1, last)
+        default_chars = 400
+    elif hi is not None:
+        span = (min(lo, hi), max(lo, hi))
+        default_chars = 3000
+    else:
+        w = args.window_turns if args.window_turns is not None else 3
+        span = (max(1, lo - w), lo + w)
+        default_chars = 3000
+    max_chars = args.max_chars if args.max_chars is not None else default_chars
+    project, title = session_meta(conn, key, prov)
+    safe_print(f"{session_date(conn, key)}  {STYLE.provider(prov)}  {pretty_project(project) or '-'}  ref {short_ref(key)}  turns {span[0]}-{min(span[1], last)} of {last}")
+    safe_print(STYLE.dim(key))
+    if others:
+        safe_print(STYLE.warn(f"note: {len(others)} other session(s) also match {ref!r}; showing the most recent"))
+    safe_print("")
+    rows = fetch_window_rows(conn, key, [span])
+    if args.role:
+        rows = [r for r in rows if r[1] == args.role]
+    for msg_index, role, text in rows:
+        if max_chars and len(text) > max_chars:
+            text = text[:max_chars] + f"… [+{len(text) - max_chars} chars; --max-chars 0 for all]"
+        marker = "▶ " if lo is not None and hi is None and msg_index == lo else ""
+        safe_print(marker + format_turn(role, text, prov, msg_index))
+    if lo is not None and hi is None and span[1] < last:
+        safe_print(STYLE.dim(f"→ more: navcom --open {short_ref(key)}:{span[1] + 1}-{min(last, span[1] + 10)}"))
+    return 0
+
+
+def cmd_recent_sessions(conn, logs, limit, keys=None):
+    if keys is not None:
+        wanted = set(keys)
+        pool = [l for l in logs if l[0] in wanted]
+    else:
+        pool = logs
+    shown = pool[-limit:] if limit else pool
+    index_logs(conn, shown)
+    safe_print(f"navcom: {len(shown)} most recent session{'s' if len(shown) != 1 else ''} of {len(pool)} · search: navcom <words> · read: navcom --open <ref>")
+    for key, mtime, size, prov in reversed(shown):
+        project, title = session_meta(conn, key, prov)
+        stamp = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M") if mtime else "????-??-?? ??:??"
+        title = (title[:90] + "…") if len(title) > 90 else title
+        safe_print(f"{stamp}  {STYLE.provider(prov, f'{prov:8s}')} {pretty_project(project) or '-':28s} {short_ref(key):10s} {title}")
+    conn.commit()
+    return 0
+
+
+def cmd_where(conn, providers):
+    safe_print(f"navcom {NAVCOM_VERSION}")
+    roots = provider_roots()
+    logs = list_logs(providers)
+    counts = {}
+    for _, _, _, prov in logs:
+        counts[prov] = counts.get(prov, 0) + 1
+    for prov in providers:
+        found = [str(r) for r in roots.get(prov, []) if Path(r).exists()]
+        where = ", ".join(found) if found else f"not found ({', '.join(str(r) for r in roots.get(prov, []))})"
+        safe_print(f"  {STYLE.provider(prov, f'{prov:8s}')} {counts.get(prov, 0):6d} sessions  {where}")
+    stats = conn.execute("SELECT count(*) FROM file_state").fetchone()[0]
+    turns = conn.execute("SELECT count(*) FROM turn_loc").fetchone()[0]
+    on_disk = {l[0] for l in logs}
+    archived = sum(1 for (f,) in conn.execute("SELECT file FROM file_state") if f not in on_disk)
+    safe_print(f"  index    {stats} sessions, {turns} turns ({archived} no longer on disk but still searchable)")
+    safe_print(f"           {default_index_path() if True else ''}")
+    return 0
+
+
+def run(argv=None):
+    parser = build_parser()
+    args = parser.parse_intermixed_args(argv)
+    STYLE.configure(args.color)
 
     if args.prompt:
         args.summary = True
     if args.solo:
         args.summary = True
         args.summary_mode = "reduce"
+    if args.window_turns is not None or args.verbosity is not None:
+        args.context = True
 
-    providers = []
-    specific = args.codex or args.claude or args.gemini or args.this
-    if specific:
-        if args.codex:
-            providers.append("codex")
-        if args.claude:
-            providers.append("claude")
-        if args.gemini:
-            providers.append("gemini")
-        if args.this:
-            detected = clean_mod.detect_latest_provider()
-            providers = [detected] if detected else ["codex"]
-    else:
-        providers = ["codex", "claude", "gemini"]
-
-    logs = list_logs(providers)
-    if args.list:
-        if not logs:
-            print("No logs found.")
-            return 0
-        for idx, (path, mtime, size, provider) in enumerate(logs):
-            stamp = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
-            print(f"{idx:03d} {stamp} {size:9d} {provider:7} {path}")
-        return 0
-
-    if not logs:
-        print("No logs found.")
-        return 1
+    query = _gather_query(args)
 
     try:
-        targets = select_targets(logs, providers, args.recent, args.all_logs, args.file, args.latest)
+        all_logs_for_detect = list_logs(ALL_PROVIDERS) if args.this else None
+        providers = resolve_providers(args, all_logs_for_detect)
     except ValueError as exc:
-        print(str(exc))
+        sys.stderr.write(f"navcom: {exc}\n")
+        return 2
+
+    index_path = Path(args.index).expanduser() if args.index else default_index_path()
+    try:
+        conn = open_index(index_path)
+    except sqlite3.Error as exc:
+        sys.stderr.write(f"navcom: can't open index {index_path}: {exc}\n")
         return 1
 
-    if not args.query and args.phrase:
-        args.query = " ".join(args.phrase).strip()
-    if args.query == "":
-        args.query = None
+    if args.where:
+        return cmd_where(conn, providers)
+
+    logs = list_logs(providers)
+
+    if args.list:
+        if not logs:
+            safe_print("No logs found.")
+            return 0
+        limit = 50 if args.limit is None else args.limit
+        start = max(0, len(logs) - limit) if limit else 0
+        if start:
+            safe_print(STYLE.dim(f"(showing last {len(logs) - start} of {len(logs)}; --limit 0 for all)"))
+        for idx in range(start, len(logs)):
+            key, mtime, size, prov = logs[idx]
+            stamp = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S") if mtime else "????-??-?? ??:??:??"
+            safe_print(f"{idx:03d} {stamp} {size:9d} {prov:8s} {key}")
+        return 0
+
+    # Which sessions are in play?
+    explicit_scope = bool(args.file or args.latest or args.recent or args.this_session)
+    if args.this_session:
+        current = current_session_log(logs if logs else list_logs(ALL_PROVIDERS))
+        if current is None:
+            safe_print("navcom: can't tell which session this is.")
+            return 1
+        targets = [current]
+    elif args.file:
+        if args.file.isdigit() and not Path(args.file).exists():
+            idx = int(args.file)
+            if idx < 0 or idx >= len(logs):
+                safe_print(f"Index out of range: {idx} (see navcom --list)")
+                return 1
+            targets = [logs[idx]]
+        else:
+            log = log_for_path(args.file)
+            if log is None:
+                key, _ = resolve_ref(conn, args.file, providers)
+                log = next((l for l in logs if l[0] == key), None) if key else None
+                if log is None and key:
+                    log = (key, 0.0, 0, _key_provider(conn, key))
+            if log is None:
+                safe_print(f"Log not found: {args.file}")
+                return 1
+            targets = [log]
+    elif args.latest:
+        targets = logs[-1:] if logs else []
+    elif args.recent:
+        targets = []
+        for prov in providers:
+            targets.extend([l for l in logs if l[3] == prov][-args.recent:])
+    else:
+        targets = logs
+
+    if args.open_ref:
+        index_logs(conn, logs)
+        result = cmd_open(conn, args, providers)
+        conn.commit()
+        conn.close()
+        return result
+
+    if not query and not explicit_scope and not args.summary:
+        try:
+            keys = filter_keys(conn, None, providers, args)
+        except ValueError as exc:
+            sys.stderr.write(f"navcom: {exc}\n")
+            return 2
+        limit = 20 if args.limit is None else args.limit
+        return cmd_recent_sessions(conn, logs, limit, keys)
+
+    if not targets and not query:
+        safe_print("No logs found.")
+        return 1
+
+    changed = index_logs(conn, targets, force=args.reindex)
+    del changed
 
     prompt_template = None
     if args.prompt:
@@ -834,233 +2434,204 @@ def main():
     elif args.prompt_file:
         prompt_path = Path(args.prompt_file).expanduser()
         if not prompt_path.exists():
-            print(f"Prompt file not found: {prompt_path}")
+            safe_print(f"Prompt file not found: {prompt_path}")
             return 1
         prompt_template = prompt_path.read_text(encoding="utf-8")
     if args.summary:
         prompt_template = ensure_markdown_prompt(prompt_template)
 
-    index_path = Path(args.index).expanduser() if args.index else default_index_path()
-    index_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(index_path))
-    fts_mod.ensure_db(conn)
+    if not query:
+        return dump_transcripts(conn, args, targets, providers, prompt_template)
 
-    index_targets(conn, targets)
-    conn.commit()
+    try:
+        keys = filter_keys(conn, [t[0] for t in targets] if explicit_scope else None, providers, args)
+    except ValueError as exc:
+        sys.stderr.write(f"navcom: {exc}\n")
+        return 2
 
-    if not args.query:
-        dump_dir = None
-        if args.summary and args.dump_dir:
-            dump_dir = clean_mod.ensure_dump_dir(args.dump_dir)
-            if dump_dir:
-                clean_mod.write_manifest(
-                    dump_dir,
-                    {
-                        "query": None,
-                        "providers": providers,
-                        "files": [str(p) for p in targets],
-                        "summary": args.summary,
-                        "summary_model": args.summary_model,
-                        "summary_mode": args.summary_mode,
-                        "prompt_file": str(args.prompt_file) if args.prompt_file else None,
-                        "prompt_inline": args.prompt if args.prompt else None,
-                    },
-                )
-        git_section_all = ""
-        if not args.summary:
-            git_section_all = format_git_section(collect_git_summaries(conn, targets))
-        for target in targets:
-            provider = detect_provider_from_path(target)
-            rows = []
-            if not args.summary:
-                print(f"=== {target}")
-            msg_index = 0
-            for role, text in iter_clean_turns(target, provider, include_tools=False, include_cmds=True):
-                msg_index += 1
-                if args.max_chars and len(text) > args.max_chars:
-                    text = text[: args.max_chars] + "…"
-                rows.append((msg_index, role, text))
-                if not args.summary:
-                    print(format_turn(role, text, provider))
-            if args.summary:
-                transcript = build_transcript_from_rows(rows, provider)
-                git_section = format_git_section(collect_git_summaries(conn, [target]))
-                if git_section:
-                    transcript = f"{transcript}\n\n{git_section}"
-                summary, error = summarize_text(
-                    transcript,
-                    args.summary_model,
-                    prompt_template=prompt_template,
-                    summary_mode=args.summary_mode,
-                    dump_dir=dump_dir,
-                    use_ollama=args.ollama, use_gemini_first=args.llmgemini,
-                )
-                if error:
-                    print(f"Summary error: {error}")
-                else:
-                    print(summary)
-                    if dump_dir:
-                        clean_mod.write_dump_file(dump_dir, "window.md", transcript)
-                        clean_mod.write_dump_file(dump_dir, "summary.md", summary)
-                        clean_mod.write_dump_file(dump_dir, "final.md", summary)
-                        convert_dump_txt_to_md(dump_dir)
-        if git_section_all:
-            print("")
-            print(git_section_all)
-        conn.close()
-        return 0
-
-    file_filter = [str(p) for p in targets] if len(targets) != len(logs) else None
-
-    window = args.window_turns if args.window_turns is not None else VERBOSITY_WINDOW.get(args.verbosity, 6)
-
-    hits = search_hits(conn, args.query, providers=providers, files=file_filter, limit=args.limit, snippet_tokens=args.snippet_tokens, no_prefix=args.no_prefix)
+    limit = 20 if args.limit is None else args.limit
+    hits, cooked, note = search_hits(
+        conn, query, providers=providers, keys=keys,
+        limit=limit or 100000, snippet_tokens=args.snippet_tokens,
+        no_prefix=args.no_prefix, role=args.role, any_terms=args.any,
+        include_self=args.include_self,
+    )
     if not hits:
-        print("No hits.")
-        return 0
-
-    ranges = window_ranges_for_hits(hits, window)
-
-    # Print a summary banner FIRST so truncated output still shows the big picture
-    unique_files = list(ranges.keys())
-    print(f"── NavCom: {len(hits)} hits across {len(unique_files)} conversation(s) ──")
-    for i, fp in enumerate(unique_files, 1):
-        spans = ranges[fp]
-        hit_count = sum(1 for h in hits if h.file == fp)
-        short = fp.split("/")[-1] if "/" in fp else fp
-        # Show provider + project context
-        provider_tag = detect_provider_from_path(fp)
-        prov_colors = {"claude": "\033[95m", "gemini": "\033[94m", "codex": "\033[93m"}
-        prov_color = prov_colors.get(provider_tag, "\033[0m")
-        project = ""
-        if "/.claude/projects/" in fp:
-            parts = fp.split("/.claude/projects/")[1].split("/")
-            project = f" \033[2m{parts[0]}\033[0m"
-        elif "/.gemini/" in fp:
-            project = f" \033[2mgemini-session\033[0m"
-        print(f"  {i}. [{hit_count} hits] {prov_color}{provider_tag:7s}\033[0m {short}{project}")
-    print()
-
-    # Compact mode: just banner + snippets, no full turn expansion
-    if args.compact:
-        _dim = "\033[2m"
-        _cyan = "\033[96m"
-        _reset = "\033[0m"
-        _prov_colors = {"claude": "\033[95m", "gemini": "\033[94m", "codex": "\033[93m"}
-        for hit in hits:
-            short = hit.file.split("/")[-1] if "/" in hit.file else hit.file
-            role_label = f"{hit.role}:" if hit.role else ""
-            prov = hit.provider if hit.provider else detect_provider_from_path(hit.file)
-            pc = _prov_colors.get(prov, "")
-            snippet = hit.snip[:200] if hit.snip else hit.text[:200]
-            snippet = snippet.replace("\n", " ").strip()
-            print(f"  {pc}{prov:7s}{_reset} {_dim}{short}:{hit.msg_index}{_reset}  {_cyan}{role_label}{_reset} {snippet}")
-        print()
+        scope = ", ".join(providers) if set(providers) != set(ALL_PROVIDERS) else "all harnesses"
+        extra = []
+        if keys is not None:
+            extra.append(f"{len(keys)} sessions after filters")
+        if args.role:
+            extra.append(f"role={args.role}")
+        safe_print(f"No hits. (query: {cooked or '(nothing searchable)'} · {scope}{' · ' + ', '.join(extra) if extra else ''})")
+        safe_print(STYLE.dim("tip: fewer or shorter words; words are prefix-matched and ALL must be in one turn — or use a OR b"))
         conn.close()
         return 0
 
+    groups = _group_hits(conn, hits, newest=args.newest)
+
+    if args.json:
+        print_json(conn, groups, cooked, note)
+        conn.commit()
+        conn.close()
+        return 0
+
+    if not args.context and not args.summary:
+        max_chars = 220 if args.max_chars is None else args.max_chars
+        print_compact(conn, groups, max_chars, len(hits), cooked, note)
+        conn.commit()
+        conn.close()
+        return 0
+
+    if args.window_turns is not None:
+        window = args.window_turns
+    elif args.verbosity is not None:
+        window = VERBOSITY_WINDOW.get(args.verbosity, 6)
+    else:
+        window = VERBOSITY_WINDOW.get(DEFAULT_VERBOSITY, 1) or 1
+
+    if not args.summary:
+        max_chars = 200 if args.max_chars is None else args.max_chars
+        safe_print(f"navcom: {len(hits)} hits in {len(groups)} sessions · query: {cooked}")
+        if note:
+            safe_print(STYLE.warn(f"note: {note}"))
+        print_context(conn, groups, window, max_chars)
+        conn.commit()
+        conn.close()
+        return 0
+
+    return summarize_hits(conn, args, groups, hits, window, prompt_template, providers, targets, query)
+
+
+def summarize_hits(conn, args, groups, hits, window, prompt_template, providers, targets, query):
     dump_dir = None
     if args.dump_dir:
         dump_dir = clean_mod.ensure_dump_dir(args.dump_dir)
         if dump_dir:
-            clean_mod.write_manifest(
-                dump_dir,
-                {
-                    "query": args.query,
-                    "providers": providers,
-                    "files": [str(p) for p in targets],
-                    "window": window,
-                    "verbosity": args.verbosity,
-                    "summary": args.summary,
-                    "summary_model": args.summary_model,
-                    "summary_mode": args.summary_mode,
-                    "prompt_file": str(args.prompt_file) if args.prompt_file else None,
-                },
-            )
+            clean_mod.write_manifest(dump_dir, {
+                "query": query, "providers": providers, "window": window,
+                "summary_model": args.summary_model, "summary_mode": args.summary_mode,
+                "prompt_file": str(args.prompt_file) if args.prompt_file else None,
+            })
             clean_mod.write_dump_file(dump_dir, "hits.md", json.dumps([hit.__dict__ for hit in hits], indent=2))
 
     summary_engine_printed = False
-    reduce_chunks = []  # for --summary-mode reduce: collect all, summarize once
-
-    for file_path, spans in ranges.items():
-        provider = detect_provider_from_path(file_path)
+    reduce_chunks = []
+    for g in groups:
+        file_path = g["key"]
+        provider = g["provider"] or detect_provider_from_path(file_path)
+        spans = window_ranges_for_hits(g["hits"], window)[file_path]
         rows = fetch_window_rows(conn, file_path, spans)
-        output_rows = []
-
-        # Get file date from file_state
-        file_date = ""
-        row = conn.execute("SELECT mtime FROM file_state WHERE file=?", (file_path,)).fetchone()
-        if row:
-            file_date = datetime.fromtimestamp(row[0]).strftime("%Y-%m-%d")
-
-        if not args.summary:
-            print(f"=== {file_path}")
-        for msg_index, role, text in rows:
-            # Summary gets full turns for better LLM context; display gets truncated
-            if args.summary:
-                output_rows.append((msg_index, role, text))
-            else:
-                display_text = text
-                if args.max_chars and len(text) > args.max_chars:
-                    display_text = text[: args.max_chars] + "…"
-                output_rows.append((msg_index, role, display_text))
-                print(format_turn(role, display_text, provider))
-
-        if args.summary:
-            transcript = build_transcript_from_rows(output_rows, provider)
-            short = file_path.split("/")[-1] if "/" in file_path else file_path
-            project = ""
-            if "/.claude/projects/" in file_path:
-                project = file_path.split("/.claude/projects/")[1].split("/")[0]
-
-            # Prepend date + source header to transcript
-            header = f"[Session: {file_date} | {provider} | {short} | {project}]"
-            dated_transcript = f"{header}\n{transcript}"
-
-            if args.summary_mode == "reduce":
-                reduce_chunks.append((dated_transcript, short, provider, project, file_date))
-            else:
-                # Per-chunk summary
-                summary, error = summarize_text(
-                    dated_transcript,
-                    args.summary_model,
-                    prompt_template=prompt_template,
-                    summary_mode=args.summary_mode,
-                    dump_dir=dump_dir,
-                    use_ollama=args.ollama, use_gemini_first=args.llmgemini,
-                    _print_engine=not summary_engine_printed,
-                )
-                summary_engine_printed = True
-                if error:
-                    print(f"Summary error: {error}")
-                else:
-                    print(f"\n\033[2m{provider}  {file_date}  {short}  {project}\033[0m")
-                    print(summary)
-                    if dump_dir:
-                        clean_mod.write_dump_file(dump_dir, "window.md", transcript)
-                        clean_mod.write_dump_file(dump_dir, "summary.md", summary)
-                        clean_mod.write_dump_file(dump_dir, "final.md", summary)
-                        convert_dump_txt_to_md(dump_dir)
-
-    # Reduce mode: combine all chunks, summarize once
-    if args.summary and args.summary_mode == "reduce" and reduce_chunks:
-        combined = "\n\n---\n\n".join(t for t, *_ in reduce_chunks)
+        transcript = build_transcript_from_rows(rows, provider)
+        project, _ = session_meta(conn, file_path, provider)
+        file_date = session_date(conn, file_path)
+        short = short_ref(file_path)
+        dated_transcript = f"[Session: {file_date} | {provider} | {short} | {pretty_project(project)}]\n{transcript}"
+        if args.summary_mode == "reduce":
+            reduce_chunks.append(dated_transcript)
+            continue
         summary, error = summarize_text(
-            combined,
-            args.summary_model,
-            prompt_template=prompt_template,
-            summary_mode="chrono",  # use chrono internally since we're passing one big text
-            dump_dir=dump_dir,
+            dated_transcript, args.summary_model, prompt_template=prompt_template,
+            summary_mode=args.summary_mode, dump_dir=dump_dir,
             use_ollama=args.ollama, use_gemini_first=args.llmgemini,
-            _print_engine=True,
+            _print_engine=not summary_engine_printed,
+        )
+        summary_engine_printed = True
+        if error:
+            safe_print(f"Summary error: {error}")
+        else:
+            safe_print("")
+            safe_print(STYLE.dim(f"{provider}  {file_date}  ref {short}  {pretty_project(project)}"))
+            safe_print(summary)
+            if dump_dir:
+                clean_mod.write_dump_file(dump_dir, "window.md", transcript)
+                clean_mod.write_dump_file(dump_dir, "summary.md", summary)
+                clean_mod.write_dump_file(dump_dir, "final.md", summary)
+                convert_dump_txt_to_md(dump_dir)
+
+    if args.summary_mode == "reduce" and reduce_chunks:
+        combined = "\n\n---\n\n".join(reduce_chunks)
+        summary, error = summarize_text(
+            combined, args.summary_model, prompt_template=prompt_template,
+            summary_mode="chrono", dump_dir=dump_dir,
+            use_ollama=args.ollama, use_gemini_first=args.llmgemini, _print_engine=True,
         )
         if error:
-            print(f"Summary error: {error}")
+            safe_print(f"Summary error: {error}")
         else:
-            print(summary)
-
+            safe_print(summary)
+    conn.commit()
     conn.close()
     return 0
+
+
+def dump_transcripts(conn, args, targets, providers, prompt_template):
+    """No query + explicit sessions (--latest/--recent/--file): print or summarize them whole."""
+    dump_dir = None
+    if args.summary and args.dump_dir:
+        dump_dir = clean_mod.ensure_dump_dir(args.dump_dir)
+        if dump_dir:
+            clean_mod.write_manifest(dump_dir, {
+                "query": None, "providers": providers, "files": [t[0] for t in targets],
+                "summary_model": args.summary_model, "summary_mode": args.summary_mode,
+            })
+    max_chars = 200 if args.max_chars is None else args.max_chars
+    git_section_all = ""
+    if not args.summary:
+        git_section_all = format_git_section(collect_git_summaries(conn, [t[0] for t in targets]))
+    for key, _, _, provider in targets:
+        last = max_msg_index(conn, key)
+        rows = fetch_window_rows(conn, key, [(1, last)])
+        if args.role:
+            rows = [r for r in rows if r[1] == args.role]
+        if not args.summary:
+            project, _ = session_meta(conn, key, provider)
+            safe_print(f"=== {session_date(conn, key)}  {provider}  {pretty_project(project) or '-'}  ref {short_ref(key)}")
+            safe_print(STYLE.dim(key))
+            for msg_index, role, text in rows:
+                if max_chars and len(text) > max_chars:
+                    text = text[:max_chars] + "…"
+                safe_print(format_turn(role, text, provider, msg_index))
+            continue
+        full_rows = rows
+        transcript = build_transcript_from_rows(full_rows, provider)
+        git_section = format_git_section(collect_git_summaries(conn, [key]))
+        if git_section:
+            transcript = f"{transcript}\n\n{git_section}"
+        summary, error = summarize_text(
+            transcript, args.summary_model, prompt_template=prompt_template,
+            summary_mode=args.summary_mode, dump_dir=dump_dir,
+            use_ollama=args.ollama, use_gemini_first=args.llmgemini,
+        )
+        if error:
+            safe_print(f"Summary error: {error}")
+        else:
+            safe_print(summary)
+            if dump_dir:
+                clean_mod.write_dump_file(dump_dir, "window.md", transcript)
+                clean_mod.write_dump_file(dump_dir, "summary.md", summary)
+                clean_mod.write_dump_file(dump_dir, "final.md", summary)
+                convert_dump_txt_to_md(dump_dir)
+    if git_section_all:
+        safe_print("")
+        safe_print(git_section_all)
+    conn.commit()
+    conn.close()
+    return 0
+
+
+def main(argv=None):
+    try:
+        return run(argv)
+    except KeyboardInterrupt:
+        return 130
+    except BrokenPipeError:
+        return 0
+    except sqlite3.OperationalError as exc:
+        sys.stderr.write(f"navcom: index error: {exc}\n")
+        if "locked" in str(exc):
+            sys.stderr.write("navcom: another navcom is indexing right now — retry in a few seconds.\n")
+        return 1
 
 
 if __name__ == "__main__":

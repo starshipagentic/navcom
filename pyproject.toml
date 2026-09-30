@@ -4,10 +4,22 @@ build-backend = "hatchling.build"
 
 [project]
 name = "navcom"
-version = "0.1.5"
-description = "Search and recall context from past CLI coding sessions (Claude, Gemini, Codex)"
+version = "0.2.0"
+description = "Super-fast search over past AI coding sessions: Claude Code, Codex, Gemini CLI, pi, omo, opencode, goose"
+readme = "README.md"
 requires-python = ">=3.10"
+keywords = ["claude-code", "codex", "gemini-cli", "opencode", "goose", "pi", "llm", "search", "fts5", "transcripts"]
+classifiers = [
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development",
+    "Topic :: Utilities",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/starshipagentic/navcom"
+Repository = "https://github.com/starshipagentic/navcom"
 
 [project.scripts]
 navcom = "navcom:main"
@@ -15,3 +27,6 @@ navcom = "navcom:main"
 [tool.hatch.build.targets.wheel]
 packages = ["."]
 only-include = ["navcom.py"]
+
+[tool.hatch.build.targets.sdist]
+include = ["navcom.py", "README.md", "pyproject.toml", "features", "tests"]
