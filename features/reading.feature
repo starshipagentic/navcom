@@ -82,6 +82,9 @@ Feature: Reading and narrowing sessions
     Then it succeeds
     And the output contains "hits from this session (--include-self to show)"
     And the output does not contain "zebracornclaude"
+    When I run with CLAUDE_CODE_SESSION_ID=11111111-2222-4333-8444-555555555555: navcom zebracornsubagent
+    Then it succeeds
+    And the output contains "No hits."
     When I run with CLAUDE_CODE_SESSION_ID=11111111-2222-4333-8444-555555555555: navcom zebracornclaude --include-self
     Then it succeeds
     And the "claude" harness is in the results

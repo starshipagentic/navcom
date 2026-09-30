@@ -2647,6 +2647,9 @@ def run(argv=None):
         me = env_session_log(logs)
         if me:
             exclude = {me[0]}
+            # Claude keeps a session's subagent transcripts in <session-id>/subagents/
+            sid_dir = "/" + session_ref(me[0]) + "/"
+            exclude.update(l[0] for l in logs if sid_dir in l[0])
     hits, cooked, note = search_hits(
         conn, query, providers=providers, keys=keys,
         limit=limit or 100000, snippet_tokens=args.snippet_tokens,

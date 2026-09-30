@@ -47,6 +47,9 @@ def build(home: Path, base_epoch: float = 1_790_000_000):
         {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}},
         {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Committed and pushed as \x1b[2mabc1234\x1b[0m done"}]}},
     ])
+    sub = claude.parent / claude.stem / "subagents" / "agent-a1b2c3.jsonl"
+    _jsonl(sub, [{"type": "user", "message": {"role": "user", "content": "subagent digging zebracornsubagent"}}])
+    _touch(sub, base_epoch + 90)
     _touch(claude, base_epoch + 100)
     sessions["claude"] = claude
 
