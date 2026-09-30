@@ -73,3 +73,50 @@ Feature: Reading and narrowing sessions
     Then it succeeds
     And the output lists 1 sessions
     And the "claude" harness is in the results
+
+  Scenario: The session navcom runs inside is left out of normal searches
+    When I run with CLAUDE_CODE_SESSION_ID=11111111-2222-4333-8444-555555555555: navcom zebracornclaude
+    Then it succeeds
+    And the output contains "No hits."
+    When I run with CLAUDE_CODE_SESSION_ID=11111111-2222-4333-8444-555555555555: navcom zebracorn
+    Then it succeeds
+    And the output contains "hits from this session (--include-self to show)"
+    And the output does not contain "zebracornclaude"
+    When I run with CLAUDE_CODE_SESSION_ID=11111111-2222-4333-8444-555555555555: navcom zebracornclaude --include-self
+    Then it succeeds
+    And the "claude" harness is in the results
+
+  Scenario: --file accepts a bare session file name
+    When I run: navcom zebracorn --file 11111111-2222-4333-8444-555555555555.jsonl
+    Then it succeeds
+    And the output lists 1 sessions
+    And the "claude" harness is in the results
+
+  Scenario: --latest narrows to the single newest session
+    When I run: navcom zebracorn --latest
+    Then it succeeds
+    And the output lists 1 sessions
+
+  Scenario: --list honours --recent and harness filters
+    When I run: navcom --list --recent 1 --claude
+    Then it succeeds
+    And the output contains "claude"
+    And the output does not contain "codex"
+
+  Scenario: A read-only index is still searchable
+    When I run: navcom zebracorn
+    And I make the index read-only
+    And I run: navcom zebracorncodex
+    Then it succeeds
+    And the "codex" harness is in the results
+
+  Scenario: A hanging summarizer is killed on time
+    Given a summarizer CLI that hangs forever
+    When I run with NAVCOM_SUMMARY_TIMEOUT=6: navcom zebracorn --solo
+    Then it succeeds
+    And stderr contains "timed out"
+
+  Scenario: Unknown flags are reported on stdout too when output is captured
+    When I run: navcom zebracorn --frobnicate
+    Then it fails with exit code 2
+    And the output contains "unrecognized arguments: --frobnicate"

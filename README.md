@@ -66,7 +66,9 @@ Type anything. navcom never throws an FTS5 syntax error.
   it's the "weird"; query, (really)
   EOF
   ```
+- **A half-remembered `"exact phrase"`** that matches nothing is retried as loose words.
 - `--query` and bare words combine, and a leading `search` / `find` is ignored.
+- Only the turn text is matched. Words that appear in project paths don't produce false hits.
 
 ### Narrow it
 
@@ -84,6 +86,11 @@ navcom auth --json                # machine-readable
 
 `--compact` is the default and still accepted, so old scripts keep working.
 
+By default a search leaves out the conversation navcom runs inside when the harness exposes its id
+(`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`, …). Your own session is noise when you want prior
+work. `--include-self` brings it back. `--this-session` searches only the current conversation,
+which is useful after a context compaction. navcom's own past invocations never show up as hits.
+
 ### Read
 
 ```bash
@@ -98,6 +105,16 @@ navcom --latest                   # dump the most recent session
 `--solo` produces one consolidated summary and `--summary` produces one per session. Both use the
 first LLM CLI that works (`claude`, `gemini`, `codex`, then local `ollama`). `--ollama` or `--llmgemini`
 picks a specific one.
+
+## Safe to call from agents
+
+- Parallel calls are fine. If another navcom is writing, a call waits at most ~3s. It then searches
+  the index as it stands and prints a one-line note on stderr.
+- In a read-only sandbox navcom searches the index without refreshing it.
+- Unknown flags print a hint on stdout as well, so a `2>/dev/null` doesn't turn a typo into an empty
+  result that looks like "nothing found".
+- `--solo` and `--summary` have a hard time budget (`NAVCOM_SUMMARY_TIMEOUT`, default 150s). A
+  summarizer that hangs is killed along with its child processes.
 
 ## The index
 

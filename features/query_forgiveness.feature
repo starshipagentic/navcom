@@ -63,3 +63,25 @@ Feature: Queries never break on punctuation or odd syntax
     When I run: navcom zebracorn --jsn
     Then it fails with exit code 2
     And stderr contains "did you mean --json"
+
+  Scenario: --no-prefix with raw hyphens and dots falls back instead of erroring
+    When I run: navcom drizzle-kit --no-prefix
+    Then it succeeds
+    And the output does not contain "no such column"
+    And the "claude" harness is in the results
+    When I run: navcom 10.10.1.223 --no-prefix
+    Then it succeeds
+    And the output does not contain "error"
+
+  Scenario: Words in project paths do not count as hits
+    When I run: navcom proj alpha
+    Then it succeeds
+    And the output contains "No hits."
+
+  Scenario: A half-remembered exact phrase falls back to its words
+    When I search with these literal arguments
+      | arg                |
+      | "drizzle push kit" |
+    Then it succeeds
+    And the output contains "no exact phrase match"
+    And the "claude" harness is in the results

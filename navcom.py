@@ -934,9 +934,41 @@ UPGRADE_BYTES_PER_SECOND = 40_000_000
 MAX_UPGRADE_REREAD_BYTES = 200_000_000
 
 
+INDEX_READ_ONLY = False
+
+
 def open_index(index_path):
+    """Open (and migrate) the index; fall back to read-only if we can't write to it."""
+    global INDEX_READ_ONLY
+    try:
+        return _open_index_rw(index_path)
+    except sqlite3.OperationalError as exc:
+        if not index_path.exists():
+            raise
+        sys.stderr.write(f"[navcom] index is not writable ({exc}); searching it read-only\n")
+    INDEX_READ_ONLY = True
+    try:
+        conn = sqlite3.connect(f"file:{index_path}?mode=ro", uri=True, timeout=10)
+        existing = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+    except sqlite3.OperationalError:
+        # WAL needs a writable -shm file; immutable=1 reads the file as a snapshot
+        conn = sqlite3.connect(f"file:{index_path}?mode=ro&immutable=1", uri=True, timeout=10)
+        existing = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+    # temp-schema stand-ins so every query path still works without writing
+    if "turn_loc" not in existing:
+        conn.execute("CREATE TEMP VIEW turn_loc AS SELECT file, msg_index, rowid AS rid FROM session_fts")
+    if "file_meta" not in existing:
+        conn.execute("CREATE TEMP TABLE file_meta (file TEXT PRIMARY KEY, provider TEXT, project TEXT, title TEXT)")
+    if "file_parser" not in existing:
+        conn.execute("CREATE TEMP TABLE file_parser (file TEXT PRIMARY KEY, ver INTEGER NOT NULL)")
+    return conn
+
+
+def _open_index_rw(index_path):
     index_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(index_path), timeout=60)
+    # short busy timeout: a parallel navcom that is mid-index shouldn't stall us —
+    # we'd rather search the slightly stale index (reads never block under WAL)
+    conn = sqlite3.connect(str(index_path), timeout=3)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
     except sqlite3.OperationalError:
@@ -1037,6 +1069,25 @@ def index_log(conn, log, force=False):
 
 
 def index_logs(conn, logs, force=False, progress=True, upgrade=True):
+    """Bring the index up to date; if it's locked or read-only, keep going with what's there."""
+    global INDEX_READ_ONLY
+    if INDEX_READ_ONLY:
+        return 0
+    try:
+        return _index_logs(conn, logs, force, progress, upgrade)
+    except sqlite3.OperationalError as exc:
+        if _is_query_error(exc):
+            raise
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        sys.stderr.write(f"[navcom] index not refreshed ({exc}); results may miss the newest turns\n")
+        INDEX_READ_ONLY = True  # don't wait on the lock again for cache writes this run
+        return 0
+
+
+def _index_logs(conn, logs, force=False, progress=True, upgrade=True):
     changed = 0
     total = len(logs)
     announced = False
@@ -1099,13 +1150,15 @@ def session_meta(conn, key, provider=None):
         # skip throwaway openers ("hi", "hello", "continue") when something meatier follows
         meaty = [t for t in texts if len(t) >= 20]
         title = (meaty or texts or [""])[0][:160]
-    try:
-        conn.execute(
-            "INSERT OR REPLACE INTO file_meta (file, provider, project, title) VALUES (?, ?, ?, ?)",
-            (key, provider, project, title),
-        )
-    except sqlite3.OperationalError:
-        pass  # index busy elsewhere; metadata is a cache, skip
+    if not INDEX_READ_ONLY or conn.execute(
+            "SELECT 1 FROM sqlite_temp_master WHERE name='file_meta'").fetchone():
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO file_meta (file, provider, project, title) VALUES (?, ?, ?, ?)",
+                (key, provider, project, title),
+            )
+        except sqlite3.OperationalError:
+            pass  # index busy elsewhere; metadata is a cache, skip
     return project, title
 
 
@@ -1350,7 +1403,8 @@ def _key_filter_clause(conn, keys):
 def run_match(conn, match, limit, providers=None, keys=None, snippet_tokens=32, role=None):
     tokens = max(1, min(int(snippet_tokens), SNIPPET_MAX_TOKENS))
     where = "session_fts MATCH ?"
-    params = [match]
+    # Only the turn text — otherwise words in project paths (file column) inflate hits.
+    params = [f"text : ({match})"]
     if providers and set(providers) != set(ALL_PROVIDERS):
         where += f" AND provider IN ({','.join('?' * len(providers))})"
         params.extend(providers)
@@ -1369,9 +1423,18 @@ def run_match(conn, match, limit, providers=None, keys=None, snippet_tokens=32, 
     return [Hit(*row) for row in conn.execute(sql, params).fetchall()]
 
 
+def _is_query_error(exc):
+    msg = str(exc).lower()
+    return "locked" not in msg and "readonly" not in msg and "disk" not in msg
+
+
 def search_hits(conn, query, providers=None, keys=None, limit=20, snippet_tokens=32,
-                no_prefix=False, role=None, any_terms=False, include_self=False):
-    """Returns (hits, cooked_query, note). Never raises on query syntax."""
+                no_prefix=False, role=None, any_terms=False, include_self=False, exclude_keys=None):
+    """Returns (hits, cooked_query, note). Never raises on query syntax.
+
+    Every attempt that FTS5 rejects (syntax error, "no such column" from a raw
+    hyphen, …) falls through to a safer form: raw → cooked → all-literal.
+    """
     attempts = []
     if no_prefix:
         attempts.append(fts_raw_query(query))
@@ -1390,21 +1453,55 @@ def search_hits(conn, query, providers=None, keys=None, limit=20, snippet_tokens
             cooked = candidate
             break
         except sqlite3.OperationalError as exc:
-            if "fts5" not in str(exc) and "syntax" not in str(exc) and "special query" not in str(exc):
+            if not _is_query_error(exc):
                 raise
             continue
-    if not hits and not any_terms and term_count(query) > 1 and not has_operators(query):
+    filtered, excluded = _filter_hits(hits, limit, include_self, exclude_keys)
+    if not filtered and not any_terms and '"' in query.translate(_SMART_QUOTES) and not has_operators(query):
+        # a half-remembered "exact phrase": try its words, in any order
+        loose = query.translate(_SMART_QUOTES).replace('"', " ")
+        for candidate, why in ((fts_prefix_query(loose), "no exact phrase match — showing turns with all of its words"),
+                               (fts_any_query(loose), "no exact phrase match — showing turns with ANY of its words (best first)")):
+            if not candidate or (term_count(loose) < 2 and "ANY" in why):
+                continue
+            try:
+                hits = run_match(conn, candidate, fetch, providers, keys, snippet_tokens, role)
+            except sqlite3.OperationalError as exc:
+                if not _is_query_error(exc):
+                    raise
+                continue
+            filtered, excluded = _filter_hits(hits, limit, include_self, exclude_keys)
+            if filtered:
+                cooked, note = candidate, why
+                break
+    if not filtered and not any_terms and term_count(query) > 1 and not has_operators(query):
         fallback = fts_any_query(query)
         try:
             hits = run_match(conn, fallback, fetch, providers, keys, snippet_tokens, role)
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            if not _is_query_error(exc):
+                raise
             hits = []
-        if hits:
+        filtered, excluded_any = _filter_hits(hits, limit, include_self, exclude_keys)
+        if filtered:
             note = "no single turn contains ALL of those words — showing turns with ANY of them (best first)"
             cooked = fallback
+            excluded = excluded_any
+    if excluded:
+        extra = f"skipped {excluded} hit{'s' if excluded != 1 else ''} from this session (--include-self to show)"
+        note = f"{note}; {extra}" if note else extra
+    return filtered, cooked, note
+
+
+def _filter_hits(hits, limit, include_self, exclude_keys):
+    """Drop navcom's own past invocations, the calling session and duplicate turns."""
     filtered, seen = [], set()
+    excluded = 0
     for hit in hits:
         if not include_self and hit.role == "cmd" and _NAVCOM_CMD_RE.search(hit.text or ""):
+            continue
+        if exclude_keys and hit.file in exclude_keys:
+            excluded += 1
             continue
         sig = (hit.role, re.sub(r"\s+", " ", (hit.text or "")[:400]))
         if sig in seen:
@@ -1413,7 +1510,7 @@ def search_hits(conn, query, providers=None, keys=None, limit=20, snippet_tokens
         filtered.append(hit)
         if len(filtered) >= limit:
             break
-    return filtered, cooked, note
+    return filtered, excluded
 
 
 def window_ranges_for_hits(hits, window):
@@ -1657,6 +1754,65 @@ def _gemini_restore_mcp(backup_path):
         pass
 
 
+SUMMARY_TOTAL_TIMEOUT = float(os.environ.get("NAVCOM_SUMMARY_TIMEOUT") or 150)
+SUMMARY_ENGINE_TIMEOUT = 90
+_SUMMARY_DEADLINE = None
+
+
+def _summary_time_left():
+    global _SUMMARY_DEADLINE
+    import time
+    if _SUMMARY_DEADLINE is None:
+        _SUMMARY_DEADLINE = time.monotonic() + SUMMARY_TOTAL_TIMEOUT
+    return max(0.0, min(SUMMARY_ENGINE_TIMEOUT, _SUMMARY_DEADLINE - time.monotonic()))
+
+
+def run_bounded(cmd, stdin_text, timeout, env=None):
+    """Run a helper CLI with a hard timeout; on timeout kill its whole process group.
+
+    Returns (returncode or None on timeout, stdout, stderr).
+    """
+    import signal
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=env, start_new_session=True,
+        )
+    except FileNotFoundError:
+        return 127, "", f"{cmd[0]} not found"
+    try:
+        out, err = proc.communicate(stdin_text, timeout=timeout)
+        return proc.returncode, out or "", err or ""
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            proc.kill()
+        proc.communicate()
+        return None, "", "timeout"
+    except BaseException:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+        raise
+
+
+def _run_ollama_bounded(model, prompt):
+    timeout = _summary_time_left()
+    if timeout < 5:
+        return None, "summary time budget used up (NAVCOM_SUMMARY_TIMEOUT)"
+    rc, out, err = run_bounded(["ollama", "run", model], prompt, timeout)
+    if rc is None:
+        return None, f"ollama timed out after {int(timeout)}s"
+    if rc != 0:
+        return None, err.strip() or "ollama failed"
+    return out.strip(), None
+
+
+clean_mod.run_ollama = _run_ollama_bounded
+
+
 def _try_cli_summarize(cli_cmd, text, prompt_template=None, env_override=None, prompt_flag=None):
     """Try summarizing via a CLI LLM. Returns (summary, label) or (None, None)."""
     text = _strip_conversation_artifacts(text)
@@ -1682,13 +1838,16 @@ def _try_cli_summarize(cli_cmd, text, prompt_template=None, env_override=None, p
             cmd = cli_cmd + [prompt_flag, instruction]
         else:
             cmd = cli_cmd + [instruction]
-        result = subprocess.run(
-            cmd,
-            input=text,
-            capture_output=True, text=True, timeout=120, env=env,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip(), None
+        timeout = _summary_time_left()
+        if timeout < 5:
+            sys.stderr.write("[navcom] summary time budget used up (NAVCOM_SUMMARY_TIMEOUT)\n")
+            return None, None
+        sys.stderr.write(f"[navcom] summarizing with {cli_cmd[0]} (up to {int(timeout)}s)…\n")
+        rc, out, _ = run_bounded(cmd, text, timeout, env=env)
+        if rc == 0 and out.strip():
+            return out.strip(), None
+        if rc is None:
+            sys.stderr.write(f"[navcom] {cli_cmd[0]} timed out after {int(timeout)}s — killed\n")
     except Exception as e:
         sys.stderr.write(f"  [navcom] {cli_cmd[0]} error: {type(e).__name__}: {e}\n")
     return None, None
@@ -1866,8 +2025,16 @@ class NavcomArgumentParser(argparse.ArgumentParser):
                         suggestions.append(f"{bad} → did you mean {' or '.join(close)}?")
             if suggestions:
                 hint = "\n  " + "\n  ".join(suggestions)
-        sys.stderr.write(f"navcom: {message}{hint}\n")
-        sys.stderr.write("Try: navcom <words>   ·   navcom --help   (search terms need no flag and no quotes)\n")
+        text = (f"navcom: {message}{hint}\n"
+                "Try: navcom <words>   ·   navcom --help   (search terms need no flag and no quotes)\n")
+        sys.stderr.write(text)
+        try:
+            # agents often run `navcom … 2>/dev/null` and then read an empty result as
+            # "nothing found" — when stdout is captured, say it there too
+            if not sys.stdout.isatty() and not sys.stderr.isatty():
+                sys.stdout.write(text)
+        except Exception:
+            pass
         raise SystemExit(2)
 
 
@@ -2010,6 +2177,18 @@ SESSION_ID_ENV = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID
                   "OPENCODE_SESSION_ID", "PI_SESSION_ID", "OMO_SESSION_ID", "GEMINI_SESSION_ID")
 
 
+def env_session_log(logs):
+    """The log of the conversation navcom runs inside — only when the harness says so."""
+    for var in SESSION_ID_ENV:
+        sid = os.environ.get(var)
+        if not sid:
+            continue
+        for log in reversed(logs):
+            if session_ref(log[0]) == sid or log[0].endswith("#" + sid):
+                return log
+    return None
+
+
 def current_session_log(logs):
     """The log of the conversation navcom is being run from, if the harness tells us."""
     for var in SESSION_ID_ENV:
@@ -2115,7 +2294,7 @@ def filter_keys(conn, keys, providers, args):
             if needle is not None and needle not in norm:
                 continue
         out.append(key)
-    if new_meta:
+    if new_meta and not INDEX_READ_ONLY:
         try:
             conn.executemany(
                 "INSERT OR IGNORE INTO file_meta (file, provider, project, title) VALUES (?, ?, ?, NULL)", new_meta
@@ -2360,12 +2539,17 @@ def run(argv=None):
         if not logs:
             safe_print("No logs found.")
             return 0
+        indexed = list(enumerate(logs))
+        if args.recent:
+            keep = set()
+            for prov in providers:
+                keep.update([i for i, l in indexed if l[3] == prov][-args.recent:])
+            indexed = [(i, l) for i, l in indexed if i in keep]
         limit = 50 if args.limit is None else args.limit
-        start = max(0, len(logs) - limit) if limit else 0
-        if start:
-            safe_print(STYLE.dim(f"(showing last {len(logs) - start} of {len(logs)}; --limit 0 for all)"))
-        for idx in range(start, len(logs)):
-            key, mtime, size, prov = logs[idx]
+        if limit and len(indexed) > limit:
+            safe_print(STYLE.dim(f"(showing last {limit} of {len(indexed)}; --limit 0 for all)"))
+            indexed = indexed[-limit:]
+        for idx, (key, mtime, size, prov) in indexed:
             stamp = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S") if mtime else "????-??-?? ??:??:??"
             safe_print(f"{idx:03d} {stamp} {size:9d} {prov:8s} {key}")
         return 0
@@ -2387,6 +2571,14 @@ def run(argv=None):
             targets = [logs[idx]]
         else:
             log = log_for_path(args.file)
+            if log is None:
+                # a bare file name / uuid / ref: look for it among the sessions on disk
+                want = args.file.strip()
+                stem = Path(want).stem if want.endswith((".jsonl", ".json")) else want
+                on_disk = [l for l in logs if Path(l[0].split("#")[-1]).name == want
+                           or session_ref(l[0]) == stem or session_ref(l[0]).startswith(stem)
+                           or short_ref(l[0]) == stem or l[0].endswith("#" + want)]
+                log = on_disk[-1] if on_disk else None
             if log is None:
                 key, _ = resolve_ref(conn, args.file, providers)
                 log = next((l for l in logs if l[0] == key), None) if key else None
@@ -2450,11 +2642,16 @@ def run(argv=None):
         return 2
 
     limit = 20 if args.limit is None else args.limit
+    exclude = None
+    if not args.include_self and not explicit_scope:
+        me = env_session_log(logs)
+        if me:
+            exclude = {me[0]}
     hits, cooked, note = search_hits(
         conn, query, providers=providers, keys=keys,
         limit=limit or 100000, snippet_tokens=args.snippet_tokens,
         no_prefix=args.no_prefix, role=args.role, any_terms=args.any,
-        include_self=args.include_self,
+        include_self=args.include_self, exclude_keys=exclude,
     )
     if not hits:
         scope = ", ".join(providers) if set(providers) != set(ALL_PROVIDERS) else "all harnesses"
@@ -2479,6 +2676,8 @@ def run(argv=None):
     if not args.context and not args.summary:
         max_chars = 220 if args.max_chars is None else args.max_chars
         print_compact(conn, groups, max_chars, len(hits), cooked, note)
+        if limit and len(hits) >= limit:
+            safe_print(STYLE.dim(f"(showing the top {limit} hits — more: -n {limit * 3}; narrower: --here / --days 7 / --claude / more words)"))
         conn.commit()
         conn.close()
         return 0

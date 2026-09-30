@@ -113,3 +113,29 @@ def step_run_bare(context):
 def step_run_with_env(context, var, value, cmdline):
     context.env = dict(context.env, **{var: value})
     _run(context, shlex.split(cmdline))
+
+
+@when("I make the index read-only")
+def step_ro(context):
+    import os
+    from pathlib import Path
+    idx = Path(context.env["NAVCOM_INDEX"])
+    for p in idx.parent.glob(idx.name + "*"):
+        os.chmod(p, 0o444)
+    os.chmod(idx.parent, 0o555)
+    context.add_cleanup(os.chmod, idx.parent, 0o755)
+
+
+@given("a summarizer CLI that hangs forever")
+def step_hang(context):
+    import os
+    bindir = context.tmp / "bin"
+    bindir.mkdir(exist_ok=True)
+    for name in ("claude", "gemini", "codex", "ollama"):
+        script = bindir / name
+        script.write_text("#!/bin/sh\nsleep 600 &\nsleep 600\n")
+        os.chmod(script, 0o755)
+    context.env["PATH"] = f"{bindir}:/usr/bin:/bin"
+    skip = context.home / ".codex" / "navcom-skip-cache"
+    if skip.exists():
+        skip.unlink()
