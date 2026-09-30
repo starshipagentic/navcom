@@ -139,3 +139,53 @@ def step_hang(context):
     skip = context.home / ".codex" / "navcom-skip-cache"
     if skip.exists():
         skip.unlink()
+
+
+def _skill_path(context, which):
+    base = {"claude": ".claude", "codex": ".codex", "agents": ".agents"}[which]
+    return context.home / base / "skills" / "navcom-session-recall" / "SKILL.md"
+
+
+@then('the skill card exists for "{which}"')
+def step_skill_exists(context, which):
+    p = _skill_path(context, which)
+    assert p.exists() and "name: navcom-session-recall" in p.read_text(), p
+
+
+@then('the skill card is missing for "{which}"')
+def step_skill_missing(context, which):
+    assert not _skill_path(context, which).exists()
+
+
+@then("stderr does not mention skills")
+def step_quiet(context):
+    assert "skill" not in context.err.lower(), context.err
+
+
+@when('I edit the "{which}" skill card')
+def step_edit(context, which):
+    p = _skill_path(context, which)
+    p.write_text(p.read_text() + "\nMY LOCAL EDIT\n")
+
+
+@then('the "{which}" skill card still has my edit')
+def step_kept(context, which):
+    assert "MY LOCAL EDIT" in _skill_path(context, which).read_text()
+
+
+@when('the "{which}" skill card is from an older navcom')
+def step_older(context, which):
+    import hashlib
+    import json
+    p = _skill_path(context, which)
+    old = p.read_text().replace("# NavCom session recall", "# NavCom session recall (old)")
+    p.write_text(old)
+    state = context.home / "navcom-skills.json"
+    data = json.loads(state.read_text())
+    data[str(p)] = hashlib.sha256(old.encode()).hexdigest()
+    state.write_text(json.dumps(data))
+
+
+@then('the "{which}" skill card is current')
+def step_current(context, which):
+    assert "(old)" not in _skill_path(context, which).read_text()

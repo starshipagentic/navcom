@@ -27,6 +27,16 @@ pipx upgrade navcom
 
 No dependencies. Python 3.10+.
 
+On every run, navcom silently installs or refreshes a small **agent skill card**
+(`navcom-session-recall/SKILL.md`) into each harness that is present:
+`~/.claude/skills` (Claude Code; opencode and goose read it too), `$CODEX_HOME/skills` (Codex) and
+`~/.agents/skills` (the Agent Skills location that pi, omo, opencode and goose read). Your agents then
+know navcom exists before anyone mentions it. A card someone has edited is never overwritten.
+`navcom --install-skills` shows where it went, and `NAVCOM_NO_SKILLS=1` turns it off.
+
+`navcom --help` is the full manual, written for LLMs: the two-step recipe, the query rules and an
+example for every option. The test suite runs every example in it.
+
 ## Use
 
 ```bash
@@ -79,9 +89,10 @@ navcom auth --here                # sessions whose working dir is the current di
 navcom auth --project syra        # sessions whose project path contains "syra"
 navcom auth --days 7              # active in the last week (also --since 2026-09-01, --since 12h)
 navcom auth --user                # only what you typed; --cmd for shell commands the agent ran
-navcom auth -n 50                 # more hits (default 20)
+navcom auth -n 50                 # hits PER HARNESS (default 20) — every harness gets its own share
 navcom auth --newest              # order sessions by date instead of relevance
 navcom auth --json                # machine-readable
+navcom -v                         # version (also -V, --version)
 ```
 
 `--compact` is the default and still accepted, so old scripts keep working.

@@ -1,78 +1,72 @@
 ---
 name: navcom-session-recall
-description: Recover prior coding-session context with the local navcom command (searches Claude Code, Codex, Gemini CLI, pi, omo, opencode and goose transcripts). Use when the user asks to find old conversations; says to use navcom; wants a previous thread/session recovered; asks what happened before on a topic; wants to recall something from earlier in the current conversation after compaction; or needs compact evidence from past CLI coding logs before continuing work.
+description: Search every past AI coding session on this machine (Claude Code, Codex, Gemini CLI, pi, omo, opencode, goose) with the local `navcom` CLI. Use when the user says "use navcom", asks to find an old conversation or thread, asks what was done/decided/tried before on a topic, wants to recover context after a compaction, or needs evidence from past sessions (commands run, errors seen, decisions) before continuing work.
 ---
+<!-- managed by navcom: updated automatically on upgrade; edit freely and it will be left alone -->
 
-# NavCom Session Recall
+# NavCom session recall
 
-`navcom` is a sub-second full-text search over every coding-agent transcript on this machine.
-Output is plain text grouped by session, with a date, the harness, the project dir and a **ref**
-for each session.
+`navcom` is a sub-second full-text search (SQLite FTS5 + BM25) over every coding-agent transcript
+on this machine. Output is plain text grouped by session: date, harness, project dir, a **ref**, and
+the matching turns (`#533 user: …«match»…`).
 
-## The two-step recipe
-
-```bash
-navcom topic words here                 # 1. find: compact hits, grouped by session (default 20 hits)
-navcom --open <ref>:<turn>              # 2. read: the turns around one hit, full length
-```
-
-Step 1 prints refs like `ref 7ec78a59` and turn numbers like `#533`, and ends with a ready-to-run
-`--open` line. Don't `find`/`rg` the raw JSONL. `--open` reads the same content faster, and it still
-works for sessions the harness has since deleted.
-
-## Queries: just type them
-
-- No flag and no quoting needed: `navcom cerbos wave 2`. `--query "…"` also works, and both combine.
-- Punctuation is safe: `10.10.1.223`, `don't`, `PR #76`, `cerbos-wave-2`, `main()`,
-  `file.py`, `sg-0f12a…`, `user@x.com`. **Never strip punctuation by hand.**
-- All words must be in one turn, prefix-matched. If nothing has them all, navcom automatically shows
-  any-word matches and prints a `note:` line.
-- Alternatives: `a OR b`, or a comma list `cognito, cerbos, terraform`.
-- `"exact phrase"` falls back to its loose words if the exact phrase isn't found.
-- Awkward shell quoting? Send the query on stdin: `navcom - <<'EOF'` … `EOF`.
-- Prefer 2–4 distinctive words (ids, service names, error strings, file names) over sentences.
-
-## Narrowing
+## The recipe
 
 ```bash
-navcom deploy --here                    # sessions from the current working directory
-navcom deploy --project syrab2b         # project path contains "syrab2b"
-navcom deploy --days 7                  # or --since 2026-09-01 / --since 12h, --until …
-navcom deploy --claude                  # or --codex --gemini --pi --omo --opencode --goose, -p claude,pi
-navcom deploy --user                    # only what the user typed;  --cmd = shell commands run
-navcom deploy --newest -n 40            # newest sessions first, more hits
-navcom goal --this-session              # only THIS conversation (recall after compaction)
-navcom                                  # recent sessions with titles
+navcom topic words here          # 1. find  (no flag, no quotes needed)
+navcom --open <ref>:<turn>       # 2. read the turns around one hit, full text
 ```
 
-- The current conversation is excluded from normal searches automatically. `--include-self` brings it back.
-- `--this` means "the harness I'm running in", not the current directory. Use `--here` for the directory.
+Step 1 prints a ready-to-run `--open` line. Do not grep the raw JSONL. `--open` is faster and
+still works for sessions the harness has since deleted.
 
-## Reading more
+## Queries: type them as-is
+
+- Punctuation is safe: `10.10.1.223`, `don't`, `PR #76`, `cerbos-wave-2`, `main()`, `file.py`,
+  `user@x.com`. **Never strip punctuation by hand.**
+- All words must appear in one turn, prefix-matched (`auth` matches `authentication`). If no turn
+  has them all, navcom shows turns with ANY of them (rare words rank first) and prints a `note:`.
+- `a OR b`, `a | b`, or a comma list `cognito, cerbos, fhir` means any of them. `NOT x` excludes.
+- `"exact phrase"` falls back to loose words when the phrase isn't found.
+- Lowercase `and` is ignored and lowercase `or` means OR.
+- Awkward shell quoting? `navcom - <<'EOF'` … `EOF` reads the query from stdin.
+- 2–4 distinctive words (ids, error strings, service or file names) beat long sentences.
+
+## Narrow or widen
 
 ```bash
-navcom --open 7ec78a59:533              # 3 turns either side of #533
-navcom --open 7ec78a59:520-560          # a range of turns
-navcom --open 7ec78a59 --user           # every user turn in that session
-navcom deploy --context --window-turns 4   # expand every hit in place (larger output)
-navcom deploy --json                    # structured output
+navcom deploy -n 50              # hits PER HARNESS (default 20). Every harness gets its own share
+navcom deploy --claude           # also --codex --gemini --pi --omo --opencode --goose, or -p claude,pi
+navcom deploy --here             # sessions started in this directory (or below)
+navcom deploy --project syra     # working dir contains "syra"
+navcom deploy --days 7           # or --since 2026-09-01 / --since 12h / --until …
+navcom deploy --user             # only what the user typed;  --cmd = shell commands that were run
+navcom deploy --newest           # newest sessions first
+navcom goal --this-session       # only THIS conversation (recall after compaction)
+navcom                           # no query: the 20 most recent sessions, with titles
 ```
 
-## Behaviour worth knowing
+- The conversation you run navcom from is skipped automatically (`--include-self` keeps it).
+- `--this` = the harness you're running in. For the current directory use `--here`.
 
-- Parallel navcom calls are fine. A locked index costs about 3 seconds, then navcom searches what's
-  already indexed.
-- Read-only sandboxes work: it searches without refreshing and notes this on stderr.
-- `--solo` and `--summary` call another LLM CLI, so they are slow (a hard 150s cap). Prefer the
-  two-step recipe and summarize yourself.
-- Unknown flags print a hint on stdout as well, so an empty result after `2>/dev/null` really does
-  mean no hits.
-- `navcom --where` shows which harness logs exist and index stats. `navcom --version` shows the version.
+## Read more
+
+```bash
+navcom --open 7ec78a59:533       # 3 turns either side of #533 (--window-turns N for more)
+navcom --open 7ec78a59:520-560   # a range of turns
+navcom --open 7ec78a59 --user    # every user turn in that session
+navcom deploy --context          # expand every hit in place
+navcom deploy --json             # structured: sessions[] with ref, date, project, hits[]
+```
+
+## Good to know
+
+- Parallel runs are fine. Read-only sandboxes work (they search without refreshing the index).
+- `--solo` / `--summary` hand the hits to another LLM CLI, so they're slow (≤150s). Usually
+  better to read the hits and summarize them yourself.
+- `navcom --help` is the full manual. `navcom --where` shows which harness logs exist.
 
 ## Evidence pattern
 
-When answering, separate:
-
-- What navcom found: session ref, date, harness, project, turn numbers and the quoted snippets.
-- What you verified now: current repo state, files and live services.
-- What is memory-derived or stale: old deploys, cloud state and credentials, until revalidated.
+Report what navcom found (session ref, date, harness, project, turn numbers and quoted snippets)
+separately from what you verified live now, and flag anything memory-derived as possibly stale.

@@ -55,7 +55,8 @@ def load_module(code, name):
 clean_mod = load_module(LOG_CLEAN_QUICK_CODE, "log_clean_quick")
 fts_mod = load_module(LOG_SEARCH_FTS5_CODE, "log_search_fts5")
 
-NAVCOM_VERSION = "0.2.0"
+NAVCOM_VERSION = "0.2.1"
+DEFAULT_LIMIT = 20  # hits per harness (and sessions listed by a bare `navcom`)
 
 # Every harness navcom knows how to read. Order = display order in help/listings.
 ALL_PROVIDERS = ["claude", "codex", "gemini", "pi", "omo", "opencode", "goose"]
@@ -79,6 +80,7 @@ class Hit:
     provider: str
     snip: str
     text: str
+    rank: float = 0.0
 
 
 DEFAULT_SUMMARY_TEMPLATE = (
@@ -1417,7 +1419,7 @@ def run_match(conn, match, limit, providers=None, keys=None, snippet_tokens=32, 
     params.append(limit)
     sql = (
         "SELECT ts, role, file, msg_index, provider, "
-        f"snippet(session_fts, 0, '«', '»', '…', {tokens}), text "
+        f"snippet(session_fts, 0, '«', '»', '…', {tokens}), text, rank "
         f"FROM session_fts WHERE {where} ORDER BY rank LIMIT ?"
     )
     return [Hit(*row) for row in conn.execute(sql, params).fetchall()]
@@ -1428,69 +1430,76 @@ def _is_query_error(exc):
     return "locked" not in msg and "readonly" not in msg and "disk" not in msg
 
 
+def _search_once(conn, match, providers, keys, per_harness, snippet_tokens, role, include_self, exclude_keys):
+    """Run one MATCH separately for each harness so every harness gets up to
+    `per_harness` hits (a busy harness can't crowd the others out), then merge by BM25."""
+    merged, excluded = [], 0
+    for prov in providers or [None]:
+        raw = run_match(conn, match, per_harness * 3 + 30, [prov] if prov else None, keys, snippet_tokens, role)
+        kept, skipped = _filter_hits(raw, per_harness, include_self, exclude_keys)
+        merged.extend(kept)
+        excluded += skipped
+    merged.sort(key=lambda h: h.rank)
+    return merged, excluded
+
+
 def search_hits(conn, query, providers=None, keys=None, limit=20, snippet_tokens=32,
                 no_prefix=False, role=None, any_terms=False, include_self=False, exclude_keys=None):
-    """Returns (hits, cooked_query, note). Never raises on query syntax.
+    """Returns (hits, cooked_query, note). `limit` is per harness. Never raises on query syntax.
 
-    Every attempt that FTS5 rejects (syntax error, "no such column" from a raw
-    hyphen, …) falls through to a safer form: raw → cooked → all-literal.
+    Fallback chain — each step only if the previous one found nothing:
+      raw (--no-prefix) → cooked → all-literal   (any form FTS5 rejects is skipped)
+      "exact phrase"    → its words, all → its words, any
+      several words     → any of them (BM25 ranks rare words first)
     """
-    attempts = []
+    providers = list(providers or ALL_PROVIDERS)
+
+    def attempt(match):
+        try:
+            return _search_once(conn, match, providers, keys, limit, snippet_tokens, role,
+                                include_self, exclude_keys)
+        except sqlite3.OperationalError as exc:
+            if not _is_query_error(exc):
+                raise
+            return None
+
+    forms = []
     if no_prefix:
-        attempts.append(fts_raw_query(query))
-    if any_terms:
-        attempts.append(fts_any_query(query))
-    else:
-        attempts.append(fts_prefix_query(query))
-    attempts.append(fts_literal_query(query))
-    hits, cooked, note = [], "", ""
-    fetch = limit * 3 + 30
-    for candidate in attempts:
-        if not candidate:
+        forms.append(fts_raw_query(query))
+    forms.append(fts_any_query(query) if any_terms else fts_prefix_query(query))
+    forms.append(fts_literal_query(query))
+    hits, excluded, cooked, note = [], 0, "", ""
+    for form in forms:
+        if not form:
             continue
-        try:
-            hits = run_match(conn, candidate, fetch, providers, keys, snippet_tokens, role)
-            cooked = candidate
+        result = attempt(form)
+        if result is not None:
+            (hits, excluded), cooked = result, form
             break
-        except sqlite3.OperationalError as exc:
-            if not _is_query_error(exc):
-                raise
-            continue
-    filtered, excluded = _filter_hits(hits, limit, include_self, exclude_keys)
-    if not filtered and not any_terms and '"' in query.translate(_SMART_QUOTES) and not has_operators(query):
-        # a half-remembered "exact phrase": try its words, in any order
-        loose = query.translate(_SMART_QUOTES).replace('"', " ")
-        for candidate, why in ((fts_prefix_query(loose), "no exact phrase match — showing turns with all of its words"),
-                               (fts_any_query(loose), "no exact phrase match — showing turns with ANY of its words (best first)")):
-            if not candidate or (term_count(loose) < 2 and "ANY" in why):
-                continue
-            try:
-                hits = run_match(conn, candidate, fetch, providers, keys, snippet_tokens, role)
-            except sqlite3.OperationalError as exc:
-                if not _is_query_error(exc):
-                    raise
-                continue
-            filtered, excluded = _filter_hits(hits, limit, include_self, exclude_keys)
-            if filtered:
-                cooked, note = candidate, why
+
+    plain = query.translate(_SMART_QUOTES)
+    if not hits and not any_terms and '"' in plain and not has_operators(query):
+        loose = plain.replace('"', " ")
+        steps = [(fts_prefix_query(loose), "no exact phrase match — showing turns with all of its words")]
+        if term_count(loose) > 1:
+            steps.append((fts_any_query(loose), "no exact phrase match — showing turns with ANY of its words (best first)"))
+        for form, why in steps:
+            result = attempt(form) if form else None
+            if result and result[0]:
+                (hits, excluded), cooked, note = result, form, why
                 break
-    if not filtered and not any_terms and term_count(query) > 1 and not has_operators(query):
-        fallback = fts_any_query(query)
-        try:
-            hits = run_match(conn, fallback, fetch, providers, keys, snippet_tokens, role)
-        except sqlite3.OperationalError as exc:
-            if not _is_query_error(exc):
-                raise
-            hits = []
-        filtered, excluded_any = _filter_hits(hits, limit, include_self, exclude_keys)
-        if filtered:
-            note = "no single turn contains ALL of those words — showing turns with ANY of them (best first)"
-            cooked = fallback
-            excluded = excluded_any
+
+    if not hits and not any_terms and term_count(query) > 1 and not has_operators(query):
+        form = fts_any_query(query)
+        result = attempt(form) if form else None
+        if result and result[0]:
+            (hits, excluded), cooked = result, form
+            note = "no single turn contains ALL of those words — showing turns with ANY of them (rare words rank first)"
+
     if excluded:
         extra = f"skipped {excluded} hit{'s' if excluded != 1 else ''} from this session (--include-self to show)"
         note = f"{note}; {extra}" if note else extra
-    return filtered, cooked, note
+    return hits, cooked, note
 
 
 def _filter_hits(hits, limit, include_self, exclude_keys):
@@ -1957,54 +1966,236 @@ def summarize_text(text, model, prompt_template=None, summary_mode="chrono", dum
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Agent skill card — installed silently so every harness knows navcom exists
+# ─────────────────────────────────────────────────────────────────────────────
+
+SKILL_NAME = "navcom-session-recall"
+SKILL_MARKER = "<!-- managed by navcom: updated automatically on upgrade; edit freely and it will be left alone -->"
+SKILL_MD = """---
+name: navcom-session-recall
+description: Search every past AI coding session on this machine (Claude Code, Codex, Gemini CLI, pi, omo, opencode, goose) with the local `navcom` CLI. Use when the user says "use navcom", asks to find an old conversation or thread, asks what was done/decided/tried before on a topic, wants to recover context after a compaction, or needs evidence from past sessions (commands run, errors seen, decisions) before continuing work.
+---
+""" + SKILL_MARKER + """
+
+# NavCom session recall
+
+`navcom` is a sub-second full-text search (SQLite FTS5 + BM25) over every coding-agent transcript
+on this machine. Output is plain text grouped by session: date, harness, project dir, a **ref**, and
+the matching turns (`#533 user: …«match»…`).
+
+## The recipe
+
+```bash
+navcom topic words here          # 1. find  (no flag, no quotes needed)
+navcom --open <ref>:<turn>       # 2. read the turns around one hit, full text
+```
+
+Step 1 prints a ready-to-run `--open` line. Do not grep the raw JSONL. `--open` is faster and
+still works for sessions the harness has since deleted.
+
+## Queries: type them as-is
+
+- Punctuation is safe: `10.10.1.223`, `don't`, `PR #76`, `cerbos-wave-2`, `main()`, `file.py`,
+  `user@x.com`. **Never strip punctuation by hand.**
+- All words must appear in one turn, prefix-matched (`auth` matches `authentication`). If no turn
+  has them all, navcom shows turns with ANY of them (rare words rank first) and prints a `note:`.
+- `a OR b`, `a | b`, or a comma list `cognito, cerbos, fhir` means any of them. `NOT x` excludes.
+- `"exact phrase"` falls back to loose words when the phrase isn't found.
+- Lowercase `and` is ignored and lowercase `or` means OR.
+- Awkward shell quoting? `navcom - <<'EOF'` … `EOF` reads the query from stdin.
+- 2–4 distinctive words (ids, error strings, service or file names) beat long sentences.
+
+## Narrow or widen
+
+```bash
+navcom deploy -n 50              # hits PER HARNESS (default 20). Every harness gets its own share
+navcom deploy --claude           # also --codex --gemini --pi --omo --opencode --goose, or -p claude,pi
+navcom deploy --here             # sessions started in this directory (or below)
+navcom deploy --project syra     # working dir contains "syra"
+navcom deploy --days 7           # or --since 2026-09-01 / --since 12h / --until …
+navcom deploy --user             # only what the user typed;  --cmd = shell commands that were run
+navcom deploy --newest           # newest sessions first
+navcom goal --this-session       # only THIS conversation (recall after compaction)
+navcom                           # no query: the 20 most recent sessions, with titles
+```
+
+- The conversation you run navcom from is skipped automatically (`--include-self` keeps it).
+- `--this` = the harness you're running in. For the current directory use `--here`.
+
+## Read more
+
+```bash
+navcom --open 7ec78a59:533       # 3 turns either side of #533 (--window-turns N for more)
+navcom --open 7ec78a59:520-560   # a range of turns
+navcom --open 7ec78a59 --user    # every user turn in that session
+navcom deploy --context          # expand every hit in place
+navcom deploy --json             # structured: sessions[] with ref, date, project, hits[]
+```
+
+## Good to know
+
+- Parallel runs are fine. Read-only sandboxes work (they search without refreshing the index).
+- `--solo` / `--summary` hand the hits to another LLM CLI, so they're slow (≤150s). Usually
+  better to read the hits and summarize them yourself.
+- `navcom --help` is the full manual. `navcom --where` shows which harness logs exist.
+
+## Evidence pattern
+
+Report what navcom found (session ref, date, harness, project, turn numbers and quoted snippets)
+separately from what you verified live now, and flag anything memory-derived as possibly stale.
+"""
+
+
+def skill_targets():
+    """Skill folders of the harnesses that are actually installed here."""
+    home = Path.home()
+    claude_home = _env_path("CLAUDE_CONFIG_DIR") or home / ".claude"
+    codex_home = _env_path("CODEX_HOME") or home / ".codex"
+    targets = []
+    if claude_home.is_dir():
+        targets.append(claude_home / "skills")          # Claude Code (opencode/goose read it too)
+    if codex_home.is_dir():
+        targets.append(codex_home / "skills")           # Codex
+    agents_users = [home / ".agents", home / ".pi", home / ".omo", opencode_data_root(),
+                    home / ".config" / "opencode", home / ".config" / "goose", home / ".gemini"]
+    if any(p.is_dir() for p in agents_users):
+        targets.append(home / ".agents" / "skills")     # Agent Skills standard: pi, omo, opencode, goose
+    return targets
+
+
+def _skill_state_path():
+    return default_index_path().parent / "navcom-skills.json"
+
+
+def install_skills(force=False, report=False):
+    """Write/refresh the skill card in every harness's skill folder.
+
+    Missing → written. Ours and unchanged since we wrote it → updated to this version.
+    Edited by someone (hash differs) or not ours → left alone, unless force.
+    """
+    import hashlib
+    digest = lambda text: hashlib.sha256(text.encode("utf-8")).hexdigest()
+    want = digest(SKILL_MD)
+    state_path = _skill_state_path()
+    try:
+        state = json.loads(state_path.read_text())
+    except Exception:
+        state = {}
+    changed, done = False, []
+    for root in skill_targets():
+        path = root / SKILL_NAME / "SKILL.md"
+        key = str(path)
+        try:
+            current = path.read_text(encoding="utf-8") if path.exists() else None
+        except OSError:
+            continue
+        if current is not None and digest(current) == want:
+            if state.get(key) != want:
+                state[key], changed = want, True
+            done.append((path, "up to date"))
+            continue
+        ours = current is None or (SKILL_MARKER in current and state.get(key) in (None, digest(current)))
+        if not ours and not force:
+            done.append((path, "left alone (edited by someone)"))
+            continue
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(SKILL_MD, encoding="utf-8")
+        except OSError as exc:
+            done.append((path, f"not writable: {exc}"))
+            continue
+        state[key], changed = want, True
+        done.append((path, "installed" if current is None else "updated"))
+    if changed:
+        try:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(json.dumps(state, indent=1))
+        except OSError:
+            pass
+    if report:
+        if not done:
+            safe_print("navcom: no agent harness found to install the skill into")
+        for path, what in done:
+            safe_print(f"  {what:32s} {path}")
+    return done
+
+
+def auto_install_skills():
+    """Silent, cheap (a few stats + small reads), never fails the command."""
+    if os.environ.get("NAVCOM_NO_SKILLS"):
+        return
+    try:
+        install_skills()
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
 HELP_TEXT = """\
-NavCom — super-fast search over your past AI coding sessions.
-Harnesses: Claude Code, Codex, Gemini CLI, pi, omo, opencode, goose.
+navcom — instant full-text search over every AI coding session on this machine:
+Claude Code, Codex, Gemini CLI, pi, omo, opencode, goose.  SQLite FTS5 + BM25, ~0.2s.
 
-QUICK START
-  navcom drizzle migration          search every harness (compact: one line per hit)
-  navcom "drizzle migration"        same — quoting is optional, punctuation is safe
-  navcom --open 395e14b4:73         read the turns around hit #73 of session 395e14b4
-  navcom drizzle --context          expand every hit with the turns around it
-  navcom drizzle --solo             one LLM summary of everything that matched
-  navcom                            list your most recent sessions
+THE RECIPE (agents: this is all you need)
+  1. navcom <words>                 find: hits grouped by session → date, harness, project, ref, #turn
+  2. navcom --open <ref>:<turn>     read the turns around one hit, full text
+  Don't grep raw session logs, don't strip punctuation, don't bother with --compact (it's the default).
 
-QUERY RULES (all forgiving — navcom never throws a syntax error)
-  words            all must appear in the same turn; each is prefix-matched (auth → authentication)
-  "exact phrase"   phrase match
-  a OR b           either (also: a | b); falls back to ANY-word automatically if ALL finds nothing
-  NOT x            exclude (uppercase)
-  punctuation      commas, semicolons, apostrophes, quotes, colons, parens, dots, slashes — all fine
-  awkward quoting? pipe it:  navcom - <<'EOF'
-                               it's the "weird"; query, (really)
-                             EOF
+QUERIES — type anything; navcom never errors on query syntax
+  navcom cognito token refresh      all words in one turn, each prefix-matched (auth → authentication)
+  navcom "exact phrase"             phrase; if it isn't found, retried as loose words
+  navcom cognito OR cerbos          either one (also: or, |)
+  navcom cognito, cerbos, fhir      a comma/semicolon list = any of them
+  navcom deploy NOT staging         exclude (uppercase NOT)
+  navcom 10.10.1.223 "don't" PR #76 main() v0.1.3 cerbos-wave-2    ← punctuation is fine
+  navcom - <<'EOF'                  query from stdin when shell quoting gets awkward
+  it's the "weird"; one
+  EOF
+  • If no turn has ALL the words, you get turns with ANY of them (rare words rank first) + a note.
+  • Lowercase "and" is ignored, lowercase "or" means OR, "not" stays a normal word.
+  • 2–4 distinctive words (ids, error text, file/service names) beat long sentences.
 
-NARROW IT
-  --claude --codex --gemini --pi --omo --opencode --goose   (or -p claude,pi)   default: all
-  --here               only sessions whose working dir is the current directory
-  --project NAME       only sessions whose project path contains NAME
-  --days N / --since 2026-09-01    only sessions active recently
-  --latest / --recent N / --file PATH    specific sessions
-  --this-session       only the conversation you're in (recall after context compaction)
-  --role user|assistant|cmd        only that kind of turn  (--user / --cmd shortcuts)
-  -n / --limit N       max hits (default 20)
+NARROW / WIDEN
+  navcom deploy -n 50               hits PER HARNESS (default 20); every harness gets its own share
+  navcom deploy --claude --pi       only these harnesses (--codex --gemini --omo --opencode --goose,
+                                    or -p claude,pi)
+  navcom deploy --here              sessions started in this directory (or below it)
+  navcom deploy --project syra      sessions whose working directory contains "syra"
+  navcom deploy --days 7            active in the last 7 days (--since 2026-09-01, --since 12h, --until …)
+  navcom deploy --user              only what the user typed  (--cmd: shell commands the agent ran;
+                                    --role assistant: replies)
+  navcom deploy --latest            only the newest session (--recent 3: newest 3 per harness;
+                                    --file <ref|uuid|path>: one session)
+  navcom goal --this-session        only the conversation you are in (recall after context compaction)
+  navcom deploy --this              only the harness you are running in (NOT the directory — use --here)
+
+READ
+  navcom --open 7ec78a59:533        3 turns either side of #533, full text (--window-turns 8 for more)
+  navcom --open 7ec78a59:520-560    a range of turns
+  navcom --open 7ec78a59            the whole session, turns trimmed to 400 chars (--max-chars 0: full)
+  navcom --open 7ec78a59 --user     just the user's turns
+  navcom deploy --context           expand every hit in place with its neighbouring turns
+  navcom                            no query: the 20 most recent sessions, with titles
 
 OUTPUT
-  (default)            compact: hits grouped by session, with date, harness, project, ref
-  --context            windowed turns around each hit (--window-turns N, --max-chars N)
-  --open REF[:N]       read a session (or turns around #N); REF = ref shown in results
-  --json               machine-readable hits
-  --newest             order sessions by date instead of relevance
-  --solo / --summary   LLM summary (one consolidated / per session)
+  default    plain text grouped by session, matches marked «like this»; colour only on a terminal
+  --json     {"query","note","sessions":[{"ref","key","provider","date","project","title",
+              "hits":[{"msg_index","role","snippet"}]}]}
+  --newest   sessions newest-first instead of best-match-first
+  --max-chars N    snippet/turn length (0 = everything)
 
-INDEX
-  --where              show where each harness's sessions live + index stats
-  --reindex            rebuild the index for the selected sessions
-  Index: $NAVCOM_INDEX or $CODEX_HOME/navcom-index.sqlite (sessions stay searchable
-  even after a harness deletes old transcripts).
+SUMMARIES (slow: they call another LLM CLI — usually better to read the hits yourself)
+  navcom deploy --solo              one summary of all hits  (--summary: one per session)
+  --llmgemini / --ollama pick the engine; hard limit 150s (NAVCOM_SUMMARY_TIMEOUT)
+
+GOOD TO KNOW
+  • The session you run navcom from is skipped (it would match itself); --include-self keeps it.
+  • Sessions stay searchable after a harness deletes them — the index is the archive.
+  • Parallel runs are fine; read-only sandboxes work (they search without refreshing the index).
+  • Index: $NAVCOM_INDEX or $CODEX_HOME/navcom-index.sqlite. navcom --where shows what's found.
+  • Exit codes: 0 ok (including "No hits."), 1 session/ref/file not found, 2 bad flag or value.
 """
 
 
@@ -2041,84 +2232,98 @@ class NavcomArgumentParser(argparse.ArgumentParser):
 def build_parser():
     parser = NavcomArgumentParser(
         prog="navcom",
+        usage="navcom [words ...] [options]      (full manual below; examples in every section)",
         description=HELP_TEXT,
         formatter_class=argparse.RawTextHelpFormatter,
         allow_abbrev=True,
     )
-    parser.add_argument("phrase", nargs="*", help="Search words (no flag needed). Use - to read the query from stdin.")
-    parser.add_argument("-q", "--query", "--search", "--q", dest="query", action="append",
-                        help="Search words (same as bare words; repeatable, combined with bare words).")
+    parser.add_argument("phrase", nargs="*", metavar="words",
+                        help="What to search for — no flag or quotes needed.  navcom cognito token refresh\n"
+                             "Use - to read the query from stdin.")
+    parser.add_argument("-q", "--query", "--search", "--q", dest="query", action="append", metavar="WORDS",
+                        help="Same as bare words (repeatable; combined with any bare words).")
 
-    g = parser.add_argument_group("harnesses (default: all)")
+    g = parser.add_argument_group("harnesses (default: all of them)")
     for name in ALL_PROVIDERS:
-        g.add_argument(f"--{name}", action="store_true", help=f"Only {name} sessions.")
+        g.add_argument(f"--{name}", action="store_true", help=f"Only {name} sessions (combine several: --claude --pi).")
     g.add_argument("-p", "--provider", "--providers", "--harness", "--source", "--agent", action="append",
-                   help="Harness(es) by name, comma-separated (e.g. -p claude,pi).")
-    g.add_argument("--all", action="store_true", help="All harnesses (default).")
-    g.add_argument("--this", action="store_true", help="Only the harness you are running inside (auto-detected).")
+                   metavar="NAMES", help="Harnesses by name, comma-separated.  -p claude,pi  (aliases: omo-ai, pi-dev, cc…)")
+    g.add_argument("--all", action="store_true", help="All harnesses (the default; accepted for compatibility).")
+    g.add_argument("--this", action="store_true",
+                   help="Only the harness you are running inside. NOT the directory — that's --here.")
 
     s = parser.add_argument_group("scope")
-    s.add_argument("--recent", type=int, default=0, help="Only the N most recent sessions per harness.")
-    s.add_argument("--latest", "--last", action="store_true", help="Only the single most recent session.")
-    s.add_argument("--this-session", "--current", "--current-session", "--me", dest="this_session", action="store_true",
-                   help="Only the session you are running inside (recall after context compaction).")
-    s.add_argument("--file", "--session", help="A specific log file/key, or an index from --list.")
-    s.add_argument("--days", "--last-days", type=float, help="Only sessions active in the last N days.")
-    s.add_argument("--since", "--after", help="Only sessions active since DATE (YYYY-MM-DD) or 12h / 3d / 2w.")
-    s.add_argument("--until", "--before", help="Only sessions last active before DATE (YYYY-MM-DD) or 12h / 3d / 2w.")
-    s.add_argument("--project", "--repo", "--dir", "--cwd", dest="project",
-                   help="Only sessions whose project/working dir contains this text.")
-    s.add_argument("--here", action="store_true", help="Only sessions whose working dir is the current directory.")
+    s.add_argument("--here", action="store_true", help="Only sessions started in the current directory (or below it).")
+    s.add_argument("--project", "--repo", "--dir", "--cwd", dest="project", metavar="TEXT",
+                   help="Only sessions whose working directory contains TEXT.  --project syra")
+    s.add_argument("--days", "--last-days", type=float, metavar="N", help="Only sessions active in the last N days.  --days 7")
+    s.add_argument("--since", "--after", metavar="WHEN", help="Active since WHEN: 2026-09-01, 12h, 3d, 2w, today, yesterday.")
+    s.add_argument("--until", "--before", metavar="WHEN", help="Last active before WHEN (same formats as --since).")
     s.add_argument("--role", choices=["user", "assistant", "cmd"], help="Only this kind of turn.")
-    s.add_argument("--user", dest="role", action="store_const", const="user", help="Only what the user typed.")
+    s.add_argument("--user", dest="role", action="store_const", const="user", help="Only what the user typed (= --role user).")
     s.add_argument("--cmd", "--cmds", "--commands", dest="role", action="store_const", const="cmd",
-                   help="Only shell commands the agent ran.")
+                   help="Only shell commands the agent ran (= --role cmd).")
+    s.add_argument("--latest", "--last", action="store_true", help="Only the single newest session.")
+    s.add_argument("--recent", type=int, default=0, metavar="N", help="Only the N newest sessions of each harness.")
+    s.add_argument("--file", "--session", metavar="REF",
+                   help="One session: a ref from the results, a uuid, a file name, a path, or a --list number.")
+    s.add_argument("--this-session", "--current", "--current-session", "--me", dest="this_session", action="store_true",
+                   help="Only the conversation you are in (recall after context compaction).")
+    s.add_argument("--include-self", action="store_true",
+                   help="Keep hits from the session navcom runs inside, and past navcom commands (skipped by default).")
     s.add_argument("--all-logs", action="store_true", help=argparse.SUPPRESS)
 
     o = parser.add_argument_group("output")
-    o.add_argument("-n", "--limit", "--max", "--top", "--max-results", "--head", type=int, default=None,
-                   help="Max hits (default 20; 0 = no limit). With --list: rows shown.")
-    o.add_argument("--compact", "--brief", "--short", action="store_true",
-                   help="Compact hit list (this is the default; accepted for compatibility).")
-    o.add_argument("--context", "--full", "--expand", "--verbose", "-v", action="store_true",
-                   help="Show the turns around each hit instead of one-line snippets.")
-    o.add_argument("--window-turns", "--window", "--turns", "--around", type=int,
-                   help="Turns before/after each hit (implies --context; default 1, --open default 3).")
-    o.add_argument("--verbosity", type=int, default=None, help=argparse.SUPPRESS)
-    o.add_argument("--max-chars", "--chars", "--width", type=int, default=None,
-                   help="Truncate each turn/snippet to N chars (0 = no limit).")
-    o.add_argument("--snippet-tokens", type=int, default=32, help="Snippet length in tokens (max 64).")
-    o.add_argument("--open", "--show", "--read", "--view", dest="open_ref",
-                   help="Read a session by ref (as printed in results), optionally REF:N or REF:A-B.")
-    o.add_argument("--json", action="store_true", help="Emit hits as JSON.")
+    o.add_argument("-n", "--limit", "--max", "--top", "--max-results", "--head", type=int, default=None, metavar="N",
+                   help=f"Hits per harness (default {DEFAULT_LIMIT}; 0 = no limit). Every harness gets its own N.\n"
+                        "With no query / --list: how many sessions to list.")
+    o.add_argument("--open", "--show", "--read", "--view", dest="open_ref", metavar="REF[:N]",
+                   help="Read a session by the ref printed in results.  --open 7ec78a59:533  (3 turns either side)\n"
+                        "--open 7ec78a59:520-560 (range)   --open 7ec78a59 (whole session)")
+    o.add_argument("--context", "--full", "--expand", "--verbose", action="store_true",
+                   help="Expand every hit in place with its neighbouring turns.")
+    o.add_argument("--window-turns", "--window", "--turns", "--around", type=int, metavar="N",
+                   help="Turns shown either side of a hit (implies --context; default 1, with --open 3).")
+    o.add_argument("--max-chars", "--chars", "--width", type=int, default=None, metavar="N",
+                   help="Trim each snippet/turn to N chars (0 = everything). Defaults: 220 hits, 200 context,\n"
+                        "3000 --open REF:N, 400 --open REF.")
+    o.add_argument("--json", action="store_true",
+                   help='JSON: {"query","note","sessions":[{"ref","key","provider","date","project","title","hits":[…]}]}')
     o.add_argument("--newest", "--recent-first", "--sort-date", action="store_true",
-                   help="Order sessions newest first instead of by relevance.")
-    o.add_argument("--any", "--or", action="store_true", help="Match ANY of the words instead of all.")
+                   help="Order sessions newest-first instead of best-match-first.")
+    o.add_argument("--compact", "--brief", "--short", action="store_true",
+                   help="Accepted for compatibility — compact is already the default.")
+    o.add_argument("--any", "--or", action="store_true", help="Match ANY of the words instead of all of them.")
     o.add_argument("--no-prefix", "--exact", action="store_true",
-                   help="No prefix expansion; pass the query as raw FTS5 syntax (still error-proof).")
-    o.add_argument("--include-self", action="store_true", help="Include past navcom invocations in results.")
+                   help="Whole words only (no auth → authentication), and FTS5 syntax is passed through raw.")
+    o.add_argument("--snippet-tokens", type=int, default=32, metavar="N", help="Snippet length in words (max 64).")
     o.add_argument("--color", choices=["auto", "always", "never"], default="auto",
-                   help="Colors (default: only when writing to a terminal).")
+                   help="Colour (default auto: only on a terminal, never into a pipe).")
     o.add_argument("--no-color", dest="color", action="store_const", const="never", help=argparse.SUPPRESS)
-    o.add_argument("--list", "--ls", "--sessions", action="store_true", help="List sessions with --file indexes.")
+    o.add_argument("--verbosity", type=int, default=None, help=argparse.SUPPRESS)
+    o.add_argument("--list", "--ls", "--sessions", action="store_true",
+                   help="List session files with --file numbers (newest 50; -n 0 for all; honours --recent/harnesses).")
 
-    x = parser.add_argument_group("index")
-    x.add_argument("--index", help="SQLite index path (default: $NAVCOM_INDEX or $CODEX_HOME/navcom-index.sqlite).")
-    x.add_argument("--reindex", action="store_true", help="Re-read the selected sessions from scratch.")
-    x.add_argument("--where", "--doctor", "--status", action="store_true",
-                   help="Show where each harness keeps sessions and what's indexed.")
-    x.add_argument("-V", "--version", action="version", version=f"navcom {NAVCOM_VERSION}")
-
-    m = parser.add_argument_group("summaries (LLM)")
-    m.add_argument("--summary", "--summarize", action="store_true", help="Per-session LLM summaries of the hits.")
-    m.add_argument("--solo", action="store_true", help="One consolidated LLM summary across all hits.")
-    m.add_argument("--summary-model", default=SUMMARY_MODEL_DEFAULT, help="Ollama model for summaries.")
-    m.add_argument("--summary-mode", default="chrono", choices=["chrono", "reduce"], help=argparse.SUPPRESS)
-    m.add_argument("--ollama", action="store_true", help="Summarize with local Ollama.")
+    m = parser.add_argument_group("summaries (slow: they call another LLM CLI)")
+    m.add_argument("--solo", action="store_true", help="One consolidated summary of all hits.  navcom deploy --solo")
+    m.add_argument("--summary", "--summarize", action="store_true", help="One summary per matching session.")
+    m.add_argument("--prompt", metavar="TEXT", help='Your own summary instruction (implies --summary).  --prompt "list every table"')
+    m.add_argument("--prompt-file", metavar="PATH", help="Prompt template file with a {{transcript}} placeholder.")
     m.add_argument("--llmgemini", action="store_true", help="Summarize with Gemini first.")
-    m.add_argument("--prompt", help="Custom summary prompt (implies --summary).")
-    m.add_argument("--prompt-file", help="Prompt template file ({{transcript}} placeholder).")
-    m.add_argument("--dump-dir", help="Write summary artifacts here.")
+    m.add_argument("--ollama", action="store_true", help="Summarize with local Ollama.")
+    m.add_argument("--summary-model", default=SUMMARY_MODEL_DEFAULT, metavar="MODEL", help="Ollama model (default gemma3:4b).")
+    m.add_argument("--summary-mode", default="chrono", choices=["chrono", "reduce"], help=argparse.SUPPRESS)
+    m.add_argument("--dump-dir", metavar="DIR", help="Also write summary inputs/outputs to DIR.")
+
+    x = parser.add_argument_group("index & setup")
+    x.add_argument("--where", "--doctor", "--status", action="store_true",
+                   help="Where each harness keeps its sessions, and index stats.")
+    x.add_argument("--reindex", action="store_true", help="Re-read the selected sessions from scratch.")
+    x.add_argument("--index", metavar="PATH", help="Index file (default $NAVCOM_INDEX or $CODEX_HOME/navcom-index.sqlite).")
+    x.add_argument("--install-skills", action="store_true",
+                   help="Install/refresh the navcom skill card for Claude Code, Codex and ~/.agents (pi, omo,\n"
+                        "opencode, goose). This already happens silently on every run; this shows where.")
+    x.add_argument("-V", "-v", "--version", action="version", version=f"navcom {NAVCOM_VERSION}")
     return parser
 
 
@@ -2530,6 +2735,11 @@ def run(argv=None):
         sys.stderr.write(f"navcom: can't open index {index_path}: {exc}\n")
         return 1
 
+    if args.install_skills:
+        install_skills(force=True, report=True)
+        return 0
+    auto_install_skills()
+
     if args.where:
         return cmd_where(conn, providers)
 
@@ -2610,7 +2820,7 @@ def run(argv=None):
         except ValueError as exc:
             sys.stderr.write(f"navcom: {exc}\n")
             return 2
-        limit = 20 if args.limit is None else args.limit
+        limit = DEFAULT_LIMIT if args.limit is None else args.limit
         return cmd_recent_sessions(conn, logs, limit, keys)
 
     if not targets and not query:
@@ -2641,7 +2851,7 @@ def run(argv=None):
         sys.stderr.write(f"navcom: {exc}\n")
         return 2
 
-    limit = 20 if args.limit is None else args.limit
+    limit = DEFAULT_LIMIT if args.limit is None else args.limit
     exclude = None
     if not args.include_self and not explicit_scope:
         me = env_session_log(logs)
@@ -2679,8 +2889,9 @@ def run(argv=None):
     if not args.context and not args.summary:
         max_chars = 220 if args.max_chars is None else args.max_chars
         print_compact(conn, groups, max_chars, len(hits), cooked, note)
-        if limit and len(hits) >= limit:
-            safe_print(STYLE.dim(f"(showing the top {limit} hits — more: -n {limit * 3}; narrower: --here / --days 7 / --claude / more words)"))
+        full = [p for p in providers if sum(1 for h in hits if h.provider == p) >= limit] if limit else []
+        if full:
+            safe_print(STYLE.dim(f"(top {limit} per harness shown; {', '.join(full)} had more — -n {limit * 3} for more, or narrow with --here / --days 7 / more words)"))
         conn.commit()
         conn.close()
         return 0

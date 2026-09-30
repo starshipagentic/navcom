@@ -84,3 +84,14 @@ Feature: Fast search across every harness
     When I run: navcom zebracorncodex --json
     Then it succeeds
     And the output is valid JSON with 1 sessions
+
+  Scenario: -n is per harness so every harness gets a turn
+    When I run: navcom zebracorn -n 1
+    Then it succeeds
+    And every harness is in the results
+    And the output contains "top 1 per harness shown"
+
+  Scenario: Version from the flags LLMs guess
+    When I run: navcom -v
+    Then it succeeds
+    And the output contains "navcom 0.2.1"
