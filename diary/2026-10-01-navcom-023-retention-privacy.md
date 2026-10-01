@@ -10,9 +10,12 @@ Claude keeps the originals `0600`, and navcom was quietly undoing that.
 
 - **History of the deletion,** from npm tarballs bisected with `npm pack` and grep:
   - First npm release: 0.2.9, on 2025-02-24.
-  - Hard-coded 30-day cleanup (`2592000000` ms, deleting old `messages()`/`errors()` logs): present
-    in **v0.2.33 (2025-03-07)**. Absent in 0.2.30, while 0.2.31 and 0.2.32 have a different
-    tarball layout, so they're inconclusive.
+  - Hard-coded 30-day cleanup (`2592000000` ms): **present in the very first public release,
+    v0.2.9 (2025-02-24, launch day)**. On every startup, `setImmediate(...)` reads the `messages()`
+    (conversation logs) and `errors()` directories and `unlink`s every file whose timestamped name is
+    older than 30 days. It is also confirmed in 0.2.14, 0.2.18, 0.2.19, 0.2.25, 0.2.27, 0.2.29, 0.2.33 …
+  - CORRECTION: the first pass said "since v0.2.33 (2025-03-07)". That search grepped only
+    `*.js`, but releases up to 0.2.32 ship `cli.mjs`. Always grep `*.*js`.
   - It became the setting `cleanupPeriodDays` in **v0.2.118 (2025-05-18)**; absent in 0.2.113.
   - Current 2.1.280 (2026-09-22): schema `int().positive()`, default 30. `0` is rejected, and the
     binary's own text says 0 "previously silently disabled all transcript writes".
@@ -49,8 +52,8 @@ Claude keeps the originals `0600`, and navcom was quietly undoing that.
 
 ```bash
 # which version introduced the deletion (bisect npm releases)
-f=$(npm pack @anthropic-ai/claude-code@0.2.33 --silent); mkdir x; tar -xzf $f -C x
-grep -a -o 2592000000 x/package/*.js            # 30 days in ms → transcript cleanup
+f=$(npm pack @anthropic-ai/claude-code@0.2.9 --silent); mkdir x; tar -xzf $f -C x
+grep -a -o 2592000000 x/package/*.*js           # *.*js: early releases ship cli.mjs!
 npm view @anthropic-ai/claude-code time --json   # release dates
 # check / fix retention by hand
 python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.claude/settings.json'))).get('cleanupPeriodDays'))"

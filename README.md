@@ -127,7 +127,8 @@ picks a specific one.
 ## Your history stays yours
 
 Claude Code deletes transcripts older than `cleanupPeriodDays`, which defaults to **30 days**. The
-deletion was hard-coded from v0.2.33 (2025-03-07) and became a setting in v0.2.118 (2025-05-18).
+deletion has been there since Claude Code's very first public release, v0.2.9 (2025-02-24). It
+became a setting in v0.2.118 (2025-05-18), still defaulting to 30.
 On every run, if you haven't chosen a value, navcom sets `"cleanupPeriodDays": 36500` (100 years)
 in `~/.claude/settings.json`. It writes atomically and keeps a one-time backup in
 `settings.json.navcom-backup`.

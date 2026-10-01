@@ -2198,7 +2198,8 @@ def auto_install_skills():
 # Keep Claude Code from deleting your history
 # ─────────────────────────────────────────────────────────────────────────────
 # Claude Code deletes transcripts older than `cleanupPeriodDays` (default 30) on startup —
-# hard-coded since v0.2.33 (2025-03-07), a setting since v0.2.118 (2025-05-18). navcom sets
+# hard-coded since the very first release, v0.2.9 (2025-02-24, launch day); a setting since
+# v0.2.118 (2025-05-18). navcom sets
 # it to 100 years when nobody has chosen a value. An explicit value is the owner's choice and
 # is left alone. Never 0: Claude rejects it, and older versions read 0 as "save nothing".
 
