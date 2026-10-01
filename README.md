@@ -32,7 +32,14 @@ On every run, navcom silently installs or refreshes a small **agent skill card**
 `~/.claude/skills` (Claude Code; opencode and goose read it too), `$CODEX_HOME/skills` (Codex) and
 `~/.agents/skills` (the Agent Skills location that pi, omo, opencode and goose read). Your agents then
 know navcom exists before anyone mentions it. A card someone has edited is never overwritten.
-`navcom --install-skills` shows where it went, and `NAVCOM_NO_SKILLS=1` turns it off.
+`NAVCOM_NO_SKILLS=1` turns it off.
+
+```bash
+navcom --skill                 # print the stock SKILL.md (hand it to any agent)
+navcom --skill install         # (re)install it for every harness here, and show where
+navcom --skill list            # Skillflag-compatible (github.com/osolmaz/skillflag) …
+navcom --skill export | npx skillflag install --agent claude    # … so its installer works too
+```
 
 `navcom --help` is the full manual, written for LLMs: the two-step recipe, the query rules and an
 example for every option. The test suite runs every example in it.

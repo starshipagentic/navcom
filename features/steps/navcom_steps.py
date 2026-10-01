@@ -189,3 +189,27 @@ def step_older(context, which):
 @then('the "{which}" skill card is current')
 def step_current(context, which):
     assert "(old)" not in _skill_path(context, which).read_text()
+
+
+@then("the output starts with the skill frontmatter")
+def step_frontmatter(context):
+    assert context.out.startswith("---\nname: navcom-session-recall\n"), context.out[:120]
+
+
+@when("I export the skill as a tar stream")
+def step_export(context):
+    proc = subprocess.run([sys.executable, context.navcom, "--skill", "export"], capture_output=True,
+                          env=context.env, cwd=str(context.workdir), timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    context.tar_bytes = proc.stdout
+
+
+@then('the tar holds exactly "{member}" under one top-level directory')
+def step_tar(context, member):
+    import io
+    import tarfile
+    with tarfile.open(fileobj=io.BytesIO(context.tar_bytes)) as tar:
+        names = tar.getnames()
+        assert member in names, names
+        assert {n.split("/")[0] for n in names} == {member.split("/")[0]}, names
+        assert all(m.mtime == 0 and m.uid == 0 for m in tar.getmembers())

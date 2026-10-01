@@ -55,7 +55,7 @@ def load_module(code, name):
 clean_mod = load_module(LOG_CLEAN_QUICK_CODE, "log_clean_quick")
 fts_mod = load_module(LOG_SEARCH_FTS5_CODE, "log_search_fts5")
 
-NAVCOM_VERSION = "0.2.1"
+NAVCOM_VERSION = "0.2.2"
 DEFAULT_LIMIT = 20  # hits per harness (and sessions listed by a bare `navcom`)
 
 # Every harness navcom knows how to read. Order = display order in help/listings.
@@ -2038,6 +2038,7 @@ navcom deploy --json             # structured: sessions[] with ref, date, projec
 - `--solo` / `--summary` hand the hits to another LLM CLI, so they're slow (≤150s). Usually
   better to read the hits and summarize them yourself.
 - `navcom --help` is the full manual. `navcom --where` shows which harness logs exist.
+- `navcom --skill` prints this card; `navcom --skill install` (re)installs it for every harness here.
 
 ## Evidence pattern
 
@@ -2120,6 +2121,61 @@ def install_skills(force=False, report=False):
     return done
 
 
+SKILL_SUMMARY = ("Search every past AI coding session (Claude Code, Codex, Gemini CLI, pi, omo, opencode, goose) "
+                 "with navcom: find, then --open")
+
+
+def skill_tar_bytes():
+    """The skill as a deterministic ustar stream: exactly one top-level <id>/ dir (Skillflag spec §9)."""
+    import tarfile
+    buf = io.BytesIO()
+    data = SKILL_MD.encode("utf-8")
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+        for name, payload in ((f"{SKILL_NAME}/", None), (f"{SKILL_NAME}/SKILL.md", data)):
+            info = tarfile.TarInfo(name.rstrip("/"))
+            info.mtime, info.uid, info.gid, info.uname, info.gname = 0, 0, 0, "root", "root"
+            if payload is None:
+                info.type, info.mode = tarfile.DIRTYPE, 0o755
+                tar.addfile(info)
+            else:
+                info.size, info.mode = len(payload), 0o644
+                tar.addfile(info, io.BytesIO(payload))
+    return buf.getvalue()
+
+
+def cmd_skill(action, ids, as_json=False):
+    """navcom --skill [show|list|export|install] [id]  — Skillflag-compatible (github.com/osolmaz/skillflag).
+
+    Bare `navcom --skill` prints the stock SKILL.md. Unlike the Skillflag draft, `install`
+    really installs (into every harness present) — full-service by design.
+    """
+    import hashlib
+    action = (action or "show").lower()
+    skill_id = ids[0] if ids else SKILL_NAME
+    if action not in ("show", "list", "export", "install"):
+        sys.stderr.write(f"navcom: --skill takes show (default), list, export or install — not {action!r}\n")
+        return 2
+    if action != "list" and skill_id != SKILL_NAME:
+        sys.stderr.write(f"navcom: no skill {skill_id!r}; navcom ships one: {SKILL_NAME}\n")
+        return 1
+    if action == "show":
+        sys.stdout.write(SKILL_MD)
+    elif action == "list":
+        if as_json:
+            tar = skill_tar_bytes()
+            safe_print(json.dumps({"skillflag_version": "0.1", "skills": [{
+                "id": SKILL_NAME, "summary": SKILL_SUMMARY, "version": NAVCOM_VERSION, "files": 1,
+                "digest": "sha256:" + hashlib.sha256(tar).hexdigest()}]}))
+        else:
+            safe_print(f"{SKILL_NAME}\t{SKILL_SUMMARY}")
+    elif action == "export":
+        sys.stdout.buffer.write(skill_tar_bytes())
+        sys.stdout.flush()
+    else:
+        install_skills(force=True, report=True)
+    return 0
+
+
 def auto_install_skills():
     """Silent, cheap (a few stats + small reads), never fails the command."""
     if os.environ.get("NAVCOM_NO_SKILLS"):
@@ -2142,6 +2198,8 @@ THE RECIPE (agents: this is all you need)
   1. navcom <words>                 find: hits grouped by session → date, harness, project, ref, #turn
   2. navcom --open <ref>:<turn>     read the turns around one hit, full text
   Don't grep raw session logs, don't strip punctuation, don't bother with --compact (it's the default).
+  navcom --skill                    print navcom's SKILL.md skill card (already auto-installed for
+                                    Claude Code, Codex, pi, omo, opencode, goose — navcom --skill install)
 
 QUERIES — type anything; navcom never errors on query syntax
   navcom cognito token refresh      all words in one turn, each prefix-matched (auth → authentication)
@@ -2320,9 +2378,11 @@ def build_parser():
                    help="Where each harness keeps its sessions, and index stats.")
     x.add_argument("--reindex", action="store_true", help="Re-read the selected sessions from scratch.")
     x.add_argument("--index", metavar="PATH", help="Index file (default $NAVCOM_INDEX or $CODEX_HOME/navcom-index.sqlite).")
-    x.add_argument("--install-skills", action="store_true",
-                   help="Install/refresh the navcom skill card for Claude Code, Codex and ~/.agents (pi, omo,\n"
-                        "opencode, goose). This already happens silently on every run; this shows where.")
+    x.add_argument("--skill", "--skills", nargs="?", const="show", metavar="ACTION",
+                   help="navcom's agent skill card (SKILL.md).  navcom --skill            print it\n"
+                        "navcom --skill install   (re)install it for every harness here, and show where\n"
+                        "navcom --skill list | export   Skillflag-compatible listing / tar export")
+    x.add_argument("--install-skills", action="store_true", help=argparse.SUPPRESS)
     x.add_argument("-V", "-v", "--version", action="version", version=f"navcom {NAVCOM_VERSION}")
     return parser
 
@@ -2719,6 +2779,9 @@ def run(argv=None):
     if args.window_turns is not None or args.verbosity is not None:
         args.context = True
 
+    if args.skill or args.install_skills:
+        return cmd_skill("install" if args.install_skills else args.skill, args.phrase or [], args.json)
+
     query = _gather_query(args)
 
     try:
@@ -2735,9 +2798,6 @@ def run(argv=None):
         sys.stderr.write(f"navcom: can't open index {index_path}: {exc}\n")
         return 1
 
-    if args.install_skills:
-        install_skills(force=True, report=True)
-        return 0
     auto_install_skills()
 
     if args.where:

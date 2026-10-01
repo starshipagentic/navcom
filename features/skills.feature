@@ -35,3 +35,32 @@ Feature: The navcom skill card installs itself
     When I run: navcom --install-skills
     Then it succeeds
     And the output contains "navcom-session-recall/SKILL.md"
+
+  @critical
+  Scenario: --skill prints the stock skill card
+    When I run: navcom --skill
+    Then it succeeds
+    And the output starts with the skill frontmatter
+    And the output contains "navcom --open <ref>:<turn>"
+
+  Scenario: --skill install does the full-service install and reports
+    When I run with NAVCOM_NO_SKILLS=1: navcom --skill install
+    Then it succeeds
+    And the skill card exists for "claude"
+    And the skill card exists for "codex"
+    And the skill card exists for "agents"
+
+  Scenario: Skillflag-compatible list and export
+    When I run: navcom --skill list
+    Then it succeeds
+    And the output contains "navcom-session-recall	"
+    When I run: navcom --skill list --json
+    Then it succeeds
+    And the output contains ""skillflag_version": "0.1""
+    And the output contains ""digest": "sha256:"
+    When I export the skill as a tar stream
+    Then the tar holds exactly "navcom-session-recall/SKILL.md" under one top-level directory
+
+  Scenario: --skill with a wrong action is a clear error
+    When I run: navcom --skill frobnicate
+    Then it fails with exit code 2

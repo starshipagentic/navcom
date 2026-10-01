@@ -65,6 +65,7 @@ navcom deploy --json             # structured: sessions[] with ref, date, projec
 - `--solo` / `--summary` hand the hits to another LLM CLI, so they're slow (≤150s). Usually
   better to read the hits and summarize them yourself.
 - `navcom --help` is the full manual. `navcom --where` shows which harness logs exist.
+- `navcom --skill` prints this card; `navcom --skill install` (re)installs it for every harness here.
 
 ## Evidence pattern
 
