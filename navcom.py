@@ -2112,6 +2112,8 @@ def install_skills(force=False, report=False):
             continue
         state[key], changed = want, True
         done.append((path, "installed" if current is None else "updated"))
+    if not changed:
+        private_file(state_path)
     if changed:
         try:
             state_path.parent.mkdir(parents=True, exist_ok=True)
