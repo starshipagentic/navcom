@@ -213,3 +213,64 @@ def step_tar(context, member):
         assert member in names, names
         assert {n.split("/")[0] for n in names} == {member.split("/")[0]}, names
         assert all(m.mtime == 0 and m.uid == 0 for m in tar.getmembers())
+
+
+def _claude_settings(context):
+    return context.home / ".claude" / "settings.json"
+
+
+@given("Claude settings without a retention value")
+def step_cs_none(context):
+    import json
+    _claude_settings(context).write_text(json.dumps({"model": "opus", "permissions": {"allow": ["Bash(ls:*)"]}}, indent=2))
+    context.orig_settings = _claude_settings(context).read_text()
+
+
+@given("Claude settings with cleanupPeriodDays {n:d}")
+def step_cs_n(context, n):
+    import json
+    _claude_settings(context).write_text(json.dumps({"cleanupPeriodDays": n}))
+
+
+@given("Claude settings that are not plain JSON")
+def step_cs_jsonc(context):
+    _claude_settings(context).write_text('{\n  // my comment\n  "model": "opus",\n}\n')
+    context.orig_settings = _claude_settings(context).read_text()
+
+
+@then("Claude's cleanupPeriodDays is {n:d}")
+def step_cs_is(context, n):
+    import json
+    assert json.loads(_claude_settings(context).read_text())["cleanupPeriodDays"] == n
+
+
+@then("the other Claude settings are untouched")
+def step_cs_rest(context):
+    import json
+    now = json.loads(_claude_settings(context).read_text())
+    now.pop("cleanupPeriodDays")
+    assert now == json.loads(context.orig_settings), now
+
+
+@then("a backup of the original Claude settings exists")
+def step_cs_backup(context):
+    backup = _claude_settings(context).with_name("settings.json.navcom-backup")
+    assert backup.read_text() == context.orig_settings
+
+
+@then("the Claude settings file is byte-for-byte unchanged")
+def step_cs_same(context):
+    assert _claude_settings(context).read_text() == context.orig_settings
+
+
+@then("every navcom index file is readable only by its owner")
+def step_private(context):
+    import os
+    import stat
+    from pathlib import Path
+    idx = Path(context.env["NAVCOM_INDEX"])
+    files = list(idx.parent.glob(idx.name + "*")) + [idx.parent / "navcom-skills.json"]
+    for f in files:
+        if f.exists():
+            mode = stat.S_IMODE(os.stat(f).st_mode)
+            assert mode & 0o077 == 0, f"{f} is {oct(mode)}"

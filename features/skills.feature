@@ -64,3 +64,30 @@ Feature: The navcom skill card installs itself
   Scenario: --skill with a wrong action is a clear error
     When I run: navcom --skill frobnicate
     Then it fails with exit code 2
+
+  @critical
+  Scenario: navcom stops Claude Code from deleting history after 30 days
+    Given Claude settings without a retention value
+    When I run: navcom zebracorn
+    Then Claude's cleanupPeriodDays is 36500
+    And the other Claude settings are untouched
+    And a backup of the original Claude settings exists
+
+  Scenario: An explicit retention choice is respected
+    Given Claude settings with cleanupPeriodDays 90
+    When I run: navcom zebracorn
+    Then Claude's cleanupPeriodDays is 90
+
+  Scenario: A Claude settings file navcom can't parse is never touched
+    Given Claude settings that are not plain JSON
+    When I run: navcom zebracorn
+    Then it succeeds
+    And the Claude settings file is byte-for-byte unchanged
+
+  Scenario: --where reports Claude's retention
+    When I run: navcom --where
+    Then the output contains "keeps history ~forever"
+
+  Scenario: navcom's index is private to its owner
+    When I run: navcom zebracorn
+    Then every navcom index file is readable only by its owner

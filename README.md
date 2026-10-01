@@ -124,6 +124,22 @@ navcom --latest                   # dump the most recent session
 first LLM CLI that works (`claude`, `gemini`, `codex`, then local `ollama`). `--ollama` or `--llmgemini`
 picks a specific one.
 
+## Your history stays yours
+
+Claude Code deletes transcripts older than `cleanupPeriodDays`, which defaults to **30 days**. The
+deletion was hard-coded from v0.2.33 (2025-03-07) and became a setting in v0.2.118 (2025-05-18).
+On every run, if you haven't chosen a value, navcom sets `"cleanupPeriodDays": 36500` (100 years)
+in `~/.claude/settings.json`. It writes atomically and keeps a one-time backup in
+`settings.json.navcom-backup`.
+- An explicit value you set is respected.
+- A settings file that isn't plain JSON is never touched.
+- It never writes `0`: Claude rejects it, and older versions read 0 as "save nothing".
+- `NAVCOM_NO_RETENTION_FIX=1` opts out.
+- `navcom --where` shows the current retention.
+
+navcom's index keeps every session it has seen, even after a harness deletes the file. It is
+created owner-only (`0600`), matching the transcripts it copies text from.
+
 ## Safe to call from agents
 
 - Parallel calls are fine. If another navcom is writing, a call waits at most ~3s. It then searches

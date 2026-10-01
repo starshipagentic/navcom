@@ -55,7 +55,7 @@ def load_module(code, name):
 clean_mod = load_module(LOG_CLEAN_QUICK_CODE, "log_clean_quick")
 fts_mod = load_module(LOG_SEARCH_FTS5_CODE, "log_search_fts5")
 
-NAVCOM_VERSION = "0.2.2"
+NAVCOM_VERSION = "0.2.3"
 DEFAULT_LIMIT = 20  # hits per harness (and sessions listed by a bare `navcom`)
 
 # Every harness navcom knows how to read. Order = display order in help/listings.
@@ -943,7 +943,9 @@ def open_index(index_path):
     """Open (and migrate) the index; fall back to read-only if we can't write to it."""
     global INDEX_READ_ONLY
     try:
-        return _open_index_rw(index_path)
+        conn = _open_index_rw(index_path)
+        private_file(index_path)  # -wal/-shm appear only once the connection is open
+        return conn
     except sqlite3.OperationalError as exc:
         if not index_path.exists():
             raise
@@ -968,6 +970,9 @@ def open_index(index_path):
 
 def _open_index_rw(index_path):
     index_path.parent.mkdir(parents=True, exist_ok=True)
+    if not index_path.exists():
+        index_path.touch(mode=0o600)
+    private_file(index_path)
     # short busy timeout: a parallel navcom that is mid-index shouldn't stall us —
     # we'd rather search the slightly stale index (reads never block under WAL)
     conn = sqlite3.connect(str(index_path), timeout=3)
@@ -2111,6 +2116,7 @@ def install_skills(force=False, report=False):
         try:
             state_path.parent.mkdir(parents=True, exist_ok=True)
             state_path.write_text(json.dumps(state, indent=1))
+            private_file(state_path)
         except OSError:
             pass
     if report:
@@ -2184,6 +2190,78 @@ def auto_install_skills():
         install_skills()
     except Exception:
         pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Keep Claude Code from deleting your history
+# ─────────────────────────────────────────────────────────────────────────────
+# Claude Code deletes transcripts older than `cleanupPeriodDays` (default 30) on startup —
+# hard-coded since v0.2.33 (2025-03-07), a setting since v0.2.118 (2025-05-18). navcom sets
+# it to 100 years when nobody has chosen a value. An explicit value is the owner's choice and
+# is left alone. Never 0: Claude rejects it, and older versions read 0 as "save nothing".
+
+CLAUDE_RETENTION_DAYS = 36500
+
+
+def claude_settings_path():
+    return (_env_path("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "settings.json"
+
+
+def claude_retention_status():
+    """(days or None, how) — what Claude Code will do with old transcripts."""
+    path = claude_settings_path()
+    if not path.parent.is_dir():
+        return None, "Claude Code not installed"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception:
+        return None, f"{path} is not plain JSON — not touched"
+    if not isinstance(data, dict):
+        return None, f"{path} is not a JSON object — not touched"
+    days = data.get("cleanupPeriodDays")
+    if days is None:
+        return 30, "default — Claude deletes transcripts after 30 days"
+    return days, "set in " + str(path)
+
+
+def ensure_claude_retention():
+    """Set cleanupPeriodDays=36500 when unset. Atomic write, one backup, never touches odd files."""
+    if os.environ.get("NAVCOM_NO_RETENTION_FIX"):
+        return False
+    path = claude_settings_path()
+    if not path.parent.is_dir():
+        return False
+    try:
+        raw = path.read_text(encoding="utf-8") if path.exists() else ""
+        data = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        return False  # JSONC / broken file: never risk corrupting Claude's settings
+    if not isinstance(data, dict) or "cleanupPeriodDays" in data:
+        return False
+    data["cleanupPeriodDays"] = CLAUDE_RETENTION_DAYS
+    try:
+        if raw:
+            backup = path.with_name(path.name + ".navcom-backup")
+            if not backup.exists():
+                backup.write_text(raw, encoding="utf-8")
+        tmp = path.with_name(path.name + f".navcom-tmp-{os.getpid()}")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        if path.exists():
+            os.chmod(tmp, path.stat().st_mode & 0o777)
+        os.replace(tmp, path)
+    except OSError:
+        return False
+    return True
+
+
+def private_file(path):
+    """navcom's index holds the text of transcripts Claude keeps owner-only (0600); match that."""
+    for candidate in (Path(str(path)), Path(f"{path}-wal"), Path(f"{path}-shm")):
+        try:
+            if candidate.exists() and candidate.stat().st_mode & 0o077:
+                os.chmod(candidate, 0o600)
+        except OSError:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2762,7 +2840,11 @@ def cmd_where(conn, providers):
     on_disk = {l[0] for l in logs}
     archived = sum(1 for (f,) in conn.execute("SELECT file FROM file_state") if f not in on_disk)
     safe_print(f"  index    {stats} sessions, {turns} turns ({archived} no longer on disk but still searchable)")
-    safe_print(f"           {default_index_path() if True else ''}")
+    safe_print(f"           {default_index_path()}")
+    days, how = claude_retention_status()
+    if days is not None:
+        verdict = "keeps history ~forever" if days >= 3650 else f"DELETES transcripts after {days} days"
+        safe_print(f"  claude   retention: {verdict} ({how})")
     return 0
 
 
@@ -2799,6 +2881,10 @@ def run(argv=None):
         return 1
 
     auto_install_skills()
+    try:
+        ensure_claude_retention()
+    except Exception:
+        pass
 
     if args.where:
         return cmd_where(conn, providers)
