@@ -45,6 +45,21 @@ wrote.
 
 Run `navcom --where` to see what it found on your machine.
 
+## `navcom --menu`
+
+A full-screen retro dashboard for humans. It shows your history (sessions, turns, tool output, and
+how many sessions were rescued after their harness deleted them) and retention (each harness's
+default deletion window, then the fix navcom applied). It also has live search with a session
+reader, every harness on the machine, and a LEARN screen. Each screen shows the CLI command it is
+running, so the commands are easy to pick up.
+
+![navcom --menu splash](https://raw.githubusercontent.com/starshipagentic/navcom/main/docs/menu-splash.png)
+![navcom --menu dashboard](https://raw.githubusercontent.com/starshipagentic/navcom/main/docs/menu-dashboard.png)
+
+It needs only the standard library and a truecolor terminal (Atari raster-bar styling, with a
+block-glyph wordmark that renders the same in any font). Bare `navcom` prints the manual.
+`navcom --sessions` lists your recent sessions.
+
 ## Install
 
 ```bash
@@ -77,7 +92,8 @@ example for every option. The test suite runs every example in it.
 navcom drizzle migration            # every harness; compact hits grouped by session
 navcom --open 395e14b4:73           # read the turns around hit #73 of that session
 navcom drizzle --context            # expand every hit with the turns around it
-navcom                              # your most recent sessions, with titles
+navcom --sessions                   # your most recent sessions, with titles
+navcom --menu                       # the retro dashboard: retention, history, search, learn
 navcom drizzle --solo               # one LLM summary of all the hits
 ```
 

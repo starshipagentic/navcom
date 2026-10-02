@@ -44,7 +44,7 @@ navcom deploy --user             # only what the user typed;  --cmd = shell comm
 navcom "TypeError: x" --tool     # search TOOL OUTPUTS (command output, files read, errors, tests)
 navcom deploy --newest           # newest sessions first
 navcom goal --this-session       # only THIS conversation (recall after compaction)
-navcom                           # no query: the 20 most recent sessions, with titles
+navcom --sessions                # the 20 most recent sessions, with titles
 ```
 
 - The conversation you run navcom from is skipped automatically (`--include-self` keeps it).
@@ -67,6 +67,8 @@ navcom --restore 7ec78a59        # transcript deleted by its harness? put it bac
 - `--solo` / `--summary` hand the hits to another LLM CLI, so they're slow (≤150s). Usually
   better to read the hits and summarize them yourself.
 - `navcom --help` is the full manual. `navcom --where` shows which harness logs exist.
+- Humans: `navcom --menu` is a full-screen retro dashboard (retention, history, search). Agents should use
+  the plain commands above.
 - `navcom --skill` prints this card; `navcom --skill install` (re)installs it for every harness here.
 
 ## Evidence pattern

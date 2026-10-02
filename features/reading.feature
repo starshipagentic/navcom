@@ -31,7 +31,7 @@ Feature: Reading and narrowing sessions
     And the output contains "cmd: rg cognito src/"
 
   Scenario: No query lists recent sessions with titles
-    When I run: navcom -n 100
+    When I run: navcom --sessions -n 100
     Then it succeeds
     And the output contains "most recent sessions"
     And the output contains "Verify cerbos test gaps"

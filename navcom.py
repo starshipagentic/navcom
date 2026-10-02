@@ -56,7 +56,7 @@ def load_module(code, name):
 clean_mod = load_module(LOG_CLEAN_QUICK_CODE, "log_clean_quick")
 fts_mod = load_module(LOG_SEARCH_FTS5_CODE, "log_search_fts5")
 
-NAVCOM_VERSION = "0.6.0"
+NAVCOM_VERSION = "0.7.0"
 DEFAULT_LIMIT = 20  # hits per harness (and sessions listed by a bare `navcom`)
 
 # Every harness navcom knows how to read. Order = display order in help/listings.
@@ -3080,7 +3080,7 @@ navcom deploy --user             # only what the user typed;  --cmd = shell comm
 navcom "TypeError: x" --tool     # search TOOL OUTPUTS (command output, files read, errors, tests)
 navcom deploy --newest           # newest sessions first
 navcom goal --this-session       # only THIS conversation (recall after compaction)
-navcom                           # no query: the 20 most recent sessions, with titles
+navcom --sessions                # the 20 most recent sessions, with titles
 ```
 
 - The conversation you run navcom from is skipped automatically (`--include-self` keeps it).
@@ -3103,6 +3103,8 @@ navcom --restore 7ec78a59        # transcript deleted by its harness? put it bac
 - `--solo` / `--summary` hand the hits to another LLM CLI, so they're slow (≤150s). Usually
   better to read the hits and summarize them yourself.
 - `navcom --help` is the full manual. `navcom --where` shows which harness logs exist.
+- Humans: `navcom --menu` is a full-screen retro dashboard (retention, history, search). Agents should use
+  the plain commands above.
 - `navcom --skill` prints this card; `navcom --skill install` (re)installs it for every harness here.
 
 ## Evidence pattern
@@ -9466,6 +9468,651 @@ register_harness('grokdev', list_fn=grokdev_list, iter_fn=grokdev_iter, project_
 # <<< registered harnesses
 
 # ─────────────────────────────────────────────────────────────────────────────
+# navcom --menu — CAPCOM-style retro TUI (Atari raster bands, vertical gradients only)
+# ─────────────────────────────────────────────────────────────────────────────
+# Style guide: ~/dev/EXP31-pi-dev-tools/docs/retro-raster-tui-style.md. Horizontal is solid,
+# vertical is the gradient; half-block ▀ doubles the vertical resolution; GTIA palette; block-glyph
+# wordmark (font-independent). Stdlib only: termios/tty/select key loop, alternate screen.
+
+MENU_P = dict(black="000000", blue_deep="000071", blue_dark="13007d", blue_mid="351c9d",
+              cyan="6cc4e2", sky="8ee6ff", gold_dk="816f00", gold="c7b43d", amber="ead760",
+              yellow="fffa84", orange="ca8e3d", orange_dk="975b0a", orange_hot="fdc170",
+              red_deep="420404", cream="e6d6b0", ink="1a0f00", green="6aab36", red="c2402a",
+              grey="555555", grey_lt="9aa0a6")
+MENU_SPARK = "▁▂▃▄▅▆▇█"
+MENU_SLOGAN = "YOUR CONVERSATIONS · YOUR MACHINE · YOUR DATA"
+MENU_TAGLINE = "every coding agent's history — searchable in a blink, archived, kept for 100 years"
+
+_GLYPHS = {  # 5x7 masks, '#' = on
+    "N": ["#   #", "##  #", "# # #", "#  ##", "#   #", "#   #", "#   #"],
+    "A": [" ### ", "#   #", "#   #", "#####", "#   #", "#   #", "#   #"],
+    "V": ["#   #", "#   #", "#   #", "#   #", "#   #", " # # ", "  #  "],
+    "C": ["#####", "#    ", "#    ", "#    ", "#    ", "#    ", "#####"],
+    "O": [" ### ", "#   #", "#   #", "#   #", "#   #", "#   #", " ### "],
+    "M": ["#   #", "## ##", "# # #", "# # #", "#   #", "#   #", "#   #"],
+}
+
+
+def _mrgb(c):
+    h = MENU_P.get(c, c)
+    return f"{int(h[0:2], 16)};{int(h[2:4], 16)};{int(h[4:6], 16)}"
+
+
+def _msgr(fg=None, bg=None):
+    return (f"\033[38;2;{_mrgb(fg)}m" if fg else "") + (f"\033[48;2;{_mrgb(bg)}m" if bg else "")
+
+
+def _interp(a, b, t, d):
+    a, b = MENU_P.get(a, a), MENU_P.get(b, b)
+    return "".join(f"{(int(a[i:i + 2], 16) * (d - t) + int(b[i:i + 2], 16) * t) // d:02x}" for i in (0, 2, 4))
+
+
+def _line(spans, width, dfg="cream", dbg="black"):
+    """Render [(text, fg, bg)] clipped/padded to exactly `width` cells."""
+    out, vis = [], 0
+    for text, fg, bg in spans:
+        if vis >= width:
+            break
+        text = str(text)[:width - vis]
+        out.append(_msgr(fg or dfg, bg or dbg) + text + "\033[0m")
+        vis += len(text)
+    if vis < width:
+        out.append(_msgr(dfg, dbg) + " " * (width - vis) + "\033[0m")
+    return "".join(out)
+
+
+def _stripe(width, top, bot):
+    return _line([("▀" * width, top, bot)], width)
+
+
+def _band(width, text, fg, bg):
+    pad = max(0, (width - len(text)) // 2)
+    return _line([(" " * pad + text, fg, bg)], width, dbg=bg)
+
+
+def _meter(frac, width):
+    frac = max(0.0, min(1.0, frac))
+    n = int(round(frac * width))
+    return "█" * n + "░" * (width - n)
+
+
+def _spark(xs):
+    """sqrt-scaled so one huge day doesn't flatten the other 29."""
+    xs = [max(0, x) ** 0.5 for x in (list(xs) or [0])]
+    hi = max(xs)
+    if hi <= 0:
+        return MENU_SPARK[0] * len(xs)
+    return "".join(MENU_SPARK[min(7, int(x / hi * 7 + 0.001))] if x else " " for x in xs)
+
+
+def _box(title, body, width, height, bfg="blue_mid", tfg="gold"):
+    inner = width - 2
+    rows = [_line([("╭─ ", bfg, None), (title, tfg, None), (" " + "─" * max(0, inner - len(title) - 3), bfg, None),
+                   ("╮", bfg, None)], width)]
+    for i in range(height - 2):
+        spans = body[i] if i < len(body) else []
+        rows.append(_line([("│ ", bfg, None)] + list(spans), width - 1) + _line([("│", bfg, None)], 1))
+    rows.append(_line([("╰" + "─" * inner + "╯", bfg, None)], width))
+    return rows
+
+
+def _wordmark(width, word="NAVCOM", top="orange_hot", bot="orange_dk", on="▀▀"):
+    off, gap = "  ", "  "
+    vis = len(word) * (5 * len(on) + len(gap))
+    if vis > width:  # narrow terminal: single-cell pixels
+        on, off, gap = on[:1], " ", " "
+        vis = len(word) * (5 * len(on) + len(gap))
+    rows = []
+    for r in range(7):
+        line = ""
+        for ch in word:
+            line += "".join(on if c == "#" else off for c in _GLYPHS[ch][r]) + gap
+        pad = max(0, (width - vis) // 2)
+        rows.append(_line([(" " * pad + line, _interp(top, bot, r, 6), "black")], width))
+    return rows
+
+
+def _wrap(text, width):
+    out = []
+    for para in str(text).splitlines() or [""]:
+        line = ""
+        for word in para.split(" "):
+            while len(word) > width:
+                if line:
+                    out.append(line)
+                    line = ""
+                out.append(word[:width])
+                word = word[width:]
+            if len(line) + len(word) + (1 if line else 0) > width:
+                out.append(line)
+                line = word
+            else:
+                line = f"{line} {word}" if line else word
+        out.append(line)
+    return out
+
+
+def splash_frame(width):
+    rows = [_stripe(width, "black", "blue_deep"), _stripe(width, "blue_deep", "blue_dark"),
+            _stripe(width, "blue_dark", "blue_mid"), _line([], width)]
+    rows += _wordmark(width)
+    rows += [_line([], width), _stripe(width, "orange_hot", "orange"),
+             _band(width, MENU_SLOGAN, "ink", "orange"),
+             _stripe(width, "orange", "orange_dk"),
+             _band(width, MENU_TAGLINE, "cream", "orange_dk"),
+             _stripe(width, "orange_dk", "red_deep"), _stripe(width, "red_deep", "black"),
+             _band(width, f"navcom {NAVCOM_VERSION} · press any key", "grey_lt", "black")]
+    return rows
+
+
+# ── dashboard data ───────────────────────────────────────────────────────────
+
+def dashboard_stats(conn):
+    """Everything the dashboard shows, computed from the index + disk in well under a second."""
+    import time
+    now = time.time()
+    logs = list_logs(ALL_PROVIDERS)
+    on_disk = {l[0] for l in logs}
+    per_harness = collections.Counter(l[3] for l in logs)
+    rows = conn.execute("SELECT file, mtime FROM file_state").fetchall()
+    rescued = sum(1 for f, _ in rows if f not in on_disk)
+    oldest = min((m for _, m in rows if m), default=now)
+    days = [0] * 30
+    for _, m in rows:
+        age = int((now - (m or 0)) // 86400)
+        if 0 <= age < 30:
+            days[29 - age] += 1
+    turns = conn.execute("SELECT count(*) FROM turn_loc").fetchone()[0]
+    try:
+        tool_rows = conn.execute("SELECT count(*) FROM session_fts WHERE role='tool'").fetchone()[0]
+    except sqlite3.Error:
+        tool_rows = 0
+    claude_logs = [l for l in logs if l[3] == "claude"]
+    claude_old_kept = sum(1 for l in claude_logs if now - l[1] > 30 * 86400)
+    retention = []
+    for name, status in (("Claude Code", claude_retention_status), ("Gemini CLI", gemini_retention_status)):
+        d, how = status()
+        if d is not None:
+            retention.append((name, 30, d, how))
+    for hid, h in EXTRA_HARNESSES.items():
+        if not h.get("retention"):
+            continue
+        try:
+            spec = h["retention"]()
+        except Exception:
+            continue
+        if not spec or not Path(spec["settings_path"]).parent.is_dir():
+            continue
+        reader = yaml_setting if str(spec["settings_path"]).endswith((".yaml", ".yml")) else json_setting
+        cur = reader(spec["settings_path"], spec["key_path"])
+        kept = cur is not None and str(cur).lower() in (str(spec["never_delete_value"]).lower(), "false", "36500")
+        retention.append((h["label"], spec.get("default_days", 30), 36500 if kept else spec.get("default_days", 30),
+                          f"{spec['key_path']} = {cur}"))
+    archive_files = archive_bytes = 0
+    root = archive_root()
+    if root.exists():
+        for p in root.rglob("*.gz"):
+            archive_files += 1
+            archive_bytes += p.stat().st_size
+    return {
+        "sessions": len(rows), "on_disk": len(on_disk), "rescued": rescued, "turns": turns, "tools": tool_rows,
+        "oldest": oldest, "days": days, "per_harness": per_harness, "retention": retention,
+        "claude_old_kept": claude_old_kept, "archive_files": archive_files, "archive_bytes": archive_bytes,
+        "daily": daily_job_status(), "index_bytes": default_index_path().stat().st_size
+        if default_index_path().exists() else 0,
+    }
+
+
+MENU_ACTIONS = [
+    ("search", "SEARCH", "Find any conversation, command or error across every harness.",
+     "navcom <words>"),
+    ("recent", "RECENT SESSIONS", "Your latest sessions, with titles — open one to read it.",
+     "navcom --sessions"),
+    ("open", "OPEN BY REF", "Read a session by the ref printed in search results (e.g. 7ec78a59:533).",
+     "navcom --open <ref>[:turn]"),
+    ("harness", "HARNESSES", "Every coding agent navcom reads, how many sessions each has, where they live.",
+     "navcom --where"),
+    ("learn", "LEARN NAVCOM", "The two-step recipe and the query rules, with copy-paste examples.",
+     "navcom --help"),
+    ("skill", "SKILL CARD", "Teach every agent on this machine to use navcom (already automatic).",
+     "navcom --skill install"),
+    ("maintain", "RUN UPKEEP NOW", "Index everything, archive raw transcripts, re-parse old rows.",
+     "navcom --maintain"),
+    ("quit", "QUIT", "Back to your shell.", ""),
+]
+
+
+def dashboard_frame(stats, sel, width, height):
+    import time
+    W = width
+    rows = [_stripe(W, "orange_hot", "orange"),
+            _line([("  NAVCOM", "yellow", None), (" · mission control for your agent history   ", "cream", None),
+                   (MENU_SLOGAN.lower(), "orange_hot", None), ("   " + time.strftime("%H:%M:%S"), "grey_lt", None)], W),
+            _stripe(W, "orange", "orange_dk")]
+    lw = rw = min(36, max(22, (W - 6) // 3))
+    cw = max(24, W - lw - rw - 2)
+    th = 13
+    s = stats
+    oldest = datetime.fromtimestamp(s["oldest"]).strftime("%Y-%m-%d")
+    hist = [
+        [("sessions   ", "grey_lt", None), (f"{s['sessions']:,}", "yellow", None)],
+        [("turns      ", "grey_lt", None), (f"{s['turns']:,}", "cream", None)],
+        [("tool output", "grey_lt", None), (f" {s['tools']:,}", "cream", None)],
+        [("history    ", "grey_lt", None), (f"since {oldest}", "cyan", None)],
+        [("rescued    ", "grey_lt", None), (f"{s['rescued']:,}", "green", None), (" deleted by", "grey_lt", None)],
+        [("           ", None, None), ("their harness,", "grey_lt", None)],
+        [("           ", None, None), ("still yours", "green", None)],
+        [("archive    ", "grey_lt", None),
+         (f"{s['archive_files']:,} raw · {s['archive_bytes'] / 1e6:.0f} MB", "cream", None)],
+        [("index      ", "grey_lt", None), (f"{s['index_bytes'] / 1e9:.2f} GB", "cream", None)],
+    ]
+    bw = max(8, cw - 33)
+    sliver = "█" + "░" * (bw - 1)  # 30 days against 36,500: one cell is already generous
+    ret = [[("Claude's default  ", "grey_lt", None), (sliver, "red", None), ("  30 days", "red", None)],
+           [("navcom keeps     ", "grey_lt", None), (_meter(1.0, bw), "green", None), ("  100 years", "green", None)],
+           [("─" * (cw - 4), "blue_mid", None)]]
+    for name, default, now_days, _how in s["retention"][:6]:
+        ok = now_days >= 3650
+        ret.append([("● " if ok else "○ ", "green" if ok else "red", None), (f"{name[:14]:<15}", "cream", None),
+                    (f"wipes at {default}d → ", "grey_lt", None),
+                    ("kept 100y" if ok else f"DELETES {now_days:g}d", "green" if ok else "red", None)])
+    if s["claude_old_kept"]:
+        ret.append([("  saved so far: ", "grey_lt", None), (f"{s['claude_old_kept']} Claude chats", "green", None),
+                    (" > 30d old", "grey_lt", None)])
+    top = s["per_harness"].most_common(5)
+    hi = max([n for _, n in top] or [1])
+    act = [[("30 days ", "grey_lt", None), (_spark(s["days"]), "cyan", None)],
+           [("─" * (rw - 4), "blue_mid", None)]]
+    for name, n in top:
+        act.append([(f"{name:<9}", "cream", None), (_meter(n / hi, rw - 18), "amber", None), (f" {n:>5}", "grey_lt", None)])
+    act += [[("─" * (rw - 4), "blue_mid", None)],
+            [("● " if "scheduled" in s["daily"] else "○ ", "green" if "scheduled" in s["daily"] else "red", None),
+             ("daily upkeep " + ("on" if "scheduled" in s["daily"] else "off"), "cream", None)],
+            [(f"{len([1 for v in s['per_harness'].values() if v])} harnesses active", "grey_lt", None)]]
+    a, b, c = _box("HISTORY", hist, lw, th), _box("RETENTION ▸ keeping your data", ret, cw, th, tfg="orange_hot"), \
+        _box("ACTIVITY", act, rw, th)
+    rows += [a[i] + " " + b[i] + " " + c[i] for i in range(th)]
+    acts = []
+    for i, (_aid, label, why, cli) in enumerate(MENU_ACTIONS):
+        on = i == sel
+        acts.append([("▶ " if on else "  ", "orange_hot" if on else "blue_mid", None),
+                     (f" {label:<16}", "ink" if on else "cream", "amber" if on else None),
+                     (f"  {why}", "cream" if on else "grey_lt", None)])
+    rows += _box("ACTIONS   (↑↓ select · enter go)", acts, W, len(MENU_ACTIONS) + 2)
+    cli = MENU_ACTIONS[sel][3]
+    rows.append(_line([("  CLI ▸ ", "orange_hot", None), (cli or "—", "yellow", None),
+                       ("   learn the command: everything here is one line in a script or an agent", "grey_lt", None)], W))
+    rows.append(_line([("  ↑↓", "orange_hot", None), (" move  ", "grey_lt", None), ("enter", "orange_hot", None),
+                       (" go  ", "grey_lt", None), ("/", "orange_hot", None), (" search  ", "grey_lt", None),
+                       ("r", "orange_hot", None), (" refresh  ", "grey_lt", None), ("q", "orange_hot", None),
+                       (" quit", "grey_lt", None)], W))
+    rows += [_stripe(W, "orange_dk", "red_deep"), _stripe(W, "red_deep", "black")]
+    return rows[:height]
+
+
+def _screen(title, body_rows, width, height, footer, cli=""):
+    """Generic full-screen page: title band, body, CLI line, key hints."""
+    rows = [_stripe(width, "black", "blue_deep"), _band(width, title, "yellow", "blue_dark"),
+            _stripe(width, "blue_dark", "black")]
+    room = height - len(rows) - 4
+    rows += body_rows[:room] + [_line([], width)] * max(0, room - len(body_rows))
+    rows.append(_line([("  CLI ▸ ", "orange_hot", None), (cli or "—", "yellow", None)], width))
+    rows.append(_line([("  " + footer, "grey_lt", None)], width))
+    rows += [_stripe(width, "orange_dk", "red_deep"), _stripe(width, "red_deep", "black")]
+    return rows
+
+
+ROLE_COLORS = {"user": "amber", "cmd": "orange_hot", "tool": "grey_lt"}
+
+
+def _turn_rows(role, text, provider, msg_index, width, marked=False):
+    label = clean_mod.label_for_role(role, provider or "") or "assistant"
+    color = ROLE_COLORS.get(role, "cyan")
+    rows = [_line([("▶ " if marked else "  ", "orange_hot", None), (f"#{msg_index} ", "grey", None),
+                   (label + ":", color, None)], width)]
+    for chunk in _wrap(strip_ansi(text), width - 6)[:400]:
+        rows.append(_line([("    " + chunk, "cream" if role != "tool" else "grey_lt", None)], width))
+    return rows
+
+
+# ── the interactive app ──────────────────────────────────────────────────────
+
+class _Term:
+    """Alternate screen + cbreak keys; restores the terminal no matter what."""
+
+    def __enter__(self):
+        import termios
+        import tty
+        self.fd = sys.stdin.fileno()
+        self.old = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        sys.stdout.write("\033[?1049h\033[?25l\033[2J")
+        sys.stdout.flush()
+        return self
+
+    def __exit__(self, *exc):
+        import termios
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+        sys.stdout.write("\033[?25h\033[?1049l")
+        sys.stdout.flush()
+
+    def key(self, timeout=None):
+        import select
+        if not select.select([sys.stdin], [], [], timeout)[0]:
+            return None
+        ch = os.read(self.fd, 1)
+        if ch == b"\x1b":
+            if select.select([sys.stdin], [], [], 0.03)[0]:
+                seq = os.read(self.fd, 2)
+                return {b"[A": "up", b"[B": "down", b"[C": "right", b"[D": "left",
+                        b"[5": "pgup", b"[6": "pgdn", b"[H": "home", b"[F": "end"}.get(seq, "esc")
+            return "esc"
+        if ch in (b"\r", b"\n"):
+            return "enter"
+        if ch == b"\x7f":
+            return "backspace"
+        try:
+            return ch.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+    @staticmethod
+    def size():
+        sz = shutil.get_terminal_size((110, 34))
+        return max(60, sz.columns), max(24, sz.lines)
+
+    @staticmethod
+    def draw(rows):
+        sys.stdout.write("\033[H" + "\n".join(rows) + "\033[J")
+        sys.stdout.flush()
+
+    def prompt(self, label, hint=""):
+        """One-line input drawn as a band at the bottom; esc cancels."""
+        text = ""
+        while True:
+            w, h = self.size()
+            sys.stdout.write(f"\033[{h - 1};1H" + _line([(f"  {label} ▸ ", "ink", "amber"), (text + "█", "yellow", "blue_dark")], w,
+                                                     dbg="blue_dark")
+                             + f"\033[{h};1H" + _line([("  " + hint, "grey_lt", None)], w))
+            sys.stdout.flush()
+            k = self.key()
+            if k == "enter":
+                return text.strip()
+            if k == "esc":
+                return None
+            if k == "backspace":
+                text = text[:-1]
+            elif k and len(k) == 1 and k.isprintable():
+                text += k
+
+
+def _menu_search(term, conn, query):
+    import shlex
+    try:
+        words = shlex.split(query)
+    except ValueError:
+        words = query.split()
+    providers, rest, tool = list(ALL_PROVIDERS), [], False
+    for w in words:  # tiny subset of CLI flags, so typing them here teaches the CLI too
+        if w.startswith("--") and w[2:] in ALL_PROVIDERS:
+            providers = [w[2:]] if providers == ALL_PROVIDERS else providers + [w[2:]]
+        elif w in ("--tool", "--tools"):
+            tool = True
+        else:
+            rest.append(w)
+    q = " ".join(rest)
+    hits, cooked, note = search_hits(conn, q, providers=providers, limit=12,
+                                     role="tool" if tool else None, include_tools=tool)
+    groups = _group_hits(conn, hits)
+    items = []  # (kind, payload)
+    for g in groups:
+        project, title = session_meta(conn, g["key"], g["provider"])
+        items.append(("head", (g, project, title)))
+        for h in g["hits"]:
+            items.append(("hit", (g, h)))
+    sel = next((i for i, it in enumerate(items) if it[0] == "hit"), 0)
+    top = 0
+    while True:
+        w, hgt = term.size()
+        body = [_line([("  query ", "grey_lt", None), (cooked or "(nothing searchable)", "cyan", None),
+                       (f"   {len(hits)} hits in {len(groups)} sessions", "grey_lt", None)], w)]
+        if note:
+            body.append(_line([("  note: " + note, "amber", None)], w))
+        view = hgt - 9 - len(body)
+        if sel < top:
+            top = sel
+        if sel >= top + view:
+            top = sel - view + 1
+        for i, (kind, payload) in enumerate(items[top:top + view], start=top):
+            if kind == "head":
+                g, project, title = payload
+                body.append(_line([("  ", None, None), (session_date(conn, g["key"]), "grey_lt", None),
+                                   (f"  {g['provider']:<9}", "cyan", None), (pretty_project(project)[:28] + "  ", "cream", None),
+                                   (title[:max(0, w - 60)], "gold", None)], w))
+            else:
+                g, h = payload
+                on = i == sel
+                snip = _trim_snippet(h.snip or h.text, w - 24).replace("«", "").replace("»", "")
+                body.append(_line([("  ▶ " if on else "    ", "orange_hot", None),
+                                   (f"#{h.msg_index:<6}", "grey", "amber" if on else None),
+                                   (f"{h.role}: ", ROLE_COLORS.get(h.role, "cyan"), "amber" if on else None),
+                                   (snip, "ink" if on else "cream", "amber" if on else None)], w))
+        if not items:
+            body.append(_line([("  No hits — try fewer words, or a OR b.", "amber", None)], w))
+        cur = items[sel][1] if items and items[sel][0] == "hit" else None
+        cli = f"navcom {query}" + (f"   →   navcom --open {display_ref(conn, cur[0]['key'], cur[0]['provider'])}:{cur[1].msg_index}"
+                                    if cur else "")
+        term.draw(_screen(f"SEARCH ▸ {query}", body, w, hgt, "↑↓ move · enter read · / new search · esc back", cli))
+        k = term.key()
+        if k in ("esc", "q", "left"):
+            return
+        if k == "/":
+            return "again"
+        if k in ("up", "k"):
+            sel = next((i for i in range(sel - 1, -1, -1) if items[i][0] == "hit"), sel)
+        elif k in ("down", "j"):
+            sel = next((i for i in range(sel + 1, len(items)) if items[i][0] == "hit"), sel)
+        elif k == "enter" and cur:
+            _menu_view(term, conn, cur[0]["key"], cur[0]["provider"], cur[1].msg_index)
+
+
+def _menu_view(term, conn, key, provider, focus=None):
+    last = max_msg_index(conn, key)
+    lo = max(1, (focus or 1) - 60)
+    hi = (focus or 1) + 120 if focus else 300
+    turns = fetch_window_rows(conn, key, [(lo, hi)])
+    project, title = session_meta(conn, key, provider)
+    ref = display_ref(conn, key, provider)
+    scroll = None
+    while True:
+        w, hgt = term.size()
+        rows, anchor = [], 0
+        for msg_index, role, text in turns:
+            if msg_index == focus:
+                anchor = len(rows)
+            rows += _turn_rows(role, text, provider, msg_index, w, marked=msg_index == focus)
+        if scroll is None:
+            scroll = max(0, anchor - 3)
+        view = hgt - 9
+        scroll = max(0, min(scroll, max(0, len(rows) - view)))
+        head = [_line([("  ", None, None), (session_date(conn, key), "grey_lt", None), (f"  {provider}", "cyan", None),
+                       (f"  {pretty_project(project)}", "cream", None), (f"  turns {lo}-{min(hi, last)} of {last}", "grey_lt", None)], w),
+                _line([("  " + (title or "")[:w - 4], "gold", None)], w)]
+        cli = f"navcom --open {ref}:{focus}" if focus else f"navcom --open {ref}"
+        term.draw(_screen(f"SESSION ▸ {ref}", head + rows[scroll:scroll + view - 2], w, hgt,
+                          "↑↓ scroll · pgup/pgdn page · esc back", cli))
+        k = term.key()
+        if k in ("esc", "q", "left"):
+            return
+        if k in ("up", "k"):
+            scroll -= 1
+        elif k in ("down", "j"):
+            scroll += 1
+        elif k == "pgup":
+            scroll -= view - 4
+        elif k in ("pgdn", " "):
+            scroll += view - 4
+        elif k == "home":
+            scroll = 0
+        elif k == "end":
+            scroll = len(rows)
+
+
+def _menu_list(term, conn, title, entries, cli, on_enter=None):
+    """entries: [(spans, payload)]"""
+    sel, top = 0, 0
+    while True:
+        w, hgt = term.size()
+        view = hgt - 9
+        sel = max(0, min(sel, len(entries) - 1))
+        if sel < top:
+            top = sel
+        if sel >= top + view:
+            top = sel - view + 1
+        body = []
+        for i, (spans, _payload) in enumerate(entries[top:top + view], start=top):
+            on = i == sel and on_enter is not None
+            body.append(_line([("  ▶ " if on else "    ", "orange_hot", None)]
+                              + [(t, "ink" if on else fg, "amber" if on else bg) for t, fg, bg in spans], w))
+        term.draw(_screen(title, body, w, hgt, ("↑↓ move · enter open · " if on_enter else "↑↓ scroll · ") + "esc back", cli))
+        k = term.key()
+        if k in ("esc", "q", "left"):
+            return
+        if k in ("up", "k"):
+            sel -= 1
+        elif k in ("down", "j"):
+            sel += 1
+        elif k == "pgdn":
+            sel += view
+        elif k == "pgup":
+            sel -= view
+        elif k == "enter" and on_enter and entries:
+            on_enter(entries[sel][1])
+
+
+LEARN_PAGES = [
+    ("THE RECIPE", "navcom <words>            find — hits grouped by session, each with a ref and #turn\n"
+                   "navcom --open <ref>:<n>   read the turns around one hit, full text\n\n"
+                   "That's the whole loop. Agents (Claude Code, Codex, Gemini, Copilot, …) already know it from\n"
+                   "the skill card navcom installed for them."),
+    ("QUERIES", "Type anything — punctuation is safe: 10.10.1.223  don't  PR #76  main()  cerbos-wave-2\n"
+                "words      all must be in one turn, prefix-matched (auth → authentication)\n"
+                "a OR b     either one · a, b, c = any of them · NOT x excludes · \"exact phrase\"\n"
+                "No turn has every word? navcom shows turns with ANY of them, rare words first."),
+    ("NARROW", "--claude --codex --cline …   only those harnesses (30 supported)\n"
+               "--here / --project syra       by working directory\n"
+               "--days 7 / --since 2026-09-01 by date\n"
+               "--user / --cmd / --tool       what you typed / commands run / tool output"),
+    ("YOUR DATA", "Claude Code deletes transcripts after 30 days by default (since its first release).\n"
+                  "navcom sets cleanupPeriodDays to 36500, turns Gemini's 30-day wipe off, keeps Qwen and\n"
+                  "Hermes from pruning — only where you haven't chosen otherwise — archives every raw\n"
+                  "transcript, and keeps searching sessions even after their harness deletes them.\n"
+                  "Nothing leaves this machine."),
+    ("AUTOMATIC", "A daily upkeep job (launchd / systemd) indexes and archives while you sleep.\n"
+                  "Every agent harness gets the navcom skill card, so your agents use navcom on their own.\n"
+                  "navcom --where   shows every harness, retention setting, the archive and the daily job."),
+]
+
+
+def run_menu(conn):
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        safe_print("navcom --menu is the interactive terminal UI — run it in a terminal. "
+                   "For scripts and agents: navcom --help")
+        return 0
+    import time
+    with _Term() as term:
+        w, h = term.size()
+        term.draw(splash_frame(w) + [_line([], w)] * max(0, h - 20))
+        stats = dashboard_stats(conn)
+        term.key(timeout=2.2)
+        sel = 0
+        while True:
+            w, h = term.size()
+            term.draw(dashboard_frame(stats, sel, w, h))
+            k = term.key(timeout=1.0)  # 1s tick keeps the clock live
+            if k is None:
+                continue
+            if k in ("q", "esc"):
+                return 0
+            if k in ("up", "k"):
+                sel = (sel - 1) % len(MENU_ACTIONS)
+            elif k in ("down", "j"):
+                sel = (sel + 1) % len(MENU_ACTIONS)
+            elif k == "r":
+                stats = dashboard_stats(conn)
+            elif k in ("enter", "/"):
+                action = "search" if k == "/" else MENU_ACTIONS[sel][0]
+                if action == "quit":
+                    return 0
+                if action == "search":
+                    while True:
+                        q = term.prompt("SEARCH", "type words · add --claude/--codex/… or --tool · enter go · esc back")
+                        if not q or _menu_search(term, conn, q) != "again":
+                            break
+                elif action == "recent":
+                    logs = list_logs(ALL_PROVIDERS)[-80:]
+                    index_logs(conn, logs, progress=False)
+                    entries = []
+                    for key, mtime, _size, prov in reversed(logs):
+                        project, title = session_meta(conn, key, prov)
+                        stamp = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M") if mtime else "?"
+                        entries.append(([(stamp + "  ", "grey_lt", None), (f"{prov:<9}", "cyan", None),
+                                         (f"{pretty_project(project)[:26]:<28}", "cream", None),
+                                         (title[:80], "gold", None)], (key, prov)))
+                    _menu_list(term, conn, "RECENT SESSIONS", entries, "navcom --sessions",
+                               on_enter=lambda kp: _menu_view(term, conn, kp[0], kp[1]))
+                elif action == "open":
+                    ref = term.prompt("REF", "a ref from search results, e.g. 7ec78a59 or 7ec78a59:533 · esc back")
+                    if ref:
+                        m = re.match(r"^(.*?)[:#](\d+)$", ref)
+                        base, focus = (m.group(1), int(m.group(2))) if m else (ref, None)
+                        key, _ = resolve_ref(conn, base)
+                        if key:
+                            _menu_view(term, conn, key, _key_provider(conn, key), focus)
+                elif action == "harness":
+                    roots = provider_roots()
+                    counts = collections.Counter(l[3] for l in list_logs(ALL_PROVIDERS))
+                    entries = []
+                    for hid in ALL_PROVIDERS:
+                        n = counts.get(hid, 0)
+                        where = next((str(r) for r in roots.get(hid, []) if Path(r).exists()), "")
+                        label = EXTRA_HARNESSES.get(hid, {}).get("label", hid)
+                        entries.append(([("● " if n else "○ ", "green" if n else "grey", None),
+                                         (f"{label[:24]:<26}", "cream", None), (f"{n:>6} ", "yellow", None),
+                                         (f" --{hid:<11}", "orange_hot", None), (pretty_project(where)[:60], "grey_lt", None)], None))
+                    _menu_list(term, conn, f"HARNESSES ▸ {sum(1 for v in counts.values() if v)} active of {len(ALL_PROVIDERS)}",
+                               entries, "navcom --where")
+                elif action == "learn":
+                    entries = []
+                    for head, text in LEARN_PAGES:
+                        entries.append(([("■ " + head, "orange_hot", None)], None))
+                        for line in text.splitlines():
+                            entries.append(([("  " + line, "cream", None)], None))
+                        entries.append(([("", None, None)], None))
+                    _menu_list(term, conn, "LEARN NAVCOM", entries, "navcom --help")
+                elif action == "skill":
+                    import contextlib
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        install_skills(force=False, report=True)
+                    entries = [([("  " + line, "cream", None)], None) for line in buf.getvalue().splitlines()]
+                    entries += [([("", None, None)], None),
+                                ([("  Every agent harness reads this card, so your agents reach for navcom themselves.", "grey_lt", None)], None)]
+                    _menu_list(term, conn, "SKILL CARD", entries, "navcom --skill   ·   navcom --skill install")
+                elif action == "maintain":
+                    term.draw(_screen("UPKEEP ▸ running…", [_line([("  indexing every harness and archiving raw transcripts…", "cyan", None)], w)],
+                                      w, h, "please wait", "navcom --maintain"))
+                    import contextlib
+                    buf = io.StringIO()
+                    t0 = time.time()
+                    with contextlib.redirect_stdout(buf):
+                        cmd_maintain(conn)
+                    stats = dashboard_stats(conn)
+                    entries = [([("  " + line, "green", None)], None) for line in buf.getvalue().splitlines()]
+                    entries.append(([(f"  done in {time.time() - t0:.1f}s", "grey_lt", None)], None))
+                    _menu_list(term, conn, "UPKEEP ▸ done", entries, "navcom --maintain")
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -9518,7 +10165,8 @@ READ
   navcom --open 7ec78a59            the whole session, turns trimmed to 400 chars (--max-chars 0: full)
   navcom --open 7ec78a59 --user     just the user's turns
   navcom deploy --context           expand every hit in place with its neighbouring turns
-  navcom                            no query: the 20 most recent sessions, with titles
+  navcom --sessions                 your 20 most recent sessions, with titles
+  navcom --menu                     the retro full-screen UI: live dashboard, search, read, learn
   navcom --restore 7ec78a59         put a deleted transcript back from navcom's archive, so
                                     `claude --resume` works again   (--restore all: every one)
 
@@ -9671,8 +10319,13 @@ def build_parser():
                    help="Colour (default auto: only on a terminal, never into a pipe).")
     o.add_argument("--no-color", dest="color", action="store_const", const="never", help=argparse.SUPPRESS)
     o.add_argument("--verbosity", type=int, default=None, help=argparse.SUPPRESS)
-    o.add_argument("--list", "--ls", "--sessions", action="store_true",
+    o.add_argument("--sessions", "--recent-sessions", action="store_true",
+                   help="Your most recent sessions, with titles (-n for how many; harness/date/project filters apply).")
+    o.add_argument("--list", "--ls", action="store_true",
                    help="List session files with --file numbers (newest 50; -n 0 for all; honours --recent/harnesses).")
+    o.add_argument("--menu", "--tui", "--ui", action="store_true",
+                   help="The retro full-screen UI: live dashboard (retention, history, activity), search, read,\n"
+                        "learn the commands. Humans only — agents should use the plain commands.")
 
     m = parser.add_argument_group("summaries (slow: they call another LLM CLI)")
     m.add_argument("--solo", action="store_true", help="One consolidated summary of all hits.  navcom deploy --solo")
@@ -10143,6 +10796,9 @@ def cmd_where(conn, providers):
 
 def run(argv=None):
     parser = build_parser()
+    if not (sys.argv[1:] if argv is None else argv):
+        parser.print_help()  # bare `navcom`: the manual (LLMs and humans both start here)
+        return 0
     args = parser.parse_intermixed_args(argv)
     STYLE.configure(args.color)
 
@@ -10195,6 +10851,8 @@ def run(argv=None):
     if args.restore:
         return cmd_restore(conn, args.restore, providers)
 
+    if args.menu:
+        return run_menu(conn)
     if args.where:
         return cmd_where(conn, providers)
 
@@ -10269,7 +10927,7 @@ def run(argv=None):
         conn.close()
         return result
 
-    if not query and not explicit_scope and not args.summary:
+    if args.sessions or (not query and not explicit_scope and not args.summary):
         try:
             keys = filter_keys(conn, None, providers, args)
         except ValueError as exc:

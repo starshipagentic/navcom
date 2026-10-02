@@ -105,7 +105,7 @@ Feature: Fast search across every harness
   Scenario: Version from the flags LLMs guess
     When I run: navcom -v
     Then it succeeds
-    And the output contains "navcom 0.6.0"
+    And the output contains "navcom 0.7.0"
 
   @critical
   Scenario: Every registered harness indexes prompts, replies, commands and tool output — never injected context
