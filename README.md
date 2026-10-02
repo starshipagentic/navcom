@@ -87,6 +87,18 @@ Type anything. navcom never throws an FTS5 syntax error.
 - `--query` and bare words combine, and a leading `search` / `find` is ignored.
 - Only the turn text is matched. Words that appear in project paths don't produce false hits.
 
+### Tool outputs
+
+What commands printed, files that were read, errors and test runs are indexed too. Each output is
+labelled with the call that produced it, and long ones are capped to the first 3 KB plus the last
+1 KB, where errors usually are. Tool outputs stay out of normal searches so file dumps don't drown
+your conversations:
+
+```bash
+navcom "TypeError: cannot read" --tool    # only tool outputs
+navcom cognito --everything               # conversation and tool outputs together
+```
+
 ### Narrow it
 
 ```bash
@@ -137,6 +149,17 @@ in `~/.claude/settings.json`. It writes atomically and keeps a one-time backup i
 - It never writes `0`: Claude rejects it, and older versions read 0 as "save nothing".
 - `NAVCOM_NO_RETENTION_FIX=1` opts out.
 - `navcom --where` shows the current retention.
+
+**Raw archive.** Every Claude transcript is also kept whole and compressed under
+`~/.navcom/archive/`, with every byte of every tool output. A growing session is archived
+incrementally: only the new part is compressed and appended. If a transcript ever disappears,
+`navcom --restore <ref>` (or `--restore all`) puts it back so `claude --resume` works again.
+`NAVCOM_ARCHIVE=all` archives every harness, and `=off` stops archiving.
+
+**Daily upkeep.** navcom installs a daily background job, a launchd agent on macOS or a systemd
+user timer on Linux. The job runs `navcom --maintain`, which indexes everything, re-parses old rows
+and archives, with no time limits. Your history is kept current even if nobody runs navcom.
+`navcom --daily status | off | on` controls it, and `off` stays off.
 
 navcom's index keeps every session it has seen, even after a harness deletes the file. It is
 created owner-only (`0600`), matching the transcripts it copies text from.

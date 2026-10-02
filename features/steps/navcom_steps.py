@@ -274,3 +274,41 @@ def step_private(context):
         if f.exists():
             mode = stat.S_IMODE(os.stat(f).st_mode)
             assert mode & 0o077 == 0, f"{f} is {oct(mode)}"
+
+
+@then("the claude transcript has a private archive copy")
+def step_archived(context):
+    import os
+    arch = list((context.home / ".navcom" / "archive" / "claude").rglob("*.jsonl.gz"))
+    assert arch, "no archive copy"
+    assert all(os.stat(a).st_mode & 0o077 == 0 for a in arch)
+    context.original_claude = context.sessions["claude"].read_bytes()
+
+
+@when("the claude transcript is deleted")
+def step_delete(context):
+    if not hasattr(context, "original_claude"):
+        context.original_claude = context.sessions["claude"].read_bytes()
+    context.sessions["claude"].unlink()
+
+
+@then("the claude transcript is back byte for byte")
+def step_back(context):
+    assert context.sessions["claude"].read_bytes() == context.original_claude
+
+
+def _job_files(context):
+    return [context.home / "Library" / "LaunchAgents" / "io.navcom.maintain.plist",
+            context.home / ".config" / "systemd" / "user" / "navcom-maintain.timer"]
+
+
+@then("a daily navcom --maintain job is scheduled")
+def step_daily(context):
+    found = [p for p in _job_files(context) if p.exists()]
+    assert found, "no daily job file"
+    assert "--maintain" in found[0].read_text(errors="replace") or found[0].suffix == ".timer"
+
+
+@then("no daily job is scheduled")
+def step_no_daily(context):
+    assert not any(p.exists() for p in _job_files(context))

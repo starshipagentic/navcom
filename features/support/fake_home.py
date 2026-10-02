@@ -44,7 +44,10 @@ def build(home: Path, base_epoch: float = 1_790_000_000):
             {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "npx drizzle-kit push --force"}},
             {"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "navcom --query zebracorn --compact"}},
         ]}},
-        {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}},
+        {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "added 3 packages, migration applied zebracorntoolclaude"},
+            {"type": "tool_result", "tool_use_id": "t2", "content": "navcom: 3 hits in 2 sessions · query: zebracorn* zebracornselfoutput"},
+        ]}},
         {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Committed and pushed as \x1b[2mabc1234\x1b[0m done"}]}},
     ])
     sub = claude.parent / claude.stem / "subagents" / "agent-a1b2c3.jsonl"
@@ -60,7 +63,11 @@ def build(home: Path, base_epoch: float = 1_790_000_000):
         {"timestamp": "2026-09-01T10:00:00Z", "type": "session_meta", "payload": {"id": "x", "cwd": cwd}},
         {"timestamp": "2026-09-01T10:00:01Z", "type": "event_msg", "payload": {"type": "user_message", "message": "find the cognito auth bug zebracorn zebracorncodex"}},
         {"timestamp": "2026-09-01T10:00:02Z", "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "find the cognito auth bug zebracorn zebracorncodex"}]}},
-        {"timestamp": "2026-09-01T10:00:03Z", "type": "response_item", "payload": {"type": "function_call", "name": "shell_command", "arguments": json.dumps({"command": "rg cognito src/"})}},
+        {"timestamp": "2026-09-01T10:00:03Z", "type": "response_item", "payload": {"type": "function_call", "name": "shell_command", "call_id": "c1", "arguments": json.dumps({"command": "rg cognito src/"})}},
+        {"timestamp": "2026-09-01T10:00:03Z", "type": "response_item", "payload": {"type": "function_call_output", "call_id": "c1", "output": json.dumps({"output": "src/auth.ts:12: cognito refresh zebracorntoolcodex", "metadata": {"exit_code": 0}})}},
+        {"timestamp": "2026-09-01T10:00:03Z", "type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "call_id": "c2", "arguments": json.dumps({"cmd": "npm test -- auth", "workdir": "/x"})}},
+        {"timestamp": "2026-09-01T10:00:03Z", "type": "response_item", "payload": {"type": "custom_tool_call", "name": "exec", "call_id": "c3", "input": 'const r = await tools.exec_command({"cmd": "git log --oneline -3"}); text(r)'}},
+        {"timestamp": "2026-09-01T10:00:03Z", "type": "response_item", "payload": {"type": "custom_tool_call_output", "call_id": "c3", "output": [{"type": "input_text", "text": "Script completed\nOutput:\nabc1234 fix zebracornjsexec"}]}},
         {"timestamp": "2026-09-01T10:00:04Z", "type": "event_msg", "payload": {"type": "agent_message", "message": "The cognito token refresh was missing. zebracorncodex"}},
     ])
     _touch(codex, base_epoch + 200)
@@ -74,7 +81,8 @@ def build(home: Path, base_epoch: float = 1_790_000_000):
         "messages": [
             {"type": "user", "content": [{"text": "terraform plan for zebracorn zebracorngemini"}], "timestamp": "2026-09-02T00:00:00Z"},
             {"type": "gemini", "content": "Run terraform plan -out=tf.plan zebracorngemini", "timestamp": "2026-09-02T00:00:01Z",
-             "toolCalls": [{"name": "run_shell_command", "args": {"command": "terraform plan -out=tf.plan"}}]},
+             "toolCalls": [{"name": "run_shell_command", "args": {"command": "terraform plan -out=tf.plan"},
+                            "resultDisplay": "Plan: 3 to add zebracorntoolgemini"}]},
         ],
     }))
     (home / ".gemini" / "projects.json").write_text(json.dumps({"projects": {cwd: PROJECT}}))
@@ -96,7 +104,7 @@ def build(home: Path, base_epoch: float = 1_790_000_000):
                 {"type": "toolCall", "id": "c2", "name": "memory", "arguments": {"command": "create", "file_path": "x"}},
             ]}},
             {"type": "message", "id": "4", "message": {"role": "toolResult", "toolCallId": "c1", "toolName": "bash", "content": [{"type": "text", "text": "zebracorntoolresult"}]}},
-            {"type": "message", "id": "5", "message": {"role": "bashExecution", "command": "pwd", "output": "/x", "exitCode": 0}},
+            {"type": "message", "id": "5", "message": {"role": "bashExecution", "command": "pwd", "output": "/x zebracornbashexec", "exitCode": 0}},
         ])
         _touch(path, base_epoch + (400 if name == "pi" else 500))
         sessions[name] = path
@@ -124,7 +132,7 @@ def build(home: Path, base_epoch: float = 1_790_000_000):
         ("prt_1", "msg_1", {"type": "text", "text": "check the cerbos policies zebracorn zebracornopencode"}),
         ("prt_1b", "msg_1", {"type": "text", "text": "<system-reminder>zebracornsynthetic</system-reminder>", "synthetic": True}),
         ("prt_2", "msg_2", {"type": "reasoning", "text": "zebracornthinking"}),
-        ("prt_3", "msg_2", {"type": "tool", "tool": "bash", "callID": "c", "state": {"status": "completed", "input": {"command": "grep -c it( tests/cerbos.test.ts"}, "output": "22"}}),
+        ("prt_3", "msg_2", {"type": "tool", "tool": "bash", "callID": "c", "state": {"status": "completed", "input": {"command": "grep -c it( tests/cerbos.test.ts"}, "output": "22 zebracorntoolopencode"}}),
         ("prt_4", "msg_2", {"type": "text", "text": "22 cerbos tests found. zebracornopencode"}),
     ]
     for i, (pid, mid, data) in enumerate(parts):
@@ -167,7 +175,7 @@ def build(home: Path, base_epoch: float = 1_790_000_000):
             {"type": "text", "text": "Let me check the pod logs. zebracorngoose"},
             {"type": "toolRequest", "id": "r1", "toolCall": {"status": "success", "value": {"name": "developer__shell", "arguments": {"command": "kubectl logs pod/api-0"}}}},
         ]),
-        ("user", [{"type": "toolResponse", "id": "r1", "toolResult": {"status": "success", "value": [{"type": "text", "text": "zebracorntoolresult"}]}}]),
+        ("user", [{"type": "toolResponse", "id": "r1", "toolResult": {"status": "success", "value": [{"type": "text", "text": "CrashLoopBackOff zebracorntoolgoose"}]}}]),
     ]
     for i, (role, content) in enumerate(msgs):
         con.execute("INSERT INTO messages (session_id, role, content_json, created_timestamp) VALUES (?,?,?,?)",
@@ -197,5 +205,6 @@ def env_for(home: Path):
         "CLAUDE_CONFIG_DIR": str(home / ".claude"),
         "NAVCOM_INDEX": str(home / "navcom-index.sqlite"),
         "NO_COLOR": "1",
+        "NAVCOM_DRY_SCHEDULER": "1",
     })
     return env

@@ -55,7 +55,7 @@ def load_module(code, name):
 clean_mod = load_module(LOG_CLEAN_QUICK_CODE, "log_clean_quick")
 fts_mod = load_module(LOG_SEARCH_FTS5_CODE, "log_search_fts5")
 
-NAVCOM_VERSION = "0.2.3"
+NAVCOM_VERSION = "0.3.0"
 DEFAULT_LIMIT = 20  # hits per harness (and sessions listed by a bare `navcom`)
 
 # Every harness navcom knows how to read. Order = display order in help/listings.
@@ -446,6 +446,7 @@ def _is_shell_tool(name):
 
 def iter_pi_lines(lines):
     """pi / omo session JSONL: {"type":"message","message":{role, content}} records."""
+    calls = {}
     for line in lines:
         try:
             obj = json.loads(line)
@@ -462,6 +463,10 @@ def iter_pi_lines(lines):
             text = _text_of(content)
             if text:
                 yield "user", text
+        elif role == "toolResult":
+            turn = tool_turn(calls.get(msg.get("toolCallId"), msg.get("toolName") or "tool"), content)
+            if turn:
+                yield turn
         elif role == "assistant":
             buf = []
             for item in content if isinstance(content, list) else [content]:
@@ -472,10 +477,11 @@ def iter_pi_lines(lines):
                     continue
                 if item.get("type") == "text" and isinstance(item.get("text"), str):
                     buf.append(item["text"])
-                elif item.get("type") == "toolCall" and _is_shell_tool(item.get("name")):
+                elif item.get("type") == "toolCall":
                     args = item.get("arguments") or {}
-                    cmd = args.get("command") if isinstance(args, dict) else None
-                    if isinstance(cmd, str) and cmd.strip():
+                    calls[item.get("id")] = _call_label(item.get("name"), args)
+                    cmd = _shell_cmd(item.get("name"), args)
+                    if cmd:
                         if buf:
                             yield "assistant", "\n".join(buf)
                             buf = []
@@ -486,9 +492,13 @@ def iter_pi_lines(lines):
             cmd = msg.get("command")
             if isinstance(cmd, str) and cmd.strip():
                 yield "cmd", cmd
+                turn = tool_turn(f"bash: {cmd}", msg.get("output"))
+                if turn:
+                    yield turn
 
 
-def _goose_content_turns(role, content):
+def _goose_content_turns(role, content, calls=None):
+    calls = {} if calls is None else calls
     buf = []
     for item in content if isinstance(content, list) else []:
         if not isinstance(item, dict):
@@ -499,20 +509,33 @@ def _goose_content_turns(role, content):
         elif itype == "toolRequest":
             call = item.get("toolCall") or {}
             value = call.get("value") if isinstance(call, dict) else None
-            if isinstance(value, dict) and _is_shell_tool(value.get("name")):
+            if isinstance(value, dict):
                 args = value.get("arguments") or {}
-                cmd = args.get("command") if isinstance(args, dict) else None
-                if isinstance(cmd, str) and cmd.strip():
+                calls[item.get("id")] = _call_label(value.get("name"), args)
+                cmd = _shell_cmd(value.get("name"), args)
+                if cmd:
                     if buf:
                         yield role, "\n".join(buf)
                         buf = []
                     yield "cmd", cmd
+        elif itype == "toolResponse":
+            result = item.get("toolResult") or {}
+            output = result.get("value") if isinstance(result, dict) else None
+            if isinstance(result, dict) and result.get("status") == "error":
+                output = result.get("error")
+            turn = tool_turn(calls.get(item.get("id"), "tool"), output)
+            if turn:
+                if buf:
+                    yield role, "\n".join(buf)
+                    buf = []
+                yield turn
     if buf:
         yield role, "\n".join(buf)
 
 
 def iter_goose_lines(lines):
     """Legacy goose .jsonl: first line is session metadata, then one Message per line."""
+    calls = {}
     for line in lines:
         try:
             obj = json.loads(line)
@@ -520,7 +543,7 @@ def iter_goose_lines(lines):
             continue
         if not isinstance(obj, dict) or obj.get("role") not in ("user", "assistant"):
             continue
-        yield from _goose_content_turns(obj["role"], obj.get("content"))
+        yield from _goose_content_turns(obj["role"], obj.get("content"), calls)
 
 
 def iter_goose_db(key):
@@ -534,6 +557,7 @@ def iter_goose_db(key):
         con.close()
     except sqlite3.Error:
         return
+    calls = {}
     for role, content_json in rows:
         if role not in ("user", "assistant"):
             continue
@@ -541,7 +565,7 @@ def iter_goose_db(key):
             content = json.loads(content_json)
         except Exception:
             continue
-        yield from _goose_content_turns(role, content)
+        yield from _goose_content_turns(role, content, calls)
 
 
 def _opencode_parts_turns(role, parts):
@@ -554,15 +578,19 @@ def _opencode_parts_turns(role, parts):
             if part.get("synthetic"):
                 continue
             buf.append(part["text"])
-        elif ptype == "tool" and _is_shell_tool(part.get("tool")):
+        elif ptype == "tool":
             state = part.get("state") or {}
             args = state.get("input") if isinstance(state, dict) else None
-            cmd = args.get("command") if isinstance(args, dict) else None
-            if isinstance(cmd, str) and cmd.strip():
-                if buf:
-                    yield role, "\n".join(buf)
-                    buf = []
+            cmd = _shell_cmd(part.get("tool"), args)
+            if buf and (cmd or state.get("output")):
+                yield role, "\n".join(buf)
+                buf = []
+            if cmd:
                 yield "cmd", cmd
+            if isinstance(state, dict):
+                turn = tool_turn(_call_label(part.get("tool"), args), state.get("output") or state.get("error"))
+                if turn:
+                    yield turn
     if buf:
         yield role, "\n".join(buf)
 
@@ -656,7 +684,7 @@ def _rescue_slash_command(text):
 
 def _raw_turns(key, provider, text_chunk=None):
     if provider == "gemini":
-        return clean_mod.iter_gemini(Path(key), False, True)
+        return iter_gemini_file(key)
     if provider == "opencode":
         return iter_opencode_db(key) if "#" in key else iter_opencode_legacy(key)
     if provider == "goose" and "#" in key:
@@ -668,17 +696,14 @@ def _raw_turns(key, provider, text_chunk=None):
     if provider == "goose":
         return iter_goose_lines(text_chunk.splitlines())
     if provider == "claude":
-        # isMeta lines are harness-injected (hook output, caveats), not the user speaking
-        kept = "".join(line for line in text_chunk.splitlines(True) if not _IS_META_RE.search(line))
-        return clean_mod.iter_claude(_LinesSource(kept), False, True)
-    source = _LinesSource(text_chunk)
-    return clean_mod.iter_codex(source, False, True)
+        return iter_claude_lines(text_chunk.splitlines())
+    return iter_codex_lines(text_chunk.splitlines())
 
 
 def iter_clean_turns(key, provider, text_chunk=None):
     last = None
     for role, text in _raw_turns(str(key), provider, text_chunk):
-        if role not in ("user", "assistant", "cmd"):
+        if role not in ("user", "assistant", "cmd", "tool"):
             continue
         if isinstance(text, (list, dict)):
             # newer Gemini logs store content as a list of {"text": …} parts
@@ -702,6 +727,229 @@ def iter_clean_turns(key, provider, text_chunk=None):
             continue
         last = dedupe_key
         yield role, raw
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool outputs — what commands printed, files that were read, errors, test runs
+# ─────────────────────────────────────────────────────────────────────────────
+# Indexed as role "tool", capped (head + tail: errors live at the end), labelled with the
+# call that produced them. Left out of normal searches; `--tool` searches only them.
+
+TOOL_HEAD_CHARS = 3000
+TOOL_TAIL_CHARS = 1000
+_DATA_URI_RE = re.compile(r"data:[\w/+.-]+;base64,[A-Za-z0-9+/=\s]{200,}")
+_BLOB_RE = re.compile(r"[A-Za-z0-9+/=]{600,}")
+_NAVCOM_OUTPUT_MARKERS = ("→ read around a hit: navcom --open", "navcom: no session matches", "No hits. (query:")
+
+
+def cap_tool_output(text):
+    text = _BLOB_RE.sub("[binary data]", _DATA_URI_RE.sub("[binary data]", strip_ansi(text or ""))).strip()
+    if len(text) <= TOOL_HEAD_CHARS + TOOL_TAIL_CHARS + 200:
+        return text
+    omitted = len(text) - TOOL_HEAD_CHARS - TOOL_TAIL_CHARS
+    return f"{text[:TOOL_HEAD_CHARS]}\n…[{omitted} chars omitted]…\n{text[-TOOL_TAIL_CHARS:]}"
+
+
+def _is_navcom_output(label, text):
+    if label and _NAVCOM_CMD_RE.search(label):
+        return True
+    head = (text or "")[:400]
+    return head.startswith("navcom: ") or any(m in (text or "") for m in _NAVCOM_OUTPUT_MARKERS)
+
+
+def tool_turn(label, output):
+    """('tool', '[label]\\n<capped output>') or None for empty / navcom's own output."""
+    if isinstance(output, (list, dict)):
+        output = _text_of(output if isinstance(output, list) else [output]) or (
+            json.dumps(output, ensure_ascii=False)[:20000] if output else "")
+    if not isinstance(output, str) or not output.strip():
+        return None
+    stripped = output.strip()
+    if stripped.startswith("{") and '"output"' in stripped[:2000]:
+        # Codex wraps command results: {"exit_code":2,"wall_time_seconds":…,"output":"…"}
+        try:
+            env = json.loads(stripped)
+            if isinstance(env, dict) and isinstance(env.get("output"), str):
+                code = env.get("exit_code", env.get("metadata", {}).get("exit_code") if isinstance(env.get("metadata"), dict) else None)
+                output = (f"exit {code}\n" if code not in (None, 0) else "") + env["output"]
+        except Exception:
+            pass
+    if _is_navcom_output(label, output):
+        return None
+    body = cap_tool_output(output)
+    if not body:
+        return None
+    label = re.sub(r"\s+", " ", (label or "tool")).strip()[:200]
+    return "tool", f"[{label}]\n{body}"
+
+
+def _call_label(name, args):
+    """Human label for a tool call: 'Bash: npm test', 'Read: src/app.ts', 'Grep: TODO'."""
+    name = name or "tool"
+    if isinstance(args, str):
+        return f"{name}: {args[:160]}"
+    if isinstance(args, dict):
+        for key in ("command", "cmd", "file_path", "path", "pattern", "query", "url", "description", "prompt"):
+            value = args.get(key)
+            if isinstance(value, list):
+                value = " ".join(str(v) for v in value)
+            if isinstance(value, str) and value.strip():
+                return f"{name}: {value.strip()[:160]}"
+    return name
+
+
+def _shell_cmd(name, args):
+    """The shell command a tool call ran, if it is a shell-ish tool."""
+    if not _is_shell_tool(name) or not isinstance(args, dict):
+        return None
+    for key in ("command", "cmd", "script"):
+        value = args.get(key)
+        if isinstance(value, list):
+            value = " ".join(str(v) for v in value)
+            if value.startswith(("bash -lc ", "bash -c ", "zsh -lc ", "sh -c ")):
+                value = value.split(" ", 2)[2] if value.count(" ") >= 2 else value
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+# Codex's newer "exec" tool wraps calls in JS: await tools.exec_command({"cmd": "…"})
+_CODEX_JS_CMD_RE = re.compile(r'exec_command\(\s*\{\s*"?cmd"?\s*:\s*("(?:[^"\\]|\\.)*"|`(?:[^`\\]|\\.)*`)')
+
+
+def _codex_js_cmds(code):
+    cmds = []
+    for raw in _CODEX_JS_CMD_RE.findall(code or ""):
+        if raw.startswith('"'):
+            try:
+                cmds.append(json.loads(raw))
+                continue
+            except Exception:
+                pass
+        cmds.append(raw[1:-1])
+    return cmds
+
+
+def iter_claude_lines(lines):
+    """Claude Code JSONL: text turns, shell commands, and tool results (labelled by their call)."""
+    calls = {}
+    for line in lines:
+        if _IS_META_RE.search(line):
+            continue  # harness-injected (hook output, caveats), not the user speaking
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        msg = obj.get("message") if isinstance(obj, dict) else None
+        if not isinstance(msg, dict):
+            continue
+        role, content = msg.get("role"), msg.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "tool_use":
+                    args = item.get("input") or {}
+                    calls[item.get("id")] = _call_label(item.get("name"), args)
+                    cmd = _shell_cmd(item.get("name"), args)
+                    if cmd:
+                        yield "cmd", cmd
+            text = clean_mod.extract_text_content(content, False)
+            if text and role in ("user", "assistant"):
+                yield role, text
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "tool_result":
+                    turn = tool_turn(calls.get(item.get("tool_use_id"), "tool"), item.get("content"))
+                    if turn:
+                        yield turn
+        elif isinstance(content, str) and role in ("user", "assistant") and content.strip():
+            yield role, content
+
+
+def iter_codex_lines(lines):
+    """Codex rollout JSONL: messages, commands (shell / exec_command / JS exec) and their outputs."""
+    calls = {}
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        kind, payload = obj.get("type"), obj.get("payload") or {}
+        ptype = payload.get("type") if isinstance(payload, dict) else None
+        if kind == "response_item":
+            if ptype == "message":
+                text = _text_of(payload.get("content") or [])
+                if text:
+                    yield payload.get("role") or "assistant", text
+            elif ptype in ("function_call", "custom_tool_call", "local_shell_call"):
+                name = payload.get("name") or ("shell" if ptype == "local_shell_call" else "tool")
+                raw = payload.get("arguments", payload.get("input", payload.get("action")))
+                args = raw
+                if isinstance(raw, str):
+                    try:
+                        args = json.loads(raw)
+                    except Exception:
+                        args = raw
+                if isinstance(args, str):  # custom tools (exec JS, apply_patch) take free text
+                    cmds = _codex_js_cmds(args)
+                    label = f"{name}: {cmds[0]}" if cmds else f"{name}: {args.strip()[:160]}"
+                else:
+                    cmd = _shell_cmd(name, args)
+                    cmds = [cmd] if cmd else []
+                    label = _call_label(name, args)
+                calls[payload.get("call_id")] = label
+                for cmd in cmds:
+                    yield "cmd", cmd
+            elif ptype and ptype.endswith("_output"):
+                output = payload.get("output")
+                if isinstance(output, str):
+                    try:
+                        parsed = json.loads(output)
+                        if isinstance(parsed, dict) and isinstance(parsed.get("output"), str):
+                            output = parsed["output"]
+                    except Exception:
+                        pass
+                turn = tool_turn(calls.get(payload.get("call_id"), ptype.replace("_output", "")), output)
+                if turn:
+                    yield turn
+        elif kind == "event_msg":
+            if ptype == "user_message":
+                yield "user", payload.get("message", "")
+            elif ptype == "agent_message":
+                yield "assistant", payload.get("message", "")
+
+
+def iter_gemini_file(path):
+    try:
+        obj = json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return
+    for msg in obj.get("messages", []) if isinstance(obj, dict) else []:
+        if not isinstance(msg, dict):
+            continue
+        mtype = msg.get("type")
+        role = "user" if mtype == "user" else "assistant" if mtype in ("gemini", "assistant", "model") else None
+        if role is None:
+            continue
+        content = msg.get("content")
+        text = content if isinstance(content, str) else _text_of(content if isinstance(content, list) else [content])
+        if text:
+            yield role, text
+        for call in msg.get("toolCalls") or []:
+            if not isinstance(call, dict):
+                continue
+            cmd = _shell_cmd(call.get("name"), call.get("args"))
+            if cmd:
+                yield "cmd", cmd
+            output = call.get("resultDisplay")
+            if not isinstance(output, str) or not output.strip():
+                output = "\n".join(fts_mod.extract_gemini_strings(call.get("result")))
+            turn = tool_turn(_call_label(call.get("name"), call.get("args")), output)
+            if turn:
+                yield turn
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -930,7 +1178,7 @@ def short_ref(key):
 
 INDEX_SCHEMA_VERSION = 2
 # Bump when turn extraction changes; older rows get re-read gradually (see index_logs).
-PARSER_VERSION = 2
+PARSER_VERSION = 3  # 3: tool outputs, Codex exec_command / JS exec commands
 UPGRADE_BUDGET_SECONDS = 1.0
 UPGRADE_BYTES_PER_SECOND = 40_000_000
 MAX_UPGRADE_REREAD_BYTES = 200_000_000
@@ -1125,14 +1373,15 @@ def upgrade_stale_parses(conn, logs, budget=UPGRADE_BUDGET_SECONDS):
     if not stale:
         return 0
     import time
-    deadline = time.monotonic() + budget
+    deadline = None if budget is None else time.monotonic() + budget
     done = 0
     for log in reversed(stale):
-        left = deadline - time.monotonic()
-        if left <= 0:
-            break
-        if "#" not in log[0] and log[2] > left * UPGRADE_BYTES_PER_SECOND:
-            continue  # too big for this call's budget; it upgrades on its next change or --reindex
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            if "#" not in log[0] and log[2] > left * UPGRADE_BYTES_PER_SECOND:
+                continue  # too big for this call's budget; it upgrades on its next change or --reindex
         index_log(conn, log, force=True)
         done += 1
     conn.commit()
@@ -1407,7 +1656,7 @@ def _key_filter_clause(conn, keys):
     return " AND file IN (SELECT file FROM _navcom_keys)", []
 
 
-def run_match(conn, match, limit, providers=None, keys=None, snippet_tokens=32, role=None):
+def run_match(conn, match, limit, providers=None, keys=None, snippet_tokens=32, role=None, include_tools=False):
     tokens = max(1, min(int(snippet_tokens), SNIPPET_MAX_TOKENS))
     where = "session_fts MATCH ?"
     # Only the turn text — otherwise words in project paths (file column) inflate hits.
@@ -1418,6 +1667,8 @@ def run_match(conn, match, limit, providers=None, keys=None, snippet_tokens=32, 
     if role:
         where += " AND role=?"
         params.append(role)
+    elif not include_tools:
+        where += " AND role != 'tool'"  # tool outputs only with --tool / --everything
     clause, key_params = _key_filter_clause(conn, keys)
     where += clause
     params.extend(key_params)
@@ -1435,12 +1686,14 @@ def _is_query_error(exc):
     return "locked" not in msg and "readonly" not in msg and "disk" not in msg
 
 
-def _search_once(conn, match, providers, keys, per_harness, snippet_tokens, role, include_self, exclude_keys):
+def _search_once(conn, match, providers, keys, per_harness, snippet_tokens, role, include_self, exclude_keys,
+                 include_tools=False):
     """Run one MATCH separately for each harness so every harness gets up to
     `per_harness` hits (a busy harness can't crowd the others out), then merge by BM25."""
     merged, excluded = [], 0
     for prov in providers or [None]:
-        raw = run_match(conn, match, per_harness * 3 + 30, [prov] if prov else None, keys, snippet_tokens, role)
+        raw = run_match(conn, match, per_harness * 3 + 30, [prov] if prov else None, keys, snippet_tokens, role,
+                        include_tools)
         kept, skipped = _filter_hits(raw, per_harness, include_self, exclude_keys)
         merged.extend(kept)
         excluded += skipped
@@ -1449,7 +1702,8 @@ def _search_once(conn, match, providers, keys, per_harness, snippet_tokens, role
 
 
 def search_hits(conn, query, providers=None, keys=None, limit=20, snippet_tokens=32,
-                no_prefix=False, role=None, any_terms=False, include_self=False, exclude_keys=None):
+                no_prefix=False, role=None, any_terms=False, include_self=False, exclude_keys=None,
+                include_tools=False):
     """Returns (hits, cooked_query, note). `limit` is per harness. Never raises on query syntax.
 
     Fallback chain — each step only if the previous one found nothing:
@@ -1462,7 +1716,7 @@ def search_hits(conn, query, providers=None, keys=None, limit=20, snippet_tokens
     def attempt(match):
         try:
             return _search_once(conn, match, providers, keys, limit, snippet_tokens, role,
-                                include_self, exclude_keys)
+                                include_self, exclude_keys, include_tools)
         except sqlite3.OperationalError as exc:
             if not _is_query_error(exc):
                 raise
@@ -2019,6 +2273,7 @@ navcom deploy --here             # sessions started in this directory (or below)
 navcom deploy --project syra     # working dir contains "syra"
 navcom deploy --days 7           # or --since 2026-09-01 / --since 12h / --until …
 navcom deploy --user             # only what the user typed;  --cmd = shell commands that were run
+navcom "TypeError: x" --tool     # search TOOL OUTPUTS (command output, files read, errors, tests)
 navcom deploy --newest           # newest sessions first
 navcom goal --this-session       # only THIS conversation (recall after compaction)
 navcom                           # no query: the 20 most recent sessions, with titles
@@ -2035,6 +2290,7 @@ navcom --open 7ec78a59:520-560   # a range of turns
 navcom --open 7ec78a59 --user    # every user turn in that session
 navcom deploy --context          # expand every hit in place
 navcom deploy --json             # structured: sessions[] with ref, date, project, hits[]
+navcom --restore 7ec78a59        # transcript deleted by its harness? put it back, then resume it
 ```
 
 ## Good to know
@@ -2268,6 +2524,362 @@ def private_file(path):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Raw archive — a complete compressed copy of every transcript, restorable
+# ─────────────────────────────────────────────────────────────────────────────
+# ~/.navcom/archive/<harness>/<path>.jsonl.gz. Appended JSONL is archived incrementally as
+# extra gzip members (gzip readers concatenate them), so a growing session is never re-read
+# whole. Default harness: claude (the one that deletes). NAVCOM_ARCHIVE=all|off|claude,pi,…
+
+ARCHIVE_BUDGET_SECONDS = 1.0
+ARCHIVABLE = ("claude", "codex", "gemini", "pi", "omo", "goose")
+
+
+def archive_root():
+    return _env_path("NAVCOM_ARCHIVE_DIR") or Path.home() / ".navcom" / "archive"
+
+
+def archive_providers():
+    raw = (os.environ.get("NAVCOM_ARCHIVE") or "claude").strip().lower()
+    if raw in ("off", "0", "no", "none", "false"):
+        return []
+    if raw == "all":
+        return list(ARCHIVABLE)
+    return [p for p in re.split(r"[,\s]+", raw) if p in ARCHIVABLE]
+
+
+def _provider_root(provider):
+    return {
+        "claude": fts_mod.claude_projects_root(), "codex": fts_mod.codex_sessions_root(),
+        "gemini": fts_mod.gemini_tmp_root(), "pi": pi_sessions_root(), "omo": omo_sessions_root(),
+    }.get(provider)
+
+
+def archive_path_for(key, provider):
+    path = Path(key)
+    root = _provider_root(provider)
+    try:
+        rel = path.relative_to(root) if root else Path(path.name)
+    except ValueError:
+        rel = Path(path.name)
+    return archive_root() / provider / (str(rel) + ".gz")
+
+
+def _ensure_private_dir(path):
+    """mkdir -p, and make every directory from the archive root down owner-only."""
+    root = archive_root()
+    path.mkdir(parents=True, exist_ok=True)
+    dirs = [path] + [p for p in path.parents if p == root or root in p.parents]
+    if root == Path.home() / ".navcom" / "archive":
+        dirs.append(root.parent)
+    for d in dirs:
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+
+
+def _ensure_archive_table(conn):
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS archive_state (file TEXT PRIMARY KEY, provider TEXT, bytes INTEGER,"
+        " head TEXT, mtime REAL, path TEXT)"
+    )
+
+
+def archive_log(conn, log, state=None):
+    """Bring one transcript's archive copy up to date. Returns bytes compressed."""
+    import gzip
+    import hashlib
+    key, mtime, size, provider = log
+    if "#" in key or not Path(key).is_file():
+        return 0
+    if state and state[0] == size:
+        return 0
+    with open(key, "rb") as handle:
+        # fingerprint only bytes already archived, so a pure append keeps the same fingerprint
+        prefix = min(4096, state[0]) if state else min(4096, size)
+        head = hashlib.sha256(handle.read(prefix)).hexdigest()
+        target = archive_path_for(key, provider)
+        _ensure_private_dir(target.parent)
+        appending = bool(state and size > state[0] and state[1] == head and target.exists())
+        if not appending:
+            handle.seek(0)
+            head = hashlib.sha256(handle.read(min(4096, size))).hexdigest()
+        if appending:
+            handle.seek(state[0])
+            chunk = handle.read(size - state[0])
+            with open(target, "ab") as out:
+                out.write(gzip.compress(chunk, 6))
+            written = len(chunk)
+        else:
+            handle.seek(0)
+            tmp = target.with_name(target.name + f".tmp-{os.getpid()}")
+            with gzip.open(tmp, "wb", compresslevel=6) as out:
+                shutil.copyfileobj(handle, out, 1 << 20)
+            os.replace(tmp, target)
+            written = size
+    if appending and state[0] < 4096:
+        with open(key, "rb") as handle:
+            head = hashlib.sha256(handle.read(min(4096, size))).hexdigest()
+    os.chmod(target, 0o600)
+    conn.execute(
+        "INSERT OR REPLACE INTO archive_state (file, provider, bytes, head, mtime, path) VALUES (?, ?, ?, ?, ?, ?)",
+        (key, provider, size, head, mtime, str(target)),
+    )
+    return written
+
+
+def archive_logs(conn, logs, budget=ARCHIVE_BUDGET_SECONDS):
+    """Archive new/grown transcripts — oldest first (closest to a harness's deletion sweep)."""
+    import time
+    wanted = set(archive_providers())
+    if not wanted or INDEX_READ_ONLY:
+        return 0, 0
+    _ensure_archive_table(conn)
+    states = {row[0]: (row[1], row[2]) for row in conn.execute("SELECT file, bytes, head FROM archive_state")}
+    deadline = None if budget is None else time.monotonic() + budget
+    files = total = 0
+    for log in sorted((l for l in logs if l[3] in wanted and "#" not in l[0]), key=lambda l: l[1]):
+        state = states.get(log[0])
+        if state and state[0] == log[2]:
+            continue
+        if deadline is not None and time.monotonic() > deadline:
+            break
+        try:
+            written = archive_log(conn, log, state)
+        except OSError as exc:
+            sys.stderr.write(f"[navcom] archive skipped {log[0]}: {exc}\n")
+            continue
+        if written:
+            files += 1
+            total += written
+            conn.commit()
+    return files, total
+
+
+def _gunzip_to(src, dest):
+    import gzip
+    tmp = dest.with_name(dest.name + f".navcom-restore-{os.getpid()}")
+    with gzip.open(src, "rb") as inp, open(tmp, "wb") as out:
+        shutil.copyfileobj(inp, out, 1 << 20)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, dest)
+
+
+def cmd_restore(conn, ref, providers):
+    """Put archived transcripts back where their harness looks, so they can be resumed."""
+    _ensure_archive_table(conn)
+    if ref.strip().lower() in ("all", "missing"):
+        rows = conn.execute("SELECT file, provider, bytes, mtime, path FROM archive_state").fetchall()
+        rows = [r for r in rows if not Path(r[0]).exists()]
+        if not rows:
+            safe_print("navcom: every archived transcript is still on disk — nothing to restore.")
+            return 0
+    else:
+        key, _ = resolve_ref(conn, ref, providers)
+        row = conn.execute("SELECT file, provider, bytes, mtime, path FROM archive_state WHERE file=?",
+                           (key,)).fetchone() if key else None
+        if not row:  # archived but never indexed: match the ref against the archive itself
+            want = ref.strip()
+            for cand in conn.execute("SELECT file, provider, bytes, mtime, path FROM archive_state ORDER BY mtime DESC"):
+                sref = session_ref(cand[0])
+                if sref.startswith(want) or sref.endswith(want) or Path(cand[0]).name == want:
+                    row = cand
+                    break
+        if not row:
+            safe_print(f"navcom: {ref!r} is not in the raw archive (it only covers sessions navcom saw after "
+                       f"archiving started). Its text may still be readable: navcom --open {ref}")
+            return 1
+        rows = [row]
+    restored = 0
+    for file, provider, size, mtime, src in rows:
+        dest = Path(file)
+        if dest.exists() and dest.stat().st_size >= size:
+            safe_print(f"still on disk  {dest}")
+            continue
+        if not Path(src).exists():
+            safe_print(f"archive copy missing  {src}")
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _gunzip_to(Path(src), dest)
+        if mtime:
+            os.utime(dest, (mtime, mtime))
+        restored += 1
+        hint = ""
+        if provider == "claude":
+            project = _project_from_key(file, "claude")
+            cwd = decode_encoded_dir(project) if project.startswith("-") else project
+            hint = f"   →  cd {cwd or '<project dir>'} && claude --resume {session_ref(file)}"
+        safe_print(f"restored  {dest}{hint}")
+    days, _ = claude_retention_status()
+    if restored and days is not None and days < 3650:
+        safe_print(STYLE.warn(f"note: Claude Code deletes transcripts after {days} days here — "
+                              "restored ones may be swept again. Remove that setting or raise it."))
+    return 0
+
+
+def archive_summary(conn):
+    try:
+        _ensure_archive_table(conn)
+        rows = conn.execute("SELECT count(*), coalesce(sum(bytes), 0) FROM archive_state").fetchone()
+    except sqlite3.Error:
+        return ""
+    gone = sum(1 for (f,) in conn.execute("SELECT file FROM archive_state") if not Path(f).exists())
+    size = 0
+    root = archive_root()
+    if root.exists():
+        size = sum(p.stat().st_size for p in root.rglob("*.gz"))
+    which = ",".join(archive_providers()) or "off"
+    return (f"{rows[0]} transcripts ({rows[1] / 1e6:.0f} MB raw → {size / 1e6:.0f} MB gz; {gone} restorable "
+            f"after deletion) [{which}]  {root}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Daily maintenance job — so nothing depends on someone remembering to run navcom
+# ─────────────────────────────────────────────────────────────────────────────
+
+DAILY_LABEL = "io.navcom.maintain"
+
+
+def _navcom_executable():
+    exe = shutil.which("navcom")
+    return str(Path(exe).resolve()) if exe else None
+
+
+def _daily_paths():
+    home = Path.home()
+    return {
+        "darwin": home / "Library" / "LaunchAgents" / f"{DAILY_LABEL}.plist",
+        "service": (_env_path("XDG_CONFIG_HOME") or home / ".config") / "systemd" / "user" / "navcom-maintain.service",
+        "timer": (_env_path("XDG_CONFIG_HOME") or home / ".config") / "systemd" / "user" / "navcom-maintain.timer",
+        "log": home / ".navcom" / "maintain.log",
+        "off": home / ".navcom" / "daily-off",
+    }
+
+
+def _daily_env():
+    keep = ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "NAVCOM_INDEX", "NAVCOM_ARCHIVE", "NAVCOM_ARCHIVE_DIR",
+            "XDG_DATA_HOME", "PI_CODING_AGENT_DIR", "OMO_CODING_AGENT_DIR", "GOOSE_PATH_ROOT")
+    env = {k: os.environ[k] for k in keep if os.environ.get(k)}
+    env["PATH"] = os.pathsep.join(dict.fromkeys(
+        [str(Path(_navcom_executable() or sys.executable).parent), "/opt/homebrew/bin", "/usr/local/bin",
+         "/usr/bin", "/bin"]))
+    return env
+
+
+def _launchd_plist(exe, log):
+    import plistlib
+    return plistlib.dumps({
+        "Label": DAILY_LABEL,
+        "ProgramArguments": [exe, "--maintain"],
+        "StartCalendarInterval": {"Hour": 12, "Minute": 17},  # missed runs fire on wake
+        "StandardOutPath": str(log), "StandardErrorPath": str(log),
+        "EnvironmentVariables": _daily_env(),
+        "LowPriorityIO": True, "Nice": 10, "ProcessType": "Background",
+    })
+
+
+def _run_quiet(cmd):
+    if os.environ.get("NAVCOM_DRY_SCHEDULER"):
+        return 0
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=20).returncode
+    except Exception:
+        return 1
+
+
+def install_daily_job(force=False):
+    """Install (or refresh) the daily `navcom --maintain` job. Returns a status string."""
+    exe = _navcom_executable()
+    if not exe:
+        return "navcom isn't on PATH (pipx install navcom) — no daily job"
+    paths = _daily_paths()
+    if force and paths["off"].exists():
+        paths["off"].unlink()
+    paths["log"].parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(paths["log"].parent, 0o700)
+    if sys.platform == "darwin":
+        content = _launchd_plist(exe, paths["log"])
+        plist = paths["darwin"]
+        if plist.exists() and plist.read_bytes() == content and not force:
+            return f"daily job installed  {plist}"
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        plist.write_bytes(content)
+        domain = f"gui/{os.getuid()}"
+        _run_quiet(["launchctl", "bootout", f"{domain}/{DAILY_LABEL}"])
+        _run_quiet(["launchctl", "bootstrap", domain, str(plist)])
+        return f"daily job installed  {plist}"
+    if sys.platform.startswith("linux") and (shutil.which("systemctl") or os.environ.get("NAVCOM_DRY_SCHEDULER")):
+        service = (f"[Unit]\nDescription=navcom daily maintenance\n\n[Service]\nType=oneshot\n"
+                   f"ExecStart={exe} --maintain\nNice=10\n"
+                   + "".join(f'Environment="{k}={v}"\n' for k, v in _daily_env().items()))
+        timer = ("[Unit]\nDescription=navcom daily maintenance\n\n[Timer]\nOnCalendar=daily\n"
+                 "Persistent=true\nRandomizedDelaySec=900\n\n[Install]\nWantedBy=timers.target\n")
+        unchanged = (paths["service"].exists() and paths["service"].read_text() == service
+                     and paths["timer"].exists() and paths["timer"].read_text() == timer)
+        if unchanged and not force:
+            return f"daily job installed  {paths['timer']}"
+        paths["service"].parent.mkdir(parents=True, exist_ok=True)
+        paths["service"].write_text(service)
+        paths["timer"].write_text(timer)
+        _run_quiet(["systemctl", "--user", "daemon-reload"])
+        _run_quiet(["systemctl", "--user", "enable", "--now", "navcom-maintain.timer"])
+        return f"daily job installed  {paths['timer']}"
+    return f"no daily job on {sys.platform} (run `navcom --maintain` from your scheduler)"
+
+
+def remove_daily_job():
+    paths = _daily_paths()
+    removed = []
+    paths["off"].parent.mkdir(parents=True, exist_ok=True)
+    paths["off"].write_text("navcom --daily off; `navcom --daily on` re-enables\n")
+    if paths["darwin"].exists():
+        _run_quiet(["launchctl", "bootout", f"gui/{os.getuid()}/{DAILY_LABEL}"])
+        paths["darwin"].unlink()
+        removed.append(str(paths["darwin"]))
+    for k in ("timer", "service"):
+        if paths[k].exists():
+            if k == "timer":
+                _run_quiet(["systemctl", "--user", "disable", "--now", "navcom-maintain.timer"])
+            paths[k].unlink()
+            removed.append(str(paths[k]))
+    return removed
+
+
+def daily_job_status():
+    paths = _daily_paths()
+    for k in ("darwin", "timer"):
+        if paths[k].exists():
+            log = paths["log"]
+            last = (datetime.fromtimestamp(log.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                    if log.exists() else "not yet")
+            return f"daily `navcom --maintain` scheduled ({paths[k]}); last run: {last}"
+    return "no daily job (navcom --daily on)"
+
+
+def auto_install_daily_job():
+    if os.environ.get("NAVCOM_NO_DAILY") or _daily_paths()["off"].exists():
+        return
+    try:
+        install_daily_job()
+    except Exception:
+        pass
+
+
+def cmd_maintain(conn, force=False):
+    """Everything, with no time budgets: the daily job's entry point."""
+    import time
+    start = time.monotonic()
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    logs = list_logs(ALL_PROVIDERS)
+    changed = _index_logs(conn, logs, force=force, progress=force, upgrade=False)
+    upgraded = upgrade_stale_parses(conn, logs, budget=None)
+    files, raw = archive_logs(conn, logs, budget=None)
+    safe_print(f"{stamp} navcom {NAVCOM_VERSION} maintain: {len(logs)} sessions seen, {changed} indexed, "
+               f"{upgraded} re-parsed, {files} archived ({raw / 1e6:.1f} MB) in {time.monotonic() - start:.0f}s")
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2305,6 +2917,9 @@ NARROW / WIDEN
   navcom deploy --days 7            active in the last 7 days (--since 2026-09-01, --since 12h, --until …)
   navcom deploy --user              only what the user typed  (--cmd: shell commands the agent ran;
                                     --role assistant: replies)
+  navcom "TypeError: cannot read" --tool    search TOOL OUTPUTS: what commands printed, files read,
+                                    errors, test results (left out of normal searches)
+  navcom cognito --everything       conversation turns and tool outputs together
   navcom deploy --latest            only the newest session (--recent 3: newest 3 per harness;
                                     --file <ref|uuid|path>: one session)
   navcom goal --this-session        only the conversation you are in (recall after context compaction)
@@ -2317,6 +2932,8 @@ READ
   navcom --open 7ec78a59 --user     just the user's turns
   navcom deploy --context           expand every hit in place with its neighbouring turns
   navcom                            no query: the 20 most recent sessions, with titles
+  navcom --restore 7ec78a59         put a deleted transcript back from navcom's archive, so
+                                    `claude --resume` works again   (--restore all: every one)
 
 OUTPUT
   default    plain text grouped by session, matches marked «like this»; colour only on a terminal
@@ -2329,9 +2946,17 @@ SUMMARIES (slow: they call another LLM CLI — usually better to read the hits y
   navcom deploy --solo              one summary of all hits  (--summary: one per session)
   --llmgemini / --ollama pick the engine; hard limit 150s (NAVCOM_SUMMARY_TIMEOUT)
 
+YOUR HISTORY STAYS YOURS (all automatic, silent)
+  • Claude Code deletes transcripts after 30 days by default; navcom sets cleanupPeriodDays=36500
+    when unset (an explicit value is respected).
+  • Every Claude transcript is also kept whole, compressed, in ~/.navcom/archive (NAVCOM_ARCHIVE=all
+    for every harness, =off to stop).  navcom --restore <ref> brings one back.
+  • A daily `navcom --maintain` job keeps index + archive current even when nobody runs navcom
+    (navcom --daily status | off | on).
+  • The index keeps sessions (and tool outputs) even after a harness deletes them.
+
 GOOD TO KNOW
   • The session you run navcom from is skipped (it would match itself); --include-self keeps it.
-  • Sessions stay searchable after a harness deletes them — the index is the archive.
   • Parallel runs are fine; read-only sandboxes work (they search without refreshing the index).
   • Index: $NAVCOM_INDEX or $CODEX_HOME/navcom-index.sqlite. navcom --where shows what's found.
   • Exit codes: 0 ok (including "No hits."), 1 session/ref/file not found, 2 bad flag or value.
@@ -2398,7 +3023,12 @@ def build_parser():
     s.add_argument("--days", "--last-days", type=float, metavar="N", help="Only sessions active in the last N days.  --days 7")
     s.add_argument("--since", "--after", metavar="WHEN", help="Active since WHEN: 2026-09-01, 12h, 3d, 2w, today, yesterday.")
     s.add_argument("--until", "--before", metavar="WHEN", help="Last active before WHEN (same formats as --since).")
-    s.add_argument("--role", choices=["user", "assistant", "cmd"], help="Only this kind of turn.")
+    s.add_argument("--role", choices=["user", "assistant", "cmd", "tool"], help="Only this kind of turn.")
+    s.add_argument("--tool", "--tools", "--outputs", "--output", dest="role", action="store_const", const="tool",
+                   help="Search only tool outputs: what commands printed, files read, errors, test results.\n"
+                        'navcom "TypeError: cannot read" --tool')
+    s.add_argument("--everything", "--all-turns", action="store_true",
+                   help="Search conversation turns AND tool outputs together.")
     s.add_argument("--user", dest="role", action="store_const", const="user", help="Only what the user typed (= --role user).")
     s.add_argument("--cmd", "--cmds", "--commands", dest="role", action="store_const", const="cmd",
                    help="Only shell commands the agent ran (= --role cmd).")
@@ -2464,6 +3094,14 @@ def build_parser():
                         "navcom --skill install   (re)install it for every harness here, and show where\n"
                         "navcom --skill list | export   Skillflag-compatible listing / tar export")
     x.add_argument("--install-skills", action="store_true", help=argparse.SUPPRESS)
+    x.add_argument("--restore", metavar="REF",
+                   help="Put an archived transcript back on disk so its harness can resume it (or 'all' = every\n"
+                        "archived transcript that was deleted).  navcom --restore 7ec78a59")
+    x.add_argument("--maintain", action="store_true",
+                   help="Full catch-up with no time limits: index everything, re-parse old rows, archive.\n"
+                        "The daily background job runs this.")
+    x.add_argument("--daily", choices=["on", "off", "status"],
+                   help="The daily `navcom --maintain` job (installed automatically; off removes it).")
     x.add_argument("-V", "-v", "--version", action="version", version=f"navcom {NAVCOM_VERSION}")
     return parser
 
@@ -2844,6 +3482,10 @@ def cmd_where(conn, providers):
     archived = sum(1 for (f,) in conn.execute("SELECT file FROM file_state") if f not in on_disk)
     safe_print(f"  index    {stats} sessions, {turns} turns ({archived} no longer on disk but still searchable)")
     safe_print(f"           {default_index_path()}")
+    summary = archive_summary(conn)
+    if summary:
+        safe_print(f"  archive  {summary}")
+    safe_print(f"  daily    {daily_job_status()}")
     days, how = claude_retention_status()
     if days is not None:
         verdict = "keeps history ~forever" if days >= 3650 else f"DELETES transcripts after {days} days"
@@ -2888,6 +3530,21 @@ def run(argv=None):
         ensure_claude_retention()
     except Exception:
         pass
+    if args.daily == "off":
+        removed = remove_daily_job()
+        safe_print("removed  " + ", ".join(removed) if removed else "no daily job was installed")
+        safe_print("daily job stays off until `navcom --daily on`")
+        return 0
+    auto_install_daily_job()
+    if args.daily:
+        if args.daily == "on":
+            safe_print(install_daily_job(force=True))
+        safe_print(daily_job_status())
+        return 0
+    if args.maintain:
+        return cmd_maintain(conn, force=args.reindex)
+    if args.restore:
+        return cmd_restore(conn, args.restore, providers)
 
     if args.where:
         return cmd_where(conn, providers)
@@ -2976,8 +3633,11 @@ def run(argv=None):
         safe_print("No logs found.")
         return 1
 
-    changed = index_logs(conn, targets, force=args.reindex)
-    del changed
+    index_logs(conn, targets, force=args.reindex)
+    try:
+        archive_logs(conn, logs if explicit_scope else targets)
+    except Exception as exc:
+        sys.stderr.write(f"[navcom] archive step skipped: {exc}\n")
 
     prompt_template = None
     if args.prompt:
@@ -3013,7 +3673,7 @@ def run(argv=None):
         conn, query, providers=providers, keys=keys,
         limit=limit or 100000, snippet_tokens=args.snippet_tokens,
         no_prefix=args.no_prefix, role=args.role, any_terms=args.any,
-        include_self=args.include_self, exclude_keys=exclude,
+        include_self=args.include_self, exclude_keys=exclude, include_tools=args.everything,
     )
     if not hits:
         scope = ", ".join(providers) if set(providers) != set(ALL_PROVIDERS) else "all harnesses"

@@ -41,6 +41,7 @@ navcom deploy --here             # sessions started in this directory (or below)
 navcom deploy --project syra     # working dir contains "syra"
 navcom deploy --days 7           # or --since 2026-09-01 / --since 12h / --until …
 navcom deploy --user             # only what the user typed;  --cmd = shell commands that were run
+navcom "TypeError: x" --tool     # search TOOL OUTPUTS (command output, files read, errors, tests)
 navcom deploy --newest           # newest sessions first
 navcom goal --this-session       # only THIS conversation (recall after compaction)
 navcom                           # no query: the 20 most recent sessions, with titles
@@ -57,6 +58,7 @@ navcom --open 7ec78a59:520-560   # a range of turns
 navcom --open 7ec78a59 --user    # every user turn in that session
 navcom deploy --context          # expand every hit in place
 navcom deploy --json             # structured: sessions[] with ref, date, project, hits[]
+navcom --restore 7ec78a59        # transcript deleted by its harness? put it back, then resume it
 ```
 
 ## Good to know
