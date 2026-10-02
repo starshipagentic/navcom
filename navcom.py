@@ -14,6 +14,7 @@ This file embeds full copies of log_clean_quick + log_search_fts5 for function r
 # Repo lives under github.com/starshipagentic/navcom.
 
 import argparse
+import collections
 import io
 import json
 import shutil
@@ -739,7 +740,10 @@ TOOL_HEAD_CHARS = 3000
 TOOL_TAIL_CHARS = 1000
 _DATA_URI_RE = re.compile(r"data:[\w/+.-]+;base64,[A-Za-z0-9+/=\s]{200,}")
 _BLOB_RE = re.compile(r"[A-Za-z0-9+/=]{600,}")
-_NAVCOM_OUTPUT_MARKERS = ("→ read around a hit: navcom --open", "navcom: no session matches", "No hits. (query:")
+_NAVCOM_OUTPUT_MARKERS = ("→ read around a hit: navcom --open", "navcom: no session matches", "No hits. (query:",
+                          "usage: navcom [words")
+# a command that IS a navcom call (optionally after cd/env), not one that merely mentions navcom
+_NAVCOM_LEADING_RE = re.compile(r"^\s*(?:cd\s+\S+\s*(?:&&|;)\s*)?(?:\w+=\S+\s+)*(?:\S*/)?navcom(?:\.py)?(?:\s|$)")
 
 
 def cap_tool_output(text):
@@ -751,7 +755,8 @@ def cap_tool_output(text):
 
 
 def _is_navcom_output(label, text):
-    if label and _NAVCOM_CMD_RE.search(label):
+    command = label.split(": ", 1)[1] if label and ": " in label else ""
+    if command and _NAVCOM_LEADING_RE.match(command):
         return True
     head = (text or "")[:400]
     return head.startswith("navcom: ") or any(m in (text or "") for m in _NAVCOM_OUTPUT_MARKERS)
@@ -1422,6 +1427,20 @@ def _native_title(key, provider):
     """Titles some harnesses store themselves (opencode, goose)."""
     if provider == "opencode" and "#" not in key:
         return (_opencode_legacy_info(key).get("title") or "").strip()[:160]
+    if provider in ("pi", "omo") and "#" not in key:
+        # pi/omo record a session name (/name, auto-title) as {"type":"session_info","name":…}
+        name = ""
+        try:
+            with open(key, "r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    if '"session_info"' in line:
+                        try:
+                            name = json.loads(line).get("name") or name
+                        except Exception:
+                            pass
+        except OSError:
+            return ""
+        return name.strip()[:160]
     if "#" not in key or provider not in ("opencode", "goose"):
         return ""
     db, sid = key.split("#", 1)
@@ -3324,7 +3343,7 @@ def _session_header(conn, i, g):
     count = len(g["hits"])
     proj = pretty_project(project) or "-"
     hits_label = f"{count} hit" + ("s" if count != 1 else "")
-    return f"[{i}] {date}  {STYLE.provider(prov, f'{prov:8s}')} {proj}  ref {short_ref(g['key'])}  ({hits_label})"
+    return f"[{i}] {date}  {STYLE.provider(prov, f'{prov:8s}')} {proj}  ref {display_ref(conn, g['key'], prov)}  ({hits_label})"
 
 
 def print_compact(conn, groups, max_chars, total_hits, cooked, note):
@@ -3341,7 +3360,7 @@ def print_compact(conn, groups, max_chars, total_hits, cooked, note):
     if groups:
         first = groups[0]
         safe_print(STYLE.dim(
-            f"→ read around a hit: navcom --open {short_ref(first['key'])}:{first['hits'][0].msg_index}"
+            f"→ read around a hit: navcom --open {display_ref(conn, first['key'], first['provider'])}:{first['hits'][0].msg_index}"
             "   · expand all: add --context"
         ))
 
@@ -3351,7 +3370,7 @@ def print_json(conn, groups, cooked, note):
     for g in groups:
         project, title = session_meta(conn, g["key"], g["provider"])
         out["sessions"].append({
-            "ref": short_ref(g["key"]),
+            "ref": display_ref(conn, g["key"], g["provider"]),
             "key": g["key"],
             "provider": g["provider"],
             "date": session_date(conn, g["key"]),
@@ -3380,9 +3399,31 @@ def print_context(conn, groups, window, max_chars):
         safe_print("")
 
 
+_REF_CACHE = {}
+
+
+def display_ref(conn, key, provider=None):
+    """The ref to print for a session: its short ref, prefixed with the harness when that
+    short ref also names another indexed session (omo imports pi sessions under the same id)."""
+    ref = short_ref(key)
+    if ref not in _REF_CACHE:
+        like = "%" + ref.replace("%", "").replace("_", "\\_") + "%"
+        others = {f for (f,) in conn.execute("SELECT file FROM file_state WHERE file LIKE ? ESCAPE '\\'", (like,))
+                  if short_ref(f) == ref}
+        _REF_CACHE[ref] = len(others | {key}) > 1
+    if _REF_CACHE[ref]:
+        return f"{provider or detect_provider_from_path(key)}:{ref}"
+    return ref
+
+
 def resolve_ref(conn, ref, providers=None):
-    """REF → index key. Accepts a full key/path, a file stem, a uuid prefix or an opencode/goose id."""
+    """REF → index key. Accepts a full key/path, a file stem, a uuid prefix, an opencode/goose id,
+    or HARNESS:REF to pick one of several sessions sharing an id."""
     ref = ref.strip()
+    strict = False
+    prefix, _, rest = ref.partition(":")
+    if rest and prefix.lower() in ALL_PROVIDERS:
+        providers, ref, strict = [prefix.lower()], rest, True
     if conn.execute("SELECT 1 FROM file_state WHERE file=?", (ref,)).fetchone():
         return ref, []
     like = "%" + ref.replace("%", "").replace("_", "\\_") + "%"
@@ -3398,7 +3439,7 @@ def resolve_ref(conn, ref, providers=None):
         matches = rows
     if providers:
         scoped = [r for r in matches if _key_provider(conn, r[0]) in providers]
-        matches = scoped or matches
+        matches = scoped if (scoped or strict) else matches
     if not matches:
         return None, []
     return matches[0][0], [m[0] for m in matches[1:]]
@@ -3429,7 +3470,7 @@ def cmd_open(conn, args, providers):
         default_chars = 3000
     max_chars = args.max_chars if args.max_chars is not None else default_chars
     project, title = session_meta(conn, key, prov)
-    safe_print(f"{session_date(conn, key)}  {STYLE.provider(prov)}  {pretty_project(project) or '-'}  ref {short_ref(key)}  turns {span[0]}-{min(span[1], last)} of {last}")
+    safe_print(f"{session_date(conn, key)}  {STYLE.provider(prov)}  {pretty_project(project) or '-'}  ref {display_ref(conn, key, prov)}  turns {span[0]}-{min(span[1], last)} of {last}")
     safe_print(STYLE.dim(key))
     if others:
         safe_print(STYLE.warn(f"note: {len(others)} other session(s) also match {ref!r}; showing the most recent"))
@@ -3443,7 +3484,7 @@ def cmd_open(conn, args, providers):
         marker = "▶ " if lo is not None and hi is None and msg_index == lo else ""
         safe_print(marker + format_turn(role, text, prov, msg_index))
     if lo is not None and hi is None and span[1] < last:
-        safe_print(STYLE.dim(f"→ more: navcom --open {short_ref(key)}:{span[1] + 1}-{min(last, span[1] + 10)}"))
+        safe_print(STYLE.dim(f"→ more: navcom --open {display_ref(conn, key, prov)}:{span[1] + 1}-{min(last, span[1] + 10)}"))
     return 0
 
 
@@ -3460,7 +3501,7 @@ def cmd_recent_sessions(conn, logs, limit, keys=None):
         project, title = session_meta(conn, key, prov)
         stamp = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M") if mtime else "????-??-?? ??:??"
         title = (title[:90] + "…") if len(title) > 90 else title
-        safe_print(f"{stamp}  {STYLE.provider(prov, f'{prov:8s}')} {pretty_project(project) or '-':28s} {short_ref(key):10s} {title}")
+        safe_print(f"{stamp}  {STYLE.provider(prov, f'{prov:8s}')} {pretty_project(project) or '-':28s} {display_ref(conn, key, prov):10s} {title}")
     conn.commit()
     return 0
 
@@ -3808,7 +3849,7 @@ def dump_transcripts(conn, args, targets, providers, prompt_template):
             rows = [r for r in rows if r[1] == args.role]
         if not args.summary:
             project, _ = session_meta(conn, key, provider)
-            safe_print(f"=== {session_date(conn, key)}  {provider}  {pretty_project(project) or '-'}  ref {short_ref(key)}")
+            safe_print(f"=== {session_date(conn, key)}  {provider}  {pretty_project(project) or '-'}  ref {display_ref(conn, key, provider)}")
             safe_print(STYLE.dim(key))
             for msg_index, role, text in rows:
                 if max_chars and len(text) > max_chars:

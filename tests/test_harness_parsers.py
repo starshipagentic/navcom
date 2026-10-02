@@ -151,3 +151,17 @@ def test_archive_is_incremental_and_restorable(navcom, home, tmp_path):
 def test_codex_json_envelope_unwrapped(navcom):
     role, text = navcom.tool_turn("exec_command: make", '{"exit_code": 2, "wall_time_seconds": 0.9, "output": "make: *** [all] Error 2"}')
     assert text == "[exec_command: make]\nexit 2\nmake: *** [all] Error 2"
+
+
+def test_navcom_output_rule_is_narrow(navcom):
+    assert navcom._is_navcom_output("Bash: navcom drizzle -n 3", "anything")
+    assert navcom._is_navcom_output("Bash: cd ~/x && navcom --open ab:3", "anything")
+    assert not navcom._is_navcom_output("Bash: command -v navcom; ls ~/dev", "/Users/t/.local/bin/navcom\nproj-a")
+    assert navcom._is_navcom_output("Bash: command -v navcom; navcom x | head", "navcom: 3 hits in 2 sessions")
+
+
+def test_pi_session_name_is_the_title(navcom, home, tmp_path):
+    path = home["pi"]
+    with open(path, "a") as fh:
+        fh.write('{"type":"session_info","id":"x","name":"Studio box qwen setup"}\n')
+    assert navcom._native_title(str(path), "pi") == "Studio box qwen setup"

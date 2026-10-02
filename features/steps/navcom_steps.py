@@ -312,3 +312,22 @@ def step_daily(context):
 @then("no daily job is scheduled")
 def step_no_daily(context):
     assert not any(p.exists() for p in _job_files(context))
+
+
+@given("the pi session was imported into omo under the same id with different content")
+def step_imported(context):
+    import json
+    src = context.sessions["pi"]
+    dest = context.home / ".omo" / "agent" / "sessions" / src.parent.name / src.name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    lines = src.read_text().splitlines()
+    lines.append(json.dumps({"type": "message", "id": "9", "message": {"role": "user",
+                 "content": [{"type": "text", "text": "only in the omo copy zebracornimported"}]}}))
+    dest.write_text("\n".join(lines) + "\n")
+
+
+@when("I open the printed ref")
+def step_open_printed(context):
+    m = re.search(r"navcom --open (\S+)", context.out)
+    assert m, context.out
+    _run(context, ["--open", m.group(1)])

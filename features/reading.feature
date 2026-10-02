@@ -123,3 +123,13 @@ Feature: Reading and narrowing sessions
     When I run: navcom zebracorn --frobnicate
     Then it fails with exit code 2
     And the output contains "unrecognized arguments: --frobnicate"
+
+  Scenario: The same session id in two harnesses opens the right copy
+    Given the pi session was imported into omo under the same id with different content
+    When I run: navcom zebracorn
+    And I run: navcom zebracornimported --omo
+    Then it succeeds
+    And the output contains "ref omo:123456789abc"
+    And the output contains "navcom --open omo:123456789abc:"
+    When I open the printed ref
+    Then the output contains "zebracornimported"
