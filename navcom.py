@@ -56,11 +56,11 @@ def load_module(code, name):
 clean_mod = load_module(LOG_CLEAN_QUICK_CODE, "log_clean_quick")
 fts_mod = load_module(LOG_SEARCH_FTS5_CODE, "log_search_fts5")
 
-NAVCOM_VERSION = "0.3.0"
+NAVCOM_VERSION = "0.4.0"
 DEFAULT_LIMIT = 20  # hits per harness (and sessions listed by a bare `navcom`)
 
 # Every harness navcom knows how to read. Order = display order in help/listings.
-ALL_PROVIDERS = ["claude", "codex", "gemini", "pi", "omo", "opencode", "goose"]
+ALL_PROVIDERS = ["claude", "codex", "gemini", "pi", "omo", "opencode", "goose", "dsh", "grok", "kilo"]
 PROVIDER_ALIASES = {
     "claude-code": "claude", "cc": "claude",
     "openai": "codex",
@@ -69,6 +69,9 @@ PROVIDER_ALIASES = {
     "omo-ai": "omo", "oh-my-openagent": "omo",
     "open-code": "opencode", "oc": "opencode",
     "block-goose": "goose",
+    "deepseek": "dsh", "deepseek-harness": "dsh", "ds": "dsh",
+    "grok-build": "grok", "xai": "grok", "grokbuild": "grok",
+    "kilocode": "kilo", "kilo-code": "kilo",
 }
 
 
@@ -116,7 +119,7 @@ VERBOSITY_WINDOW = {
 class _Style:
     PROVIDER_CODES = {
         "claude": "95", "gemini": "94", "codex": "93", "pi": "92",
-        "omo": "96", "opencode": "36", "goose": "33",
+        "omo": "96", "opencode": "36", "goose": "33", "dsh": "34", "grok": "37", "kilo": "35",
     }
 
     def __init__(self):
@@ -228,11 +231,14 @@ def provider_roots():
     return {
         "claude": [fts_mod.claude_projects_root()],
         "codex": [fts_mod.codex_sessions_root()],
-        "gemini": [fts_mod.gemini_tmp_root()],
+        "gemini": gemini_tmp_roots(),
         "pi": [pi_sessions_root()],
         "omo": [omo_sessions_root()],
         "opencode": [opencode_data_root() / "opencode.db", opencode_data_root() / "storage" / "message"],
         "goose": [r / "sessions.db" for r in goose_session_roots()] + goose_session_roots(),
+        "dsh": [dsh_sessions_root()],
+        "grok": [grok_sessions_root()],
+        "kilo": [kilo_db_path()],
     }
 
 
@@ -255,6 +261,12 @@ def detect_provider_from_path(path):
         return _PROVIDER_BY_KEY[path_str]
     if "opencode" in path_str:
         return "opencode"
+    if "/.dsh/" in path_str:
+        return "dsh"
+    if "/.grok/" in path_str:
+        return "grok"
+    if "kilo" in path_str and "#" in path_str:
+        return "kilo"
     if "goose" in path_str:
         return "goose"
     if "/.claude/" in path_str:
@@ -307,10 +319,11 @@ def _epoch_seconds(value):
     return parsed.timestamp()
 
 
-def list_opencode_logs():
+def list_opencode_logs(db=None, provider="opencode"):
+    """opencode's SQLite store (and Kilo's — same schema), plus opencode's legacy JSON storage."""
     logs = []
     base = opencode_data_root()
-    db = base / "opencode.db"
+    db = db or base / "opencode.db"
     if db.exists():
         try:
             con = _ro_connect(db)
@@ -325,9 +338,11 @@ def list_opencode_logs():
                 if not parts:
                     continue
                 mtime = max(_epoch_seconds(updated), _epoch_seconds(part_updated))
-                logs.append((f"{db}#{sid}", mtime, int(parts), "opencode"))
+                logs.append((f"{db}#{sid}", mtime, int(parts), provider))
         except sqlite3.Error:
             pass
+    if provider != "opencode":
+        return logs
     # Pre-SQLite opencode kept one JSON file per message under storage/message/<session>/.
     legacy = base / "storage" / "message"
     if legacy.is_dir():
@@ -377,11 +392,12 @@ def list_logs(providers):
     if "claude" in providers:
         logs.extend(_file_logs(_rglob(fts_mod.claude_projects_root(), "*.jsonl"), "claude"))
     if "gemini" in providers:
-        root = fts_mod.gemini_tmp_root()
-        paths = _rglob(root, "chats/*.json")
-        if not paths and root.name == "chats":
-            paths = _rglob(root, "*.json")
-        logs.extend(_file_logs(paths, "gemini"))
+        for root in gemini_tmp_roots():
+            # ≤0.38: chats/session-*.json · ≥0.39: chats/session-*.jsonl (+ chats/<parent>/<sub>.jsonl)
+            paths = _rglob(root, "chats/*.json") + [p for p in _rglob(root, "*.jsonl") if "chats" in p.parts]
+            if not paths and root.name == "chats":
+                paths = _rglob(root, "*.json")
+            logs.extend(_file_logs(paths, "gemini"))
     if "pi" in providers:
         logs.extend(_file_logs(_rglob(pi_sessions_root(), "*.jsonl"), "pi"))
     if "omo" in providers:
@@ -390,6 +406,12 @@ def list_logs(providers):
         logs.extend(list_opencode_logs())
     if "goose" in providers:
         logs.extend(list_goose_logs())
+    if "dsh" in providers:
+        logs.extend(list_dsh_logs())
+    if "grok" in providers:
+        logs.extend(list_grok_logs())
+    if "kilo" in providers:
+        logs.extend(list_opencode_logs(kilo_db_path(), "kilo"))
     logs.sort(key=lambda x: x[1])
     for key, _, _, provider in logs:
         _PROVIDER_BY_KEY[key] = provider
@@ -685,7 +707,13 @@ def _rescue_slash_command(text):
 
 def _raw_turns(key, provider, text_chunk=None):
     if provider == "gemini":
-        return iter_gemini_file(key)
+        return iter_gemini_jsonl(key) if key.endswith(".jsonl") else iter_gemini_file(key)
+    if provider == "dsh":
+        return iter_dsh(key)
+    if provider == "grok":
+        return iter_grok_updates(key)
+    if provider == "kilo":
+        return iter_opencode_db(key)
     if provider == "opencode":
         return iter_opencode_db(key) if "#" in key else iter_opencode_legacy(key)
     if provider == "goose" and "#" in key:
@@ -958,6 +986,456 @@ def iter_gemini_file(path):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Gemini CLI ≥ 0.39 (.jsonl), DeepSeek Harness (dsh), Grok Build, Kilo Code
+# ─────────────────────────────────────────────────────────────────────────────
+
+def gemini_tmp_roots():
+    """Gemini keeps per-project chats under <home>/.gemini/tmp (GEMINI_CLI_HOME replaces <home>);
+    under the macOS seatbelt sandbox it uses ~/.cache/.gemini/tmp."""
+    roots = []
+    explicit = _env_path("GEMINI_CLI_HOME")
+    if explicit:
+        roots.append(explicit / ".gemini" / "tmp")
+    roots.append(fts_mod.gemini_tmp_root())
+    roots.append(Path.home() / ".cache" / ".gemini" / "tmp")
+    out, seen = [], set()
+    for root in roots:
+        if str(root) not in seen:
+            seen.add(str(root))
+            out.append(root)
+    return out
+
+
+def replay_gemini_jsonl(lines):
+    """Rebuild a Gemini ≥0.39 session from its append-only record log.
+
+    Records: metadata, message (a later line with the same id replaces it), {"$set": …}
+    (legacy full `messages` checkpoint), {"$patch": …} (edit/remove/reorder) and
+    {"$rewindTo": id} (drop that message and everything after it).
+    """
+    msgs, order, meta = {}, [], {}
+
+    def apply(update):
+        mid = update.get("id")
+        if mid in msgs:
+            target = msgs[mid]
+            for field in ("content", "displayContent", "thoughts"):
+                if field in update:
+                    target[field] = update[field]
+            for tc in update.get("toolCalls") or []:
+                for existing in target.setdefault("toolCalls", []):
+                    if existing.get("id") == tc.get("id"):
+                        existing.update(tc)
+                        break
+                else:
+                    target["toolCalls"].append(tc)
+
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if "$set" in obj and isinstance(obj["$set"], dict):
+            fields = dict(obj["$set"])
+            if isinstance(fields.get("messages"), list):
+                msgs = {m.get("id"): m for m in fields["messages"] if isinstance(m, dict)}
+                order = [m.get("id") for m in fields.pop("messages") if isinstance(m, dict)]
+            meta.update(fields)
+        elif "$patch" in obj and isinstance(obj["$patch"], dict):
+            patch = obj["$patch"]
+            if patch.get("id"):
+                apply(patch)
+            for update in patch.get("updates") or []:
+                if isinstance(update, dict):
+                    apply(update)
+            for rid in patch.get("removeIds") or []:
+                msgs.pop(rid, None)
+            if patch.get("orderIds"):
+                order = [i for i in patch["orderIds"] if i in msgs] + [i for i in order if i not in patch["orderIds"]]
+        elif "$rewindTo" in obj:
+            target = obj["$rewindTo"]
+            if target in order:
+                for dropped in order[order.index(target):]:
+                    msgs.pop(dropped, None)
+                order = order[:order.index(target)]
+        elif obj.get("id") and obj.get("type"):
+            if obj["id"] not in msgs:
+                order.append(obj["id"])
+            msgs[obj["id"]] = obj
+        elif obj.get("sessionId"):
+            meta.update(obj)
+    return [msgs[i] for i in order if i in msgs], meta
+
+
+def _gemini_messages_turns(messages):
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        mtype = msg.get("type")
+        role = "user" if mtype == "user" else "assistant" if mtype in ("gemini", "assistant", "model") else None
+        if role is None:
+            continue
+        content = msg.get("content")
+        text = content if isinstance(content, str) else _text_of(content if isinstance(content, list) else [content])
+        if text:
+            yield role, text
+        for call in msg.get("toolCalls") or []:
+            if not isinstance(call, dict):
+                continue
+            cmd = _shell_cmd(call.get("name"), call.get("args"))
+            if cmd:
+                yield "cmd", cmd
+            output = call.get("resultDisplay")
+            if not isinstance(output, str) or not output.strip():
+                output = "\n".join(fts_mod.extract_gemini_strings(call.get("result")))
+            turn = tool_turn(_call_label(call.get("name"), call.get("args")), output)
+            if turn:
+                yield turn
+
+
+def iter_gemini_jsonl(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            messages, _ = replay_gemini_jsonl(handle)
+    except OSError:
+        return
+    yield from _gemini_messages_turns(messages)
+
+
+def _gemini_jsonl_meta(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            _, meta = replay_gemini_jsonl(handle)
+        return meta
+    except OSError:
+        return {}
+
+
+# DeepSeek Harness ─ $DSH_HOME/sessions/--<cwd>--/<session-…>/session.v<N>.jsonl.zstd
+
+def dsh_sessions_root():
+    return (_env_path("DSH_HOME") or Path.home() / ".dsh") / "sessions"
+
+
+_ZSTD_WARNED = []
+
+
+def read_zstd(path):
+    """Decompress a (possibly multi-frame, possibly still-being-written) zstd file."""
+    data = Path(path).read_bytes()
+    try:
+        from compression import zstd as pyzstd  # Python 3.14+
+        out, buf = [], data
+        while buf:
+            dec = pyzstd.ZstdDecompressor()
+            try:
+                out.append(dec.decompress(buf))
+            except Exception:
+                break
+            if not dec.eof:
+                break  # last frame still being written
+            buf = dec.unused_data
+        return b"".join(out)
+    except ImportError:
+        pass
+    try:
+        import zstandard
+        reader = zstandard.ZstdDecompressor().stream_reader(io.BytesIO(data), read_across_frames=True)
+        chunks = []
+        try:
+            while True:
+                chunk = reader.read(1 << 20)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except Exception:
+            pass
+        return b"".join(chunks)
+    except ImportError:
+        pass
+    exe = shutil.which("zstd")
+    if exe:
+        proc = subprocess.run([exe, "-dcq"], input=data, capture_output=True)
+        return proc.stdout  # partial output is still good on a truncated last frame
+    if not _ZSTD_WARNED:
+        _ZSTD_WARNED.append(1)
+        sys.stderr.write("[navcom] DeepSeek Harness sessions are zstd-compressed: install zstd "
+                         "(brew install zstd / apt install zstd) to index them\n")
+    return b""
+
+
+def list_dsh_logs():
+    root = dsh_sessions_root()
+    logs = []
+    if not root.is_dir():
+        return logs
+    for session_dir in root.glob("*/*"):
+        if not session_dir.is_dir():
+            continue
+        candidates = list(session_dir.glob("session.v*.jsonl.zstd")) + list(session_dir.glob("session.jsonl"))
+        if not candidates:
+            continue
+
+        def version(p):
+            m = re.search(r"session\.v(\d+)\.jsonl", p.name)
+            return int(m.group(1)) if m else 0
+        logs.extend(_file_logs([max(candidates, key=version)], "dsh"))
+    return logs
+
+
+def _dsh_lines(key):
+    raw = read_zstd(key) if key.endswith(".zstd") else Path(key).read_bytes()
+    return raw.decode("utf-8", errors="replace").splitlines()
+
+
+def iter_dsh(key):
+    calls = {}
+    for line in _dsh_lines(key):
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        kind, data = obj.get("type"), obj.get("data") or {}
+        if kind == "user/message":
+            if (data.get("source") or {}).get("kind", "user") != "user":
+                continue  # runtime context, skill catalogs, reminders — injected, not typed
+            text = _text_of(data.get("content") or [])
+            if text:
+                yield "user", text
+        elif kind == "assistant/message":
+            text = _text_of((data.get("message") or {}).get("content") or [])
+            if text:
+                yield "assistant", text
+        elif kind == "tool/call":
+            args = data.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    pass
+            calls[data.get("callId")] = _call_label(data.get("name"), args)
+            cmd = _shell_cmd(data.get("name"), args)
+            if cmd:
+                yield "cmd", cmd
+        elif kind == "tool/result":
+            msg = data.get("message") or {}
+            output = msg.get("content")
+            if msg.get("isError"):
+                output = "error\n" + (_text_of(output) if isinstance(output, list) else str(output or ""))
+            turn = tool_turn(calls.get(msg.get("toolCallId"), "tool"), output)
+            if turn:
+                yield turn
+
+
+def _dsh_header(key):
+    for line in _dsh_lines(key)[:1]:
+        try:
+            return json.loads(line)
+        except Exception:
+            return {}
+    return {}
+
+
+def _dsh_title(key):
+    title = ""
+    for line in _dsh_lines(key):
+        if '"session/title"' in line:
+            try:
+                title = (json.loads(line).get("data") or {}).get("title") or title
+            except Exception:
+                pass
+    return title
+
+
+# Grok Build (xAI) ─ $GROK_HOME/sessions/<urlencoded cwd>/<uuidv7>/updates.jsonl
+
+def grok_sessions_root():
+    return (_env_path("GROK_HOME") or Path.home() / ".grok") / "sessions"
+
+
+def list_grok_logs():
+    root = grok_sessions_root()
+    if not root.is_dir():
+        return []
+    return _file_logs([p for p in root.glob("*/*/updates.jsonl")], "grok")
+
+
+def _acp_text(content):
+    """ACP content: {"type":"text","text"} | [{"type":"content","content":{…}}, …] | diffs."""
+    if isinstance(content, dict):
+        if content.get("type") == "text":
+            return content.get("text") or ""
+        if content.get("type") == "content":
+            return _acp_text(content.get("content"))
+        if content.get("type") == "diff":
+            return f"diff {content.get('path', '')}\n{content.get('newText', '')}"
+        return ""
+    if isinstance(content, list):
+        return "\n".join(t for t in (_acp_text(c) for c in content) if t)
+    return content if isinstance(content, str) else ""
+
+
+def iter_grok_updates(key):
+    calls, role, buf = {}, None, []
+    try:
+        handle = open(key, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with handle:
+        for line in handle:
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            update = (obj.get("params") or {}).get("update") or obj.get("update") or (
+                obj if "sessionUpdate" in obj else None)
+            if not isinstance(update, dict):
+                continue
+            tag = update.get("sessionUpdate")
+            if tag in ("user_message_chunk", "agent_message_chunk"):
+                speaker = "user" if tag == "user_message_chunk" else "assistant"
+                content = update.get("content") or {}
+                meta = update.get("_meta") or {}
+                bash = (content.get("_meta") or {}).get("bash_command") if isinstance(content, dict) else None
+                if meta.get("hostTurn") or bash:
+                    if role and buf:
+                        yield role, "".join(buf)
+                    role, buf = None, []
+                    if bash:
+                        yield "cmd", bash
+                    continue
+                if role != speaker:
+                    if role and buf:
+                        yield role, "".join(buf)
+                    role, buf = speaker, []
+                buf.append(_acp_text(content))
+                continue
+            if role and buf and tag in ("tool_call", "tool_call_update"):
+                yield role, "".join(buf)
+                role, buf = None, []
+            if tag == "tool_call":
+                raw = update.get("rawInput") or {}
+                cmd = raw.get("command") if isinstance(raw, dict) else None
+                if isinstance(cmd, list):
+                    cmd = " ".join(str(c) for c in cmd)
+                calls[update.get("toolCallId")] = (f"{update.get('title') or update.get('kind') or 'tool'}"
+                                                   + (f": {cmd}" if cmd and cmd not in str(update.get("title")) else ""))
+                if cmd and (update.get("kind") == "execute" or "command" in raw):
+                    yield "cmd", cmd
+            elif tag == "tool_call_update" and update.get("status") in ("completed", "failed"):
+                output = _acp_text(update.get("content"))
+                if not output.strip():
+                    raw = update.get("rawOutput")
+                    if isinstance(raw, dict):
+                        output = "\n".join(str(raw[k]) for k in ("output", "stdout", "stderr", "text", "result")
+                                           if isinstance(raw.get(k), (str, int, float)) and str(raw[k]).strip())
+                        if not output:
+                            output = json.dumps(raw, ensure_ascii=False)[:20000]
+                    elif isinstance(raw, str):
+                        output = raw
+                if update.get("status") == "failed":
+                    output = "failed\n" + output
+                turn = tool_turn(calls.get(update.get("toolCallId"), "tool"), output)
+                if turn:
+                    yield turn
+    if role and buf:
+        yield role, "".join(buf)
+
+
+def _grok_summary(key):
+    try:
+        return json.loads((Path(key).parent / "summary.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _grok_cwd(key):
+    summary = _grok_summary(key)
+    info = summary.get("info") if isinstance(summary.get("info"), dict) else {}
+    for source in (info, summary):
+        for field in ("cwd", "working_directory", "workingDirectory"):
+            if isinstance(source.get(field), str):
+                return source[field]
+    group = Path(key).parent.parent
+    cwd_file = group / ".cwd"
+    if cwd_file.exists():
+        try:
+            return cwd_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+    from urllib.parse import unquote
+    return unquote(group.name)
+
+
+# Kilo Code CLI (an opencode fork; same SQLite schema)
+
+def kilo_db_path():
+    return _env_path("KILO_DB") or _xdg_data_home() / "kilo" / "kilo.db"
+
+
+# Gemini CLI deletes chats older than 30 days by default (general.sessionRetention)
+
+def gemini_settings_path():
+    home = _env_path("GEMINI_CLI_HOME") or Path.home()
+    return home / ".gemini" / "settings.json"
+
+
+def gemini_retention_status():
+    path = gemini_settings_path()
+    if not path.parent.is_dir():
+        return None, "Gemini CLI not installed"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception:
+        return None, f"{path} is not plain JSON — not touched"
+    retention = ((data.get("general") or {}) if isinstance(data, dict) else {}).get("sessionRetention")
+    if retention is None:
+        return 30, "default — Gemini CLI deletes chats after 30 days"
+    if isinstance(retention, dict) and retention.get("enabled") is False:
+        return 10 ** 6, "set in " + str(path)
+    max_age = str((retention or {}).get("maxAge", "30d"))
+    m = re.match(r"(\d+)\s*([dhwmy]?)", max_age)
+    days = int(m.group(1)) * {"d": 1, "h": 1 / 24, "w": 7, "m": 30, "y": 365, "": 1}[m.group(2)] if m else 30
+    return days, "set in " + str(path)
+
+
+def ensure_gemini_retention():
+    """Turn Gemini's automatic chat deletion off when nobody has configured it."""
+    if os.environ.get("NAVCOM_NO_RETENTION_FIX"):
+        return False
+    path = gemini_settings_path()
+    if not path.parent.is_dir():
+        return False
+    try:
+        raw = path.read_text(encoding="utf-8") if path.exists() else ""
+        data = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    general = data.setdefault("general", {})
+    if not isinstance(general, dict) or "sessionRetention" in general:
+        return False
+    general["sessionRetention"] = {"enabled": False}
+    try:
+        if raw:
+            backup = path.with_name(path.name + ".navcom-backup")
+            if not backup.exists():
+                backup.write_text(raw, encoding="utf-8")
+        tmp = path.with_name(path.name + f".navcom-tmp-{os.getpid()}")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        if path.exists():
+            os.chmod(tmp, path.stat().st_mode & 0o777)
+        os.replace(tmp, path)
+    except OSError:
+        return False
+    return True
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Session metadata: project (working dir) + a human title
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -984,7 +1462,17 @@ def _project_from_key(key, provider):
         except (ValueError, IndexError):
             return path.parent.name
     if provider == "gemini":
+        if key.endswith(".jsonl"):
+            dirs = _gemini_jsonl_meta(key).get("directories") or []
+            if dirs and isinstance(dirs[0], str):
+                return dirs[0]
+            chats = next((p for p in path.parents if p.name == "chats"), path.parent)
+            return _gemini_project(chats.parent)
         return _gemini_project(path.parent.parent)
+    if provider == "dsh":
+        return _dsh_header(key).get("cwd") or ""
+    if provider == "grok":
+        return _grok_cwd(key)
     if provider == "codex":
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as handle:
@@ -994,7 +1482,7 @@ def _project_from_key(key, provider):
             return payload.get("cwd") or ""
         except Exception:
             return ""
-    if provider == "opencode":
+    if provider in ("opencode", "kilo"):
         if "#" in key:
             db, sid = key.split("#", 1)
             try:
@@ -1150,9 +1638,15 @@ def _opencode_legacy_info(key):
     return {}
 
 
+_GENERIC_SESSION_FILES = re.compile(r"^(updates\.jsonl|session(\.v\d+)?\.jsonl(\.zstd)?|wire\.jsonl|events\.jsonl)$")
+
+
 def session_ref(key):
-    """Short, stable handle for a session: the file stem / db session id."""
+    """Short, stable handle for a session: the file stem / db session id (or the session's
+    folder, for harnesses that name every transcript file the same: dsh, Grok Build)."""
     tail = key.split("#", 1)[1] if "#" in key else Path(key).name
+    if "#" not in key and _GENERIC_SESSION_FILES.match(tail):
+        tail = Path(key).parent.name
     for ext in (".jsonl", ".json"):
         if tail.endswith(ext):
             tail = tail[: -len(ext)]
@@ -1427,6 +1921,12 @@ def _native_title(key, provider):
     """Titles some harnesses store themselves (opencode, goose)."""
     if provider == "opencode" and "#" not in key:
         return (_opencode_legacy_info(key).get("title") or "").strip()[:160]
+    if provider == "dsh":
+        return _dsh_title(key)[:160]
+    if provider == "grok":
+        summary = _grok_summary(key)
+        # a manual /rename lands in title; otherwise Grok writes generated_title (seen on 1.0.46)
+        return (summary.get("title") or summary.get("generated_title") or summary.get("session_summary") or "").strip()[:160]
     if provider in ("pi", "omo") and "#" not in key:
         # pi/omo record a session name (/name, auto-title) as {"type":"session_info","name":…}
         name = ""
@@ -1441,12 +1941,12 @@ def _native_title(key, provider):
         except OSError:
             return ""
         return name.strip()[:160]
-    if "#" not in key or provider not in ("opencode", "goose"):
+    if "#" not in key or provider not in ("opencode", "goose", "kilo"):
         return ""
     db, sid = key.split("#", 1)
     try:
         con = _ro_connect(db)
-        if provider == "opencode":
+        if provider in ("opencode", "kilo"):
             row = con.execute("SELECT title FROM session WHERE id=?", (sid,)).fetchone()
         else:
             row = con.execute("SELECT name, description FROM sessions WHERE id=?", (sid,)).fetchone()
@@ -2251,7 +2751,7 @@ SKILL_NAME = "navcom-session-recall"
 SKILL_MARKER = "<!-- managed by navcom: updated automatically on upgrade; edit freely and it will be left alone -->"
 SKILL_MD = """---
 name: navcom-session-recall
-description: Search every past AI coding session on this machine (Claude Code, Codex, Gemini CLI, pi, omo, opencode, goose) with the local `navcom` CLI. Use when the user says "use navcom", asks to find an old conversation or thread, asks what was done/decided/tried before on a topic, wants to recover context after a compaction, or needs evidence from past sessions (commands run, errors seen, decisions) before continuing work.
+description: Search every past AI coding session on this machine (Claude Code, Codex, Gemini CLI, pi, omo, opencode, goose, DeepSeek dsh, Grok Build, Kilo) with the local `navcom` CLI. Use when the user says "use navcom", asks to find an old conversation or thread, asks what was done/decided/tried before on a topic, wants to recover context after a compaction, or needs evidence from past sessions (commands run, errors seen, decisions) before continuing work.
 ---
 """ + SKILL_MARKER + """
 
@@ -2338,7 +2838,8 @@ def skill_targets():
     if codex_home.is_dir():
         targets.append(codex_home / "skills")           # Codex
     agents_users = [home / ".agents", home / ".pi", home / ".omo", opencode_data_root(),
-                    home / ".config" / "opencode", home / ".config" / "goose", home / ".gemini"]
+                    home / ".config" / "opencode", home / ".config" / "goose", home / ".gemini",
+                    home / ".dsh", home / ".grok", kilo_db_path().parent]
     if any(p.is_dir() for p in agents_users):
         targets.append(home / ".agents" / "skills")     # Agent Skills standard: pi, omo, opencode, goose
     return targets
@@ -2404,7 +2905,7 @@ def install_skills(force=False, report=False):
     return done
 
 
-SKILL_SUMMARY = ("Search every past AI coding session (Claude Code, Codex, Gemini CLI, pi, omo, opencode, goose) "
+SKILL_SUMMARY = ("Search every past AI coding session (Claude Code, Codex, Gemini, pi, omo, opencode, goose, DeepSeek, Grok, Kilo) "
                  "with navcom: find, then --open")
 
 
@@ -2550,7 +3051,8 @@ def private_file(path):
 # whole. Default harness: claude (the one that deletes). NAVCOM_ARCHIVE=all|off|claude,pi,…
 
 ARCHIVE_BUDGET_SECONDS = 1.0
-ARCHIVABLE = ("claude", "codex", "gemini", "pi", "omo", "goose")
+ARCHIVABLE = ("claude", "codex", "gemini", "pi", "omo", "goose", "dsh", "grok")
+ARCHIVE_DEFAULT = "claude,gemini"  # the harnesses that delete their own history
 
 
 def archive_root():
@@ -2558,7 +3060,7 @@ def archive_root():
 
 
 def archive_providers():
-    raw = (os.environ.get("NAVCOM_ARCHIVE") or "claude").strip().lower()
+    raw = (os.environ.get("NAVCOM_ARCHIVE") or ARCHIVE_DEFAULT).strip().lower()
     if raw in ("off", "0", "no", "none", "false"):
         return []
     if raw == "all":
@@ -2570,6 +3072,7 @@ def _provider_root(provider):
     return {
         "claude": fts_mod.claude_projects_root(), "codex": fts_mod.codex_sessions_root(),
         "gemini": fts_mod.gemini_tmp_root(), "pi": pi_sessions_root(), "omo": omo_sessions_root(),
+        "dsh": dsh_sessions_root(), "grok": grok_sessions_root(),
     }.get(provider)
 
 
@@ -2904,7 +3407,8 @@ def cmd_maintain(conn, force=False):
 
 HELP_TEXT = """\
 navcom — instant full-text search over every AI coding session on this machine:
-Claude Code, Codex, Gemini CLI, pi, omo, opencode, goose.  SQLite FTS5 + BM25, ~0.2s.
+Claude Code, Codex, Gemini CLI, pi, omo, opencode, goose, DeepSeek dsh, Grok Build, Kilo.
+SQLite FTS5 + BM25, ~0.2s.
 
 THE RECIPE (agents: this is all you need)
   1. navcom <words>                 find: hits grouped by session → date, harness, project, ref, #turn
@@ -2929,8 +3433,8 @@ QUERIES — type anything; navcom never errors on query syntax
 
 NARROW / WIDEN
   navcom deploy -n 50               hits PER HARNESS (default 20); every harness gets its own share
-  navcom deploy --claude --pi       only these harnesses (--codex --gemini --omo --opencode --goose,
-                                    or -p claude,pi)
+  navcom deploy --claude --pi       only these harnesses (--codex --gemini --omo --opencode --goose
+                                    --dsh --grok --kilo, or -p claude,deepseek)
   navcom deploy --here              sessions started in this directory (or below it)
   navcom deploy --project syra      sessions whose working directory contains "syra"
   navcom deploy --days 7            active in the last 7 days (--since 2026-09-01, --since 12h, --until …)
@@ -3527,10 +4031,11 @@ def cmd_where(conn, providers):
     if summary:
         safe_print(f"  archive  {summary}")
     safe_print(f"  daily    {daily_job_status()}")
-    days, how = claude_retention_status()
-    if days is not None:
-        verdict = "keeps history ~forever" if days >= 3650 else f"DELETES transcripts after {days} days"
-        safe_print(f"  claude   retention: {verdict} ({how})")
+    for name, status in (("claude", claude_retention_status), ("gemini", gemini_retention_status)):
+        days, how = status()
+        if days is not None:
+            verdict = "keeps history ~forever" if days >= 3650 else f"DELETES transcripts after {days:g} days"
+            safe_print(f"  {name:8s} retention: {verdict} ({how})")
     return 0
 
 
@@ -3567,10 +4072,11 @@ def run(argv=None):
         return 1
 
     auto_install_skills()
-    try:
-        ensure_claude_retention()
-    except Exception:
-        pass
+    for fix in (ensure_claude_retention, ensure_gemini_retention):
+        try:
+            fix()
+        except Exception:
+            pass
     if args.daily == "off":
         removed = remove_daily_job()
         safe_print("removed  " + ", ".join(removed) if removed else "no daily job was installed")

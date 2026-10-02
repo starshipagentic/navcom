@@ -10,11 +10,14 @@ from their shell tool, and by you.
 |---|---|
 | Claude Code | `$CLAUDE_CONFIG_DIR/projects` (default `~/.claude/projects`) |
 | Codex CLI | `$CODEX_HOME/sessions` (default `~/.codex/sessions`) |
-| Gemini CLI | `~/.gemini/tmp/*/chats` |
+| Gemini CLI | `~/.gemini/tmp/*/chats/*.json` (≤0.38) and `*.jsonl` (≥0.39, edits replayed) |
 | pi | `$PI_CODING_AGENT_SESSION_DIR` or `~/.pi/agent/sessions` |
 | omo (OmO) | `$OMO_CODING_AGENT_SESSION_DIR` or `~/.omo/agent/sessions` |
 | opencode | `$XDG_DATA_HOME/opencode/opencode.db` (and legacy `storage/message`) |
 | goose | `$XDG_DATA_HOME/goose/sessions/sessions.db` (and legacy `*.jsonl`) |
+| DeepSeek Harness (`dsh`) | `$DSH_HOME/sessions/--<cwd>--/<id>/session.v4.jsonl.zstd` (zstd: Python 3.14, `zstandard`, or the `zstd` CLI) |
+| Grok Build (xAI `grok`) | `$GROK_HOME/sessions/<url-encoded cwd>/<id>/updates.jsonl` |
+| Kilo Code CLI | `$KILO_DB` or `$XDG_DATA_HOME/kilo/kilo.db` (opencode's schema) |
 
 Run `navcom --where` to see what it found on your machine.
 
@@ -148,9 +151,13 @@ in `~/.claude/settings.json`. It writes atomically and keeps a one-time backup i
 - A settings file that isn't plain JSON is never touched.
 - It never writes `0`: Claude rejects it, and older versions read 0 as "save nothing".
 - `NAVCOM_NO_RETENTION_FIX=1` opts out.
+
+Gemini CLI deletes chats after 30 days by default too (`general.sessionRetention`). When that
+setting is unset, navcom turns it off (`{"enabled": false}`) in `~/.gemini/settings.json`, following
+the same rules as for Claude.
 - `navcom --where` shows the current retention.
 
-**Raw archive.** Every Claude transcript is also kept whole and compressed under
+**Raw archive.** Every Claude and Gemini transcript (the two harnesses that delete) is also kept whole and compressed under
 `~/.navcom/archive/`, with every byte of every tool output. A growing session is archived
 incrementally: only the new part is compressed and appended. If a transcript ever disappears,
 `navcom --restore <ref>` (or `--restore all`) puts it back so `claude --resume` works again.

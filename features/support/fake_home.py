@@ -192,12 +192,100 @@ def build(home: Path, base_epoch: float = 1_790_000_000):
     ])
     _touch(goose_legacy, base_epoch + 50)
     sessions["goose-legacy"] = goose_legacy
+
+    # ── Gemini CLI ≥ 0.39: append-only JSONL with $set / $patch / $rewindTo ──
+    gj = home / ".gemini" / "tmp" / PROJECT / "chats" / "session-2026-09-05T00-00-abcd1234.jsonl"
+    _jsonl(gj, [
+        {"sessionId": "abcd1234-0000", "projectHash": "x", "startTime": "2026-09-05T00:00:00Z", "kind": "main", "directories": [cwd]},
+        {"$set": {"messages": [{"id": "m1", "type": "user", "content": [{"text": "checkpointed question zebracornjsonlgem"}]}]}},
+        {"id": "m2", "type": "gemini", "content": "draft answer", "toolCalls": [
+            {"id": "tc1", "name": "run_shell_command", "args": {"command": "kubectl get pods"}, "status": "executing"}]},
+        {"id": "m2", "type": "gemini", "content": "final answer zebracornjsonlgem", "toolCalls": [
+            {"id": "tc1", "name": "run_shell_command", "args": {"command": "kubectl get pods"}, "status": "executing"}]},
+        {"$patch": {"id": "m2", "toolCalls": [{"id": "tc1", "resultDisplay": "api-0 Running zebracornjsonltool", "status": "success"}]}},
+        {"id": "m3", "type": "user", "content": [{"text": "rewound away zebracornrewound"}]},
+        {"$rewindTo": "m3"},
+        {"id": "m4", "type": "user", "content": [{"text": "after rewind zebracornafterrewind"}]},
+    ])
+    _touch(gj, base_epoch + 310)
+    sessions["gemini-jsonl"] = gj
+
+    # ── DeepSeek Harness (dsh): zstd-compressed JSONL, multiple frames ──
+    dsh_dir = home / ".dsh" / "sessions" / ("--" + cwd.replace("/", "-").lstrip("-") + "--") / "session-7a48d7c9-b372-4f90-8537-d9c82b6c65a7"
+    dsh_dir.mkdir(parents=True, exist_ok=True)
+    dsh_lines = [
+        {"type": "session", "version": 4, "id": "session-7a48d7c9-b372-4f90-8537-d9c82b6c65a7", "cwd": cwd},
+        {"type": "user/message", "seq": 1, "data": {"content": [{"type": "text", "text": "run the calc check zebracorndsh"}], "source": {"kind": "user"}}},
+        {"type": "user/message", "seq": 2, "data": {"content": [{"type": "text", "text": "runtime context zebracorninjected"}], "source": {"kind": "runtime-context"}}},
+        {"type": "session/title", "seq": 3, "data": {"title": "Verify calc with DeepSeek"}},
+        {"type": "assistant/message", "seq": 4, "data": {"message": {"role": "assistant", "content": [
+            {"type": "reasoning", "text": "secret zebracornthinking"}, {"type": "text", "text": "Running it now zebracorndsh."}]}}},
+        {"type": "tool/call", "seq": 5, "data": {"callId": "c1", "name": "bash", "arguments": json.dumps({"command": "python3 -c 'print(42)'"})}},
+        {"type": "tool/result", "seq": 6, "data": {"message": {"role": "tool", "toolCallId": "c1", "content": [{"type": "text", "text": "42 zebracorndshtool"}], "isError": False}}},
+    ]
+    payload = "".join(json.dumps(r) + "\n" for r in dsh_lines).encode()
+    zpath = dsh_dir / "session.v4.jsonl.zstd"
+    import shutil as _sh
+    import subprocess as _sp
+    if _sh.which("zstd"):
+        half = len(payload) // 2
+        cut = payload.rfind(b"\n", 0, half) + 1
+        frames = b"".join(_sp.run(["zstd", "-q", "-c"], input=part, capture_output=True, check=True).stdout
+                          for part in (payload[:cut], payload[cut:]))   # two frames, like dsh writes
+        zpath.write_bytes(frames)
+        _touch(zpath, base_epoch + 800)
+        sessions["dsh"] = zpath
+
+    # ── Grok Build: ACP updates.jsonl + summary.json ──
+    from urllib.parse import quote
+    grok_dir = home / ".grok" / "sessions" / quote(cwd, safe="") / "0199bbbb-cccc-7ddd-8eee-ffff00001111"
+    grok_dir.mkdir(parents=True, exist_ok=True)
+    def env(update):
+        return {"timestamp": 1, "method": "session/update", "params": {"sessionId": "s", "update": update}}
+    _jsonl(grok_dir / "updates.jsonl", [
+        env({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "check the rust build "}}),
+        env({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "zebracorngrok"}}),
+        env({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "zebracornthinking"}}),
+        env({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Building now, "}}),
+        env({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "zebracorngrok answer."}}),
+        env({"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Run cargo build", "kind": "execute", "rawInput": {"command": "cargo build --release"}}),
+        env({"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "in_progress", "content": [{"type": "text", "text": "partial"}]}),
+        env({"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed",
+             "content": [{"type": "content", "content": {"type": "text", "text": "Finished release zebracorngroktool"}}]}),
+        {"sessionId": "s", "update": {"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "bare legacy line zebracorngroklegacy"}}},
+    ])
+    (grok_dir / "summary.json").write_text(json.dumps({"title": "Rust release build", "cwd": cwd}))
+    _touch(grok_dir / "updates.jsonl", base_epoch + 850)
+    sessions["grok"] = grok_dir / "updates.jsonl"
+
+    # ── Kilo Code CLI: opencode's SQLite schema at ~/.local/share/kilo/kilo.db ──
+    kdb = home / ".local" / "share" / "kilo" / "kilo.db"
+    kdb.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(kdb)
+    con.executescript("""
+        CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT, slug TEXT NOT NULL,
+            directory TEXT NOT NULL, title TEXT NOT NULL, version TEXT NOT NULL, time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL);
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+        CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+    """)
+    kt = int((base_epoch + 900) * 1000)
+    con.execute("INSERT INTO session VALUES (?,?,?,?,?,?,?,?,?)", ("ses_kilo1", "p", None, "s", cwd, "Kilo refactor", "1", kt, kt))
+    con.execute("INSERT INTO message VALUES (?,?,?,?,?)", ("msg_k1", "ses_kilo1", kt, kt, json.dumps({"role": "user"})))
+    con.execute("INSERT INTO part VALUES (?,?,?,?,?,?)", ("prt_k1", "msg_k1", "ses_kilo1", kt, kt,
+                json.dumps({"type": "text", "text": "refactor the router zebracornkilo"})))
+    con.commit()
+    con.close()
+    sessions["kilo"] = f"{kdb}#ses_kilo1"
     return sessions, workdir
 
 
 def env_for(home: Path):
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("PI_CODING_AGENT", "OMO_CODING_AGENT", "GOOSE_", "OPENCODE", "CLAUDE", "CODEX", "GEMINI", "NAVCOM"))}
+           if not k.startswith(("PI_CODING_AGENT", "OMO_CODING_AGENT", "GOOSE_", "OPENCODE", "CLAUDE", "CODEX", "GEMINI",
+                                "NAVCOM", "DSH_", "GROK_", "KILO", "XDG_"))}
     env.update({
         "HOME": str(home),
         "XDG_DATA_HOME": str(home / ".local" / "share"),
@@ -206,5 +294,6 @@ def env_for(home: Path):
         "NAVCOM_INDEX": str(home / "navcom-index.sqlite"),
         "NO_COLOR": "1",
         "NAVCOM_DRY_SCHEDULER": "1",
+        "NAVCOM_ARCHIVE_DIR": str(home / ".navcom" / "archive"),
     })
     return env

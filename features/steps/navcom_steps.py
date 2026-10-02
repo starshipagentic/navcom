@@ -94,7 +94,8 @@ def step_harness(context, harness):
 
 @then("every harness is in the results")
 def step_every(context):
-    for harness in ("claude", "codex", "gemini", "pi", "omo", "opencode", "goose"):
+    for harness in ("claude", "codex", "gemini", "pi", "omo", "opencode", "goose", "grok", "kilo") + (
+            ("dsh",) if "dsh" in context.sessions else ()):
         step_harness(context, harness)
 
 

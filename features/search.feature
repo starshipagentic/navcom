@@ -36,6 +36,17 @@ Feature: Fast search across every harness
       | omo      | 1        |
       | opencode | 1        |
       | goose    | 1        |
+      | grok     | 1        |
+      | kilo     | 1        |
+      | dsh      | 1        |
+
+  Scenario: Gemini CLI 0.39+ JSONL sessions are indexed with their edits replayed
+    When I run: navcom zebracornjsonlgem
+    Then it succeeds
+    And the output contains "final answer"
+    And the output does not contain "draft answer"
+    When I run: navcom zebracornrewound
+    Then the output contains "No hits."
 
   Scenario: Legacy opencode and goose storage are indexed too
     When I run: navcom zebracornocleg OR zebracornlegacygoose
@@ -94,4 +105,4 @@ Feature: Fast search across every harness
   Scenario: Version from the flags LLMs guess
     When I run: navcom -v
     Then it succeeds
-    And the output contains "navcom 0.3.0"
+    And the output contains "navcom 0.4.0"
