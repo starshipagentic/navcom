@@ -104,6 +104,7 @@ example for every option. The test suite runs every example in it.
 ```bash
 navcom drizzle migration            # every harness; compact hits grouped by session
 navcom --open 395e14b4:73           # read the turns around hit #73 of that session
+navcom --resume 395e14b4            # get back into it: cd to its folder + reopen it in its harness
 navcom drizzle --context            # expand every hit with the turns around it
 navcom --sessions                   # your most recent sessions, with titles
 navcom --menu                       # the retro dashboard: retention, history, search, learn
@@ -120,7 +121,33 @@ navcom: 7 hits in 3 sessions · query: drizzle* migration*
 [2] 2026-09-27  codex    ~/dev/api  ref 0174f1b5255f  (3 hits)
     …
 → read around a hit: navcom --open 7ec78a59:533   · expand all: add --context
+→ get back into [1] yourself: cd ~/clients/syra/syrab2bdev && claude --resume 7ec78a59-…   · any session: navcom --resume <ref> (--tab: new tab)
 ```
+
+### Get back into a conversation
+
+Found the conversation? Every search ends with the exact command that reopens the top session: it
+`cd`s to the folder it ran in and resumes it in its own harness. `navcom --open` shows the same line
+for the session it prints, and `--json` carries it as `"resume"`.
+
+```bash
+navcom --resume 7ec78a59            # cd + reopen it right here, in this terminal
+navcom --resume 7ec78a59 --tab      # in a new tab: cmux workspace, tmux window, iTerm2, WezTerm, kitty, Terminal.app
+navcom --resume 7ec78a59 --print    # just print the command (pipes and agents always get this)
+```
+
+In `navcom --menu`, every search hit and open session shows a **RESUME** line with that command:
+press **r** to resume here, **t** for a new tab, **c** to copy it.
+
+![navcom --menu resume line](https://raw.githubusercontent.com/starshipagentic/navcom/main/docs/menu-resume.png)
+
+Each harness gets its own command (`claude --resume <uuid>`, `codex resume <uuid>`, `gemini --resume
+<sessionId>`, `opencode --session ses_…`, `kimi -S session_<uuid>`, `amp threads continue T-…`,
+`goose session --resume --session-id …`, and so on for all 30). Continue and Aider can't reopen a
+session by id, so navcom gives their closest command (`cn --fork <id>`, `aider --restore-chat-history`)
+and says what it does. If the harness already deleted the transcript, navcom restores it from its
+archive first. If it was deleted before navcom archived it, navcom says so; you can still read it
+with `--open`.
 
 ### Queries never break
 

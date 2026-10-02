@@ -368,3 +368,41 @@ def step_registered(context):
         if f"cmd: echo «hi-{hid}»" not in context.out and "cmd: echo «hi»-" not in context.out and "cmd:" not in context.out:
             failures.append(f"{hid}: shell command not indexed\n{context.out[:400]}")
     assert not failures, "\n".join(failures)
+
+
+def _first_ref(context, harness):
+    refs = re.findall(rf"^\[\d+\] \S+\s+{harness}\s+\S+\s+ref (\S+)", context.out, re.M)
+    assert refs, f"no {harness} session in output:\n{context.out}"
+    return refs[0]
+
+
+@when('I resume the first "{harness}" session from a search')
+def step_resume_first(context, harness):
+    _run(context, ["zebracorn", f"--{harness}", "--include-self"])
+    _run(context, ["--resume", _first_ref(context, harness)])
+
+
+@when('I resume the first "{harness}" session from the last search')
+def step_resume_last(context, harness):
+    _run(context, ["--resume", _first_ref(context, harness)])
+
+
+@when('I resume the first "{harness}" hit ref')
+def step_resume_hit(context, harness):
+    hit = re.search(r"#(\d+) ", context.out.split("\n", 2)[2])
+    _run(context, ["--resume", f"{_first_ref(context, harness)}:{hit.group(1)}"])
+
+
+@when('the "{harness}" transcript is deleted')
+def step_delete_any(context, harness):
+    context.sessions[harness].unlink()
+
+
+@then("it fails")
+def step_fails(context):
+    assert context.rc != 0, f"rc={context.rc}\n{context.out}\n{context.err}"
+
+
+@then('stderr mentions "{text}"')
+def step_stderr(context, text):
+    assert text in context.err, f"expected {text!r} in stderr:\n{context.err}"

@@ -35,7 +35,7 @@ def build(home: Path, base_epoch: float = 1_790_000_000):
 
     # ── Claude Code ────────────────────────────────────────────────────────
     claude = home / ".claude" / "projects" / encoded / "11111111-2222-4333-8444-555555555555.jsonl"
-    _jsonl(claude, [
+    _jsonl(claude, [dict(rec, cwd=cwd) for rec in [  # real Claude records carry cwd
         {"type": "user", "isMeta": True, "message": {"role": "user", "content": "Caveat: injected by a hook, zebracornmeta"}},
         {"type": "user", "message": {"role": "user", "content": "<command-name>/goal</command-name>\n<command-args>ship the zebracorn release</command-args>"}},
         {"type": "user", "message": {"role": "user", "content": PUNCTUATED + " zebracorn zebracornclaude"}},
@@ -49,7 +49,7 @@ def build(home: Path, base_epoch: float = 1_790_000_000):
             {"type": "tool_result", "tool_use_id": "t2", "content": "navcom: 3 hits in 2 sessions · query: zebracorn* zebracornselfoutput"},
         ]}},
         {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Committed and pushed as \x1b[2mabc1234\x1b[0m done"}]}},
-    ])
+    ]])
     sub = claude.parent / claude.stem / "subagents" / "agent-a1b2c3.jsonl"
     _jsonl(sub, [{"type": "user", "message": {"role": "user", "content": "subagent digging zebracornsubagent"}}])
     _touch(sub, base_epoch + 90)

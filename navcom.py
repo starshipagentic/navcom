@@ -17,6 +17,7 @@ import argparse
 import collections
 import io
 import json
+import shlex
 import shutil
 import subprocess
 import os
@@ -56,7 +57,7 @@ def load_module(code, name):
 clean_mod = load_module(LOG_CLEAN_QUICK_CODE, "log_clean_quick")
 fts_mod = load_module(LOG_SEARCH_FTS5_CODE, "log_search_fts5")
 
-NAVCOM_VERSION = "0.7.1"
+NAVCOM_VERSION = "0.8.0"
 DEFAULT_LIMIT = 20  # hits per harness (and sessions listed by a bare `navcom`)
 
 # Every harness navcom knows how to read. Order = display order in help/listings.
@@ -1866,7 +1867,7 @@ def short_ref(key):
 # Index: FTS5 table (shared with the embedded log_search_fts5) + side tables
 # ─────────────────────────────────────────────────────────────────────────────
 
-INDEX_SCHEMA_VERSION = 2
+INDEX_SCHEMA_VERSION = 3  # 3: repair Gemini turns stored as {'text': …} reprs
 # Bump when turn extraction changes; older rows get re-read gradually (see index_logs).
 PARSER_VERSION = 3  # 3: tool outputs, Codex exec_command / JS exec commands
 UPGRADE_BUDGET_SECONDS = 1.0
@@ -1933,7 +1934,7 @@ def _open_index_rw(index_path):
     if version < INDEX_SCHEMA_VERSION:
         conn.execute("BEGIN IMMEDIATE")
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version < INDEX_SCHEMA_VERSION:
+        if version < 2:
             # turn_loc lets window/transcript lookups hit a B-tree instead of
             # full-scanning the FTS table (which cannot index its columns).
             conn.execute("DELETE FROM turn_loc")
@@ -1941,6 +1942,9 @@ def _open_index_rw(index_path):
                 "INSERT OR REPLACE INTO turn_loc (file, msg_index, rid) SELECT file, msg_index, rowid FROM session_fts"
             )
             conn.execute("DELETE FROM session_fts WHERE rowid NOT IN (SELECT rid FROM turn_loc)")
+        if version < 3:
+            _repair_part_reprs(conn)
+        if version < INDEX_SCHEMA_VERSION:
             conn.execute(f"PRAGMA user_version={INDEX_SCHEMA_VERSION}")
         conn.commit()
     # An older navcom (no turn_loc) may have appended rows since we last ran.
@@ -1954,6 +1958,26 @@ def _open_index_rw(index_path):
         )
         conn.commit()
     return conn
+
+
+def _repair_part_reprs(conn):
+    """Old navcom stored some Gemini turns as Python reprs of their parts ({'text': '…'}). The parser was
+    fixed long ago, but turns from transcripts Gemini has since deleted can't be re-read — fix them in place."""
+    import ast
+    rows = conn.execute("SELECT rowid, text FROM session_fts WHERE text LIKE '{''text'': %' OR text LIKE '[{''text'': %'").fetchall()
+    for rowid, text in rows:
+        try:
+            value = ast.literal_eval(text)
+        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            match = re.match(r"^\[?\{'text': (['\"])(.*?)(?:\1\}\]?)?$", text, re.S)  # capped: no closing quote
+            if not match:
+                continue
+            body = match.group(2).replace("\\n", "\n").replace("\\t", "\t").replace("\\'", "'").replace('\\"', '"')
+            value = {"text": body.replace("\\\\", "\\")}
+        parts = value if isinstance(value, list) else [value]
+        if not parts or not all(isinstance(p, dict) and isinstance(p.get("text"), str) for p in parts):
+            continue
+        conn.execute("UPDATE session_fts SET text=? WHERE rowid=?", ("\n".join(p["text"] for p in parts), rowid))
 
 
 def _delete_key(conn, key):
@@ -3094,6 +3118,7 @@ navcom --open 7ec78a59:520-560   # a range of turns
 navcom --open 7ec78a59 --user    # every user turn in that session
 navcom deploy --context          # expand every hit in place
 navcom deploy --json             # structured: sessions[] with ref, date, project, hits[]
+navcom --resume 7ec78a59 --print # user wants to reopen it themselves? hand them this cd + resume command
 navcom --restore 7ec78a59        # transcript deleted by its harness? put it back, then resume it
 ```
 
@@ -5740,1465 +5765,6 @@ def deepcode_fixture(home, cwd):
     return str(path)
 
 
-# ── DeepSeek Reasonix (reasonix) ─────────────────────────────────────────────
-# navcom parsers for three DeepSeek-first harnesses: Codewhale, Reasonix, Deep Code.
-#
-# The same file is copied into harness/codewhale, harness/reasonix and harness/deepcode.
-
-def _reasonix_load_json(path):
-    try:
-        return json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
-    except Exception:
-        return None
-
-
-def _reasonix_jsonl(path):
-    try:
-        handle = open(path, "r", encoding="utf-8", errors="replace")
-    except OSError:
-        return
-    with handle:
-        for line in handle:
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            if isinstance(obj, dict):
-                yield obj
-
-
-def _reasonix_tolerant(gen_fn):
-    """Odd records end a transcript early instead of raising into the indexer."""
-    def wrapper(key):
-        try:
-            yield from gen_fn(key)
-        except Exception:
-            return
-    wrapper.__name__ = gen_fn.__name__
-    return wrapper
-
-
-def _reasonix_safe_str(fn):
-    def wrapper(key):
-        try:
-            return fn(key) or ""
-        except Exception:
-            return ""
-    wrapper.__name__ = fn.__name__
-    return wrapper
-
-
-def _reasonix_args(raw):
-    if isinstance(raw, str):
-        try:
-            return json.loads(raw)
-        except Exception:
-            return raw
-    return raw
-
-
-# A text part that is one whole XML-ish element is host-injected context
-# (<turn_meta>, <session_goal>, <workspace>, <session-context>, <system-reminder>, …).
-_reasonix_INJECTED_BLOCK_RE = re.compile(r"^\s*<([A-Za-z][\w-]*)\b[^>]*>.*</\1>\s*$|^\s*<[A-Za-z][\w-]*\b[^>]*/>\s*$", re.S)
-_reasonix_EDGE_BLOCK_RE = re.compile(r"\A\s*<([A-Za-z][\w-]*)\b[^>]*>\n.*?\n</\1>\s*|\s*<([A-Za-z][\w-]*)\b[^>]*>\n.*?\n</\2>\s*\Z", re.S)
-
-
-def _reasonix_strip_injected(text):
-    """Drop whole injected XML blocks wrapped around typed text (leading or trailing)."""
-    if not isinstance(text, str):
-        return ""
-    if _reasonix_INJECTED_BLOCK_RE.match(text):
-        return ""
-    prev = None
-    while prev != text:
-        prev, text = text, _reasonix_EDGE_BLOCK_RE.sub("", text, count=1)
-    return text.strip()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Codewhale (formerly DeepSeek-TUI) ─ $CODEWHALE_HOME/sessions/<id>.json
-#   legacy ~/.deepseek/sessions (migrated by move, or copied when the move fails)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def codewhale_roots():
-    explicit = _env_path("CODEWHALE_HOME")
-    if explicit:
-        return [explicit / "sessions"]  # an explicit home never falls back to ~/.deepseek
-    return [Path.home() / ".codewhale" / "sessions", Path.home() / ".deepseek" / "sessions"]
-
-
-def codewhale_list():
-    seen, paths = set(), []
-    for root in codewhale_roots():
-        try:
-            entries = sorted(root.glob("*.json")) if root.is_dir() else []
-        except OSError:
-            entries = []
-        for path in entries:
-            # session_boot_owners.json etc. are bookkeeping; checkpoints/ and
-            # .work-graph-import-archive/ hold copies of the same sessions.
-            if path.name in seen or path.name == "session_boot_owners.json":
-                continue
-            seen.add(path.name)
-            paths.append(path)
-    return _file_logs(paths, "codewhale")
-
-
-def _reasonix_codewhale_messages(session):
-    """Every message the session ever held: the append-only journal (all branches,
-    pre-compaction turns included) when present, else the flat messages list."""
-    journal = session.get("journal") if isinstance(session.get("journal"), dict) else {}
-    entries = journal.get("entries") if isinstance(journal.get("entries"), list) else []
-    if entries:
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            kind = entry.get("kind")
-            if kind == "message" and isinstance(entry.get("message"), dict):
-                yield entry["message"]
-            elif kind in ("user", "assistant") and isinstance(entry.get("text"), str):
-                yield {"role": kind, "content": [{"type": "text", "text": entry["text"]}]}
-            # compaction / branch_summary / system: generated context, not typed or said
-        return
-    messages = session.get("messages")
-    for message in messages if isinstance(messages, list) else []:
-        if isinstance(message, dict):
-            yield message
-
-
-@_reasonix_tolerant
-def codewhale_iter(key):
-    session = _reasonix_load_json(key)
-    if not isinstance(session, dict):
-        return
-    calls = {}
-    for message in _reasonix_codewhale_messages(session):
-        role = message.get("role")
-        content = message.get("content")
-        if isinstance(content, str):
-            content = [{"type": "text", "text": content}]
-        if not isinstance(content, list) or role == "system":
-            continue
-        texts = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            kind = block.get("type")
-            if kind == "text" and isinstance(block.get("text"), str):
-                text = block["text"]
-                if role == "user":
-                    text = _reasonix_strip_injected(text)
-                elif role == "assistant_interrupted":
-                    text = text.replace(
-                        "[The following assistant output was interrupted before completion and may be incomplete or wrong]\n", "")
-                if text.strip():
-                    texts.append(text)
-            elif kind in ("tool_use", "server_tool_use"):
-                if texts:
-                    yield ("user" if role == "user" else "assistant"), "\n".join(texts)
-                    texts = []
-                args = _reasonix_args(block.get("input"))
-                calls[block.get("id")] = _call_label(block.get("name"), args)
-                cmd = _shell_cmd(block.get("name"), args)
-                if cmd:
-                    yield "cmd", cmd
-            elif kind in ("tool_result", "tool_search_tool_result", "code_execution_tool_result"):
-                output = block.get("content")
-                if (not isinstance(output, str) or not output.strip()) and block.get("content_blocks"):
-                    output = block["content_blocks"]
-                if block.get("is_error"):
-                    output = "error\n" + (output if isinstance(output, str) else _text_of(output))
-                turn = tool_turn(calls.get(block.get("tool_use_id"), "tool"), output)
-                if turn:
-                    yield turn
-            # thinking / image_url: skipped
-        if texts:
-            yield ("user" if role == "user" else "assistant"), "\n".join(texts)
-
-
-def _reasonix_codewhale_meta(key):
-    session = _reasonix_load_json(key)
-    meta = session.get("metadata") if isinstance(session, dict) else None
-    return meta if isinstance(meta, dict) else {}
-
-
-@_reasonix_safe_str
-def codewhale_project(key):
-    return str(_reasonix_codewhale_meta(key).get("workspace") or "")
-
-
-@_reasonix_safe_str
-def codewhale_title(key):
-    return str(_reasonix_codewhale_meta(key).get("title") or "")
-
-
-def codewhale_fixture(home, cwd):
-    sid = "0f0e0d0c-0b0a-4009-8807-060504030201"
-    path = Path(home) / ".codewhale" / "sessions" / f"{sid}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    messages = [
-        {"role": "user", "content": [
-            {"type": "text", "text": "please check zebracorncodewhale"},
-            {"type": "text", "text": f"<turn_meta>\nCurrent workspace: {cwd}\nzebracorninjected\n</turn_meta>"}]},
-        {"role": "assistant", "content": [
-            {"type": "thinking", "thinking": "zebracornthinking"},
-            {"type": "tool_use", "id": "call_1", "name": "bash", "input": {"command": "echo hi-codewhale"}}]},
-        {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "call_1", "content": "hi zebracorncodewhaletool"}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "done: zebracorncodewhale"}]},
-    ]
-    entries, parent = [], None
-    for i, message in enumerate(messages):
-        entry = {"id": f"e{i}", "kind": "message", "message": message,
-                 "created_at": "2026-10-01T00:00:00Z", "spawn_depth": 0}
-        if parent:
-            entry["parent_id"] = parent
-        entries.append(entry)
-        parent = entry["id"]
-    session = {
-        "schema_version": 1,
-        "metadata": {"id": sid, "title": "please check zebracorncodewhale",
-                     "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z",
-                     "message_count": 4, "total_tokens": 0, "model": "deepseek-flash",
-                     "model_provider": "deepseek", "workspace": cwd, "mode": "agent"},
-        "messages": messages,
-        "journal": {"entries": entries, "leaf_id": parent, "schema_version": 1, "spawn_depth": 0},
-        "leaf_id": parent,
-        "system_prompt": "## Codewhale\nzebracorninjected system prompt",
-    }
-    path.write_text(json.dumps(session, indent=2), encoding="utf-8")
-    return str(path)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Reasonix ─ state root = $REASONIX_STATE_HOME | $REASONIX_HOME | ~/.reasonix
-#   2.x (Studio, Go):      <state>/[projects/<slug>/]sessions/<stem>.jsonl  (+ <stem>.events.jsonl
-#                          schema 1/3 replace|append records; may hold newer turns than the .jsonl)
-#   1.x 1.38.2–1.38.7:     same names, but <stem>.events.jsonl is a schema 2 DAG log
-#   1.x ≥1.38.8 (npm):     <state>/projects/<slug>/sessions-v4/<id>/events.frames
-#                          (RX4F frames of zstd JSON records; big payloads in ../.content-v1)
-# ─────────────────────────────────────────────────────────────────────────────
-
-_reasonix_REASONIX_SIDECARS = (".events.jsonl", ".conflicts.jsonl", ".guardian.jsonl", ".wire.jsonl",
-                      ".adjudication.jsonl", ".execution.jsonl", ".turns.jsonl")
-
-
-def reasonix_roots():
-    state = _env_path("REASONIX_STATE_HOME", "REASONIX_HOME")
-    if state:
-        return [state]
-    roots = [Path.home() / ".reasonix"]
-    # pre-dotdir installs kept state in the OS config dir
-    if sys.platform == "darwin":
-        roots.append(Path.home() / "Library" / "Application Support" / "reasonix")
-    else:
-        xdg = os.environ.get("XDG_CONFIG_HOME")
-        roots.append((Path(xdg).expanduser() if xdg else Path.home() / ".config") / "reasonix")
-    return roots
-
-
-def _reasonix_reasonix_session_dirs(state):
-    """<state>/sessions plus <state>/projects/<slug>/sessions; sessions-v4 sits beside each."""
-    dirs = [state / "sessions"]
-    try:
-        dirs += [d / "sessions" for d in sorted((state / "projects").iterdir()) if d.is_dir()] \
-            if (state / "projects").is_dir() else []
-    except OSError:
-        pass
-    return dirs
-
-
-def reasonix_list():
-    logs = []
-    for state in reasonix_roots():
-        for sessions in _reasonix_reasonix_session_dirs(state):
-            for path in _rglob(sessions, "*.jsonl"):
-                rel = path.relative_to(sessions).parts
-                if any(p.startswith(".") or p.endswith(".ckpt") or p.endswith(".inbox") for p in rel[:-1]):
-                    continue
-                if path.name.endswith(_reasonix_REASONIX_SIDECARS):
-                    continue
-                events = path.with_name(path.name[:-len(".jsonl")] + ".events.jsonl")
-                try:
-                    st = path.stat()
-                    ev = events.stat() if events.exists() else None
-                except OSError:
-                    continue
-                mtime = max(st.st_mtime, ev.st_mtime if ev else 0)
-                logs.append((str(path), mtime, st.st_size + (ev.st_size if ev else 0), "reasonix"))
-            v4 = sessions.parent / "sessions-v4"
-            try:
-                session_dirs = sorted(v4.iterdir()) if v4.is_dir() else []
-            except OSError:
-                session_dirs = []
-            for sdir in session_dirs:
-                frames = sdir / "events.frames"
-                if sdir.name.startswith(".") or not (sdir / "manifest.json").is_file() or not frames.is_file():
-                    continue
-                imported = sessions / f"v4-{sdir.name}.jsonl"  # a 2.x import of this 1.x session
-                try:
-                    if imported.exists() and imported.stat().st_mtime >= frames.stat().st_mtime:
-                        continue
-                except OSError:
-                    pass
-                logs.extend(_file_logs([frames], "reasonix"))
-    return logs
-
-
-def _reasonix_rx4f_records(frames_path):
-    """Decode an RX4F log: 12-byte header (magic, compressed len, raw len; big-endian)
-    then one zstd frame per JSON record. A torn tail is a write in progress."""
-    try:
-        data = Path(frames_path).read_bytes()
-    except OSError:
-        return []
-    chunks, sizes, off = [], [], 0
-    while off + 12 <= len(data) and data[off:off + 4] == b"RX4F":
-        clen, rlen = struct.unpack(">II", data[off + 4:off + 12])
-        if off + 12 + clen > len(data):
-            break
-        chunks.append(data[off + 12:off + 12 + clen])
-        sizes.append(rlen)
-        off += 12 + clen
-    if not chunks:
-        return []
-    # zstd frames concatenate: decode them in one pass with navcom's reader, then split.
-    with tempfile.NamedTemporaryFile(suffix=".zst", delete=False) as tmp:
-        tmp.write(b"".join(chunks))
-    try:
-        raw = read_zstd(tmp.name)
-    finally:
-        os.unlink(tmp.name)
-    records, pos = [], 0
-    for size in sizes:
-        piece = raw[pos:pos + size]
-        pos += size
-        try:
-            records.append(json.loads(piece))
-        except Exception:
-            break
-    return records
-
-
-def _reasonix_reasonix_v4(frames_path):
-    """-> (messages, title). Keeps every message the log ever committed (upserts in
-    place; retracted and history-replaced messages are kept), in first-seen order."""
-    sdir = Path(frames_path).parent
-    manifest = _reasonix_load_json(sdir / "manifest.json") or {}
-    pool = (sdir if manifest.get("contentRoot") == ".content-v1" else sdir.parent) / ".content-v1"
-    order, by_id, title, pending = [], {}, "", []
-
-    def body_of(event):
-        ref = event.get("payloadRef")
-        try:
-            if isinstance(ref, dict) and len(str(ref.get("digest", ""))) == 64:
-                d = ref["digest"]
-                return json.loads((pool / "objects" / d[:2] / d[2:4] / d).read_bytes())
-            if event.get("payload"):
-                return json.loads(base64.b64decode(event["payload"]))
-        except Exception:
-            pass
-        return {}
-
-    def add(message):
-        if not isinstance(message, dict):
-            return
-        mid = message.get("id")
-        if mid and mid in by_id:
-            order[by_id[mid]] = message
-        else:
-            if mid:
-                by_id[mid] = len(order)
-            order.append(message)
-
-    for rec in _reasonix_rx4f_records(frames_path):
-        kind = rec.get("recordType")
-        if kind == "batch/begin":
-            pending = []
-        elif kind == "batch/event" and isinstance(rec.get("event"), dict):
-            pending.append(rec["event"])
-        elif kind == "batch/end":
-            for event in pending:
-                ek = event.get("kind")
-                if ek in ("message/complete", "message/upsert"):
-                    msg = body_of(event).get("message")
-                    if ek == "message/complete" and isinstance(msg, dict) and msg.get("id") in by_id:
-                        continue
-                    add(msg)
-                elif ek in ("history/replace", "legacy/import"):
-                    for msg in body_of(event).get("messages") or []:
-                        if not (isinstance(msg, dict) and msg.get("id") in by_id):
-                            add(msg)
-                elif ek == "session/title":
-                    title = str(body_of(event).get("title") or "").strip() or title
-            pending = []
-    return order, title
-
-
-def _reasonix_reasonix_events_kind(events_path):
-    for rec in _reasonix_jsonl(events_path):
-        return rec.get("schema_version")
-    return None
-
-
-def _reasonix_reasonix_dag(events_path):
-    """1.x schema 2 DAG log: every message node of every head, patches/redactions applied."""
-    order, by_id = [], {}
-    for rec in _reasonix_jsonl(events_path):
-        kind = rec.get("type")
-        if kind == "message" and rec.get("id") and rec["id"] not in by_id:
-            msgs = rec.get("msgs") or []
-            if msgs and isinstance(msgs[0], dict):
-                by_id[rec["id"]] = len(order)
-                order.append(msgs[0])
-        elif kind == "patch" and rec.get("target") in by_id:
-            msgs = rec.get("msgs") or []
-            if msgs and isinstance(msgs[0], dict):
-                order[by_id[rec["target"]]] = msgs[0]
-        elif kind == "redact" and isinstance(rec.get("targets"), dict):
-            for target, msgs in rec["targets"].items():
-                if target in by_id and msgs and isinstance(msgs[0], dict):
-                    order[by_id[target]] = msgs[0]
-    return order
-
-
-def _reasonix_reasonix_replay(events_path):
-    """2.x schema 1/3 log: replace resets, append extends. Messages a later replace
-    dropped (rewinds, compaction) are kept, in first-seen order."""
-    snapshots, cur, records = [], [], 0
-    for rec in _reasonix_jsonl(events_path):
-        msgs = rec.get("messages") if isinstance(rec.get("messages"), list) else []
-        msgs = [m for m in msgs if isinstance(m, dict)]
-        if rec.get("type") == "replace":
-            snapshots.append(cur)
-            cur = msgs
-        elif rec.get("type") == "append":
-            idx = rec.get("message_index")
-            cur = cur[:idx if isinstance(idx, int) else len(cur)] + msgs
-        else:
-            continue
-        records += 1
-    if not records:
-        return None
-    out, seen = [], set()
-    for snap in snapshots + [cur]:
-        counts = {}
-        for msg in snap:
-            sig = json.dumps(msg, sort_keys=True, ensure_ascii=False)
-            counts[sig] = counts.get(sig, 0) + 1
-            if (sig, counts[sig]) not in seen:
-                seen.add((sig, counts[sig]))
-                out.append(msg)
-    return out
-
-
-def _reasonix_reasonix_messages(key):
-    if key.endswith("events.frames"):
-        return _reasonix_reasonix_v4(key)[0]
-    events = key[:-len(".jsonl")] + ".events.jsonl"
-    if os.path.exists(events):
-        schema = _reasonix_reasonix_events_kind(events)
-        msgs = _reasonix_reasonix_dag(events) if schema == 2 else _reasonix_reasonix_replay(events)
-        if msgs:
-            return msgs
-    return list(_reasonix_jsonl(key))
-
-
-def _reasonix_openai_calls(tool_calls):
-    for call in tool_calls if isinstance(tool_calls, list) else []:
-        if not isinstance(call, dict):
-            continue
-        fn = call.get("function") if isinstance(call.get("function"), dict) else call
-        yield call.get("id"), fn.get("name") or call.get("resolved_name"), _reasonix_args(fn.get("arguments"))
-
-
-@_reasonix_tolerant
-def reasonix_iter(key):
-    calls = {}
-    for msg in _reasonix_reasonix_messages(key):
-        role = msg.get("role")
-        if role == "user":
-            if msg.get("host_authored") or msg.get("origin") == "host":
-                continue  # session-context snapshots, steer notes: injected
-            raw = msg.get("raw_content")
-            text = raw if isinstance(raw, str) and raw.strip() else _reasonix_strip_injected(_text_of(msg.get("content")))
-            if text.strip():
-                yield "user", text
-        elif role == "assistant":
-            text = _text_of(msg.get("content"))
-            if text.strip():
-                yield "assistant", text.strip()
-            for cid, name, args in _reasonix_openai_calls(msg.get("tool_calls")):
-                calls[cid] = _call_label(name, args)
-                cmd = _shell_cmd(name, args)
-                if cmd:
-                    yield "cmd", cmd
-        elif role == "tool":
-            output = msg.get("content")
-            if isinstance(output, list):
-                output = _text_of(output)
-            label = calls.get(msg.get("tool_call_id")) or msg.get("name") or "tool"
-            turn = tool_turn(label, output)
-            if turn:
-                yield turn
-
-
-_reasonix_WORKSPACE_RE = re.compile(r'Current workspace: "([^"]+)"')
-
-
-@_reasonix_safe_str
-def reasonix_project(key):
-    for msg in _reasonix_reasonix_messages(key)[:8]:
-        if msg.get("role") in ("user", "system"):
-            m = _reasonix_WORKSPACE_RE.search(_text_of(msg.get("content")) or "")
-            if m:
-                return m.group(1)
-    parts = Path(key).parts
-    if "projects" in parts:
-        i = len(parts) - 1 - parts[::-1].index("projects")
-        if i + 1 < len(parts):
-            return parts[i + 1]  # lossy slug (/ → -), same as navcom does for Claude
-    return ""
-
-
-@_reasonix_safe_str
-def reasonix_title(key):
-    if key.endswith("events.frames"):
-        title = _reasonix_reasonix_v4(key)[1]
-        if title:
-            return title
-        cache = _reasonix_load_json(Path(key).parent.parent / ".query-cache" / Path(key).parent.name / "catalog-metadata.json")
-        return str((cache or {}).get("title") or "").strip()
-    meta = _reasonix_load_json(key + ".meta") or {}
-    return str(meta.get("title") or "").strip()  # 2.x keeps only a preview of the first prompt
-
-
-def reasonix_v4_fixture(home, cwd):
-    """A 1.x sessions-v4 store (RX4F frames), built with the zstd CLI."""
-    import hashlib
-    import subprocess
-    sid = "0123456789abcdef0123456789abcdef"
-    sdir = Path(home) / ".reasonix" / "projects" / cwd.replace("/", "-") / "sessions-v4" / sid
-    sdir.mkdir(parents=True, exist_ok=True)
-    (sdir / "manifest.json").write_text(json.dumps({
-        "schemaVersion": 4, "codec": "reasonix.session.linear/v4", "storageRevision": 3,
-        "contentRoot": "../.content-v1", "sessionId": sid, "createdAt": "2026-10-01T00:00:00Z",
-        "writerGeneration": 1, "kind": "headless-run"}), encoding="utf-8")
-    big = json.dumps({"message": {"role": "tool", "id": "m5", "content": "hi zebracornreasonixv4tool\n",
-                                  "tool_call_id": "c1", "name": "bash"}}).encode()
-    digest = hashlib.sha256(big).hexdigest()
-    obj = sdir.parent / ".content-v1" / "objects" / digest[:2] / digest[2:4] / digest
-    obj.parent.mkdir(parents=True, exist_ok=True)
-    obj.write_bytes(big)
-    events = [
-        ("message/complete", {"message": {"role": "user", "id": "m1", "origin": "host",
-                                          "content": f'<session-context version="1">\n## Workspace\n\nCurrent workspace: "{cwd}"\nzebracorninjected\n</session-context>'}}),
-        ("message/complete", {"message": {"role": "user", "id": "m2", "origin": "user",
-                                          "content": "v4 zebracornreasonixv4", "raw_content": "v4 zebracornreasonixv4"}}),
-        ("message/complete", {"message": {"role": "assistant", "id": "m3", "reasoning_content": "zebracornthinking",
-                                          "tool_calls": [{"id": "c1", "name": "bash",
-                                                          "arguments": json.dumps({"command": "echo hi-reasonixv4"})}]}}),
-        ("message/complete", None),  # payload in the content pool
-        ("message/complete", {"message": {"role": "assistant", "id": "m6", "content": "done zebracornreasonixv4"}}),
-        ("session/title", {"title": "v4 zebracorn title"}),
-    ]
-    out = bytearray()
-
-    def frame(rec):
-        raw = json.dumps(rec).encode()
-        comp = subprocess.run(["zstd", "-q", "-c"], input=raw, capture_output=True).stdout
-        out.extend(b"RX4F" + struct.pack(">II", len(comp), len(raw)) + comp)
-
-    head = {"schemaVersion": 4, "codec": "reasonix.session.linear/v4"}
-    for seq, (kind, body) in enumerate(events, start=1):
-        frame({**head, "recordType": "batch/begin", "commitId": f"c{seq}", "firstSeq": seq, "eventCount": 1})
-        ev = {"id": f"e{seq}", "seq": seq, "kind": kind}
-        if body is None:
-            ev["payloadRef"] = {"digest": digest, "bytes": len(big)}
-        else:
-            ev["payload"] = base64.b64encode(json.dumps(body).encode()).decode()
-        frame({**head, "recordType": "batch/event", "event": ev})
-        frame({**head, "recordType": "batch/end", "commitId": f"c{seq}", "firstSeq": seq, "eventCount": 1, "sha256": ""})
-    (sdir / "events.frames").write_bytes(bytes(out))
-    return str(sdir / "events.frames")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Deep Code (lessweb/deepcode-cli, npm @vegamo/deepcode-cli)
-#   ~/.deepcode/projects/<cwd with / → ->/<sessionId>.jsonl  (+ sessions-index.json)
-#   os.homedir() only; no env override.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def deepcode_roots():
-    return [Path.home() / ".deepcode" / "projects"]
-
-
-def deepcode_list():
-    paths = []
-    for root in deepcode_roots():
-        try:
-            paths += sorted(root.glob("*/*.jsonl")) if root.is_dir() else []
-        except OSError:
-            pass
-    return _file_logs(paths, "deepcode")
-
-
-def _reasonix_deepcode_tool_output(content):
-    """Tool results are a JSON envelope {"ok","name","output"|"error","metadata":{exitCode…}}."""
-    if not isinstance(content, str):
-        return content
-    try:
-        env = json.loads(content)
-    except Exception:
-        return content
-    if not isinstance(env, dict) or not ({"output", "error", "ok"} & set(env)):
-        return content
-    body = env.get("output")
-    if not isinstance(body, str):
-        body = json.dumps(body, ensure_ascii=False) if body not in (None, "") else ""
-    meta = env.get("metadata") if isinstance(env.get("metadata"), dict) else {}
-    code = meta.get("exitCode")
-    head = []
-    if env.get("ok") is False:
-        head.append("error" + (f": {env['error']}" if isinstance(env.get("error"), str) else ""))
-    if code not in (None, 0):
-        head.append(f"exit {code}")
-    return "\n".join(head + [body]).strip()
-
-
-@_reasonix_tolerant
-def deepcode_iter(key):
-    calls = {}
-    for msg in _reasonix_jsonl(key):
-        role = msg.get("role")
-        params = msg.get("messageParams") if isinstance(msg.get("messageParams"), dict) else {}
-        meta = msg.get("meta") if isinstance(msg.get("meta"), dict) else {}
-        if role == "user":
-            prompt = meta.get("userPrompt") if isinstance(meta.get("userPrompt"), dict) else {}
-            text = prompt.get("text") if isinstance(prompt.get("text"), str) else _text_of(msg.get("content"))
-            if text and text.strip():
-                yield "user", text
-        elif role == "assistant":
-            text = _text_of(msg.get("content"))
-            if text.strip():
-                yield "assistant", text.strip()
-            for cid, name, args in _reasonix_openai_calls(params.get("tool_calls")):
-                calls[cid] = _call_label(name, args)
-                cmd = _shell_cmd(name, args)
-                if cmd:
-                    yield "cmd", cmd
-        elif role == "tool":
-            label = calls.get(params.get("tool_call_id"))
-            if not label and isinstance(meta.get("function"), dict):
-                fn = meta["function"]
-                label = _call_label(fn.get("name"), _reasonix_args(fn.get("arguments")))
-            turn = tool_turn(label or "tool", _reasonix_deepcode_tool_output(msg.get("content")))
-            if turn:
-                yield turn
-        # system: prompt, environment, skill bodies, compaction summaries (meta.isSummary)
-
-
-def _reasonix_deepcode_index_entry(key):
-    index = _reasonix_load_json(Path(key).parent / "sessions-index.json") or {}
-    sid = Path(key).stem
-    for entry in index.get("entries") or []:
-        if isinstance(entry, dict) and entry.get("id") == sid:
-            return index, entry
-    return index, {}
-
-
-_reasonix_ROOT_PATH_RE = re.compile(r'"root path":\s*"((?:[^"\\]|\\.)*)"')
-
-
-@_reasonix_safe_str
-def deepcode_project(key):
-    index, _ = _reasonix_deepcode_index_entry(key)
-    if isinstance(index.get("originalPath"), str) and index["originalPath"]:
-        return index["originalPath"]
-    for msg in _reasonix_jsonl(key):
-        if msg.get("role") == "system":
-            m = _reasonix_ROOT_PATH_RE.search(_text_of(msg.get("content")) or "")
-            if m:
-                try:
-                    return json.loads(f'"{m.group(1)}"')
-                except Exception:
-                    return m.group(1)
-        elif msg.get("role") == "user":
-            break
-    return Path(key).parent.name
-
-
-@_reasonix_safe_str
-def deepcode_title(key):
-    _, entry = _reasonix_deepcode_index_entry(key)
-    return str(entry.get("summary") or "").strip()
-
-
-def deepcode_fixture(home, cwd):
-    sid = "6f1c2d3e-4a5b-4c6d-8e7f-001122334455"
-    pdir = Path(home) / ".deepcode" / "projects" / cwd.replace("/", "-")
-    pdir.mkdir(parents=True, exist_ok=True)
-    base = {"sessionId": sid, "contentParams": None, "compacted": False,
-            "createTime": "2026-10-01T00:00:00.000Z", "updateTime": "2026-10-01T00:00:00.000Z"}
-    args = json.dumps({"command": "echo hi-deepcode", "description": "say hi", "sideEffects": ["read-in-cwd"]})
-    rows = [
-        {**base, "id": "s1", "role": "system", "content": "You are a helpful software engineer assistant.",
-         "messageParams": None, "visible": False},
-        {**base, "id": "s2", "role": "system",
-         "content": f'# Local Workspace Environment\n```json\n{{"root path": "{cwd}"}}\n```\nzebracorninjected',
-         "messageParams": None, "visible": False},
-        {**base, "id": "u1", "role": "user", "content": "hello zebracorndeepcode", "messageParams": None,
-         "visible": True, "meta": {"userPrompt": {"text": "hello zebracorndeepcode"}}},
-        {**base, "id": "a1", "role": "assistant", "content": " ", "visible": False,
-         "messageParams": {"tool_calls": [{"id": "call_1", "type": "function",
-                                           "function": {"name": "bash", "arguments": args}}],
-                           "reasoning_content": "zebracornthinking"},
-         "meta": {"asThinking": True}},
-        {**base, "id": "t1", "role": "tool", "visible": True, "messageParams": {"tool_call_id": "call_1"},
-         "content": json.dumps({"ok": True, "name": "bash", "output": "hi zebracorndeepcodetool\n",
-                                "metadata": {"exitCode": 0, "cwd": cwd}}, indent=2),
-         "meta": {"function": {"name": "bash", "arguments": args}}},
-        {**base, "id": "s3", "role": "system", "content": "There are earlier parts of the conversation. zebracorninjected",
-         "messageParams": None, "visible": False, "meta": {"isSummary": True}},
-        {**base, "id": "a2", "role": "assistant", "content": "all done zebracorndeepcode", "visible": True,
-         "messageParams": {"reasoning_content": "zebracornthinking"}},
-    ]
-    path = pdir / f"{sid}.jsonl"
-    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
-    (pdir / "sessions-index.json").write_text(json.dumps({
-        "version": 1, "originalPath": cwd,
-        "entries": [{"id": sid, "summary": "hello zebracorndeepcode", "assistantReply": "all done",
-                     "status": "completed", "createTime": base["createTime"], "updateTime": base["updateTime"]}]},
-        indent=2), encoding="utf-8")
-    return str(path)
-
-
-# ── Deep Code (deepcode) ─────────────────────────────────────────────────────
-# navcom parsers for three DeepSeek-first harnesses: Codewhale, Reasonix, Deep Code.
-#
-# The same file is copied into harness/codewhale, harness/reasonix and harness/deepcode.
-
-def _deepcode_load_json(path):
-    try:
-        return json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
-    except Exception:
-        return None
-
-
-def _deepcode_jsonl(path):
-    try:
-        handle = open(path, "r", encoding="utf-8", errors="replace")
-    except OSError:
-        return
-    with handle:
-        for line in handle:
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            if isinstance(obj, dict):
-                yield obj
-
-
-def _deepcode_tolerant(gen_fn):
-    """Odd records end a transcript early instead of raising into the indexer."""
-    def wrapper(key):
-        try:
-            yield from gen_fn(key)
-        except Exception:
-            return
-    wrapper.__name__ = gen_fn.__name__
-    return wrapper
-
-
-def _deepcode_safe_str(fn):
-    def wrapper(key):
-        try:
-            return fn(key) or ""
-        except Exception:
-            return ""
-    wrapper.__name__ = fn.__name__
-    return wrapper
-
-
-def _deepcode_args(raw):
-    if isinstance(raw, str):
-        try:
-            return json.loads(raw)
-        except Exception:
-            return raw
-    return raw
-
-
-# A text part that is one whole XML-ish element is host-injected context
-# (<turn_meta>, <session_goal>, <workspace>, <session-context>, <system-reminder>, …).
-_deepcode_INJECTED_BLOCK_RE = re.compile(r"^\s*<([A-Za-z][\w-]*)\b[^>]*>.*</\1>\s*$|^\s*<[A-Za-z][\w-]*\b[^>]*/>\s*$", re.S)
-_deepcode_EDGE_BLOCK_RE = re.compile(r"\A\s*<([A-Za-z][\w-]*)\b[^>]*>\n.*?\n</\1>\s*|\s*<([A-Za-z][\w-]*)\b[^>]*>\n.*?\n</\2>\s*\Z", re.S)
-
-
-def _deepcode_strip_injected(text):
-    """Drop whole injected XML blocks wrapped around typed text (leading or trailing)."""
-    if not isinstance(text, str):
-        return ""
-    if _deepcode_INJECTED_BLOCK_RE.match(text):
-        return ""
-    prev = None
-    while prev != text:
-        prev, text = text, _deepcode_EDGE_BLOCK_RE.sub("", text, count=1)
-    return text.strip()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Codewhale (formerly DeepSeek-TUI) ─ $CODEWHALE_HOME/sessions/<id>.json
-#   legacy ~/.deepseek/sessions (migrated by move, or copied when the move fails)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def codewhale_roots():
-    explicit = _env_path("CODEWHALE_HOME")
-    if explicit:
-        return [explicit / "sessions"]  # an explicit home never falls back to ~/.deepseek
-    return [Path.home() / ".codewhale" / "sessions", Path.home() / ".deepseek" / "sessions"]
-
-
-def codewhale_list():
-    seen, paths = set(), []
-    for root in codewhale_roots():
-        try:
-            entries = sorted(root.glob("*.json")) if root.is_dir() else []
-        except OSError:
-            entries = []
-        for path in entries:
-            # session_boot_owners.json etc. are bookkeeping; checkpoints/ and
-            # .work-graph-import-archive/ hold copies of the same sessions.
-            if path.name in seen or path.name == "session_boot_owners.json":
-                continue
-            seen.add(path.name)
-            paths.append(path)
-    return _file_logs(paths, "codewhale")
-
-
-def _deepcode_codewhale_messages(session):
-    """Every message the session ever held: the append-only journal (all branches,
-    pre-compaction turns included) when present, else the flat messages list."""
-    journal = session.get("journal") if isinstance(session.get("journal"), dict) else {}
-    entries = journal.get("entries") if isinstance(journal.get("entries"), list) else []
-    if entries:
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            kind = entry.get("kind")
-            if kind == "message" and isinstance(entry.get("message"), dict):
-                yield entry["message"]
-            elif kind in ("user", "assistant") and isinstance(entry.get("text"), str):
-                yield {"role": kind, "content": [{"type": "text", "text": entry["text"]}]}
-            # compaction / branch_summary / system: generated context, not typed or said
-        return
-    messages = session.get("messages")
-    for message in messages if isinstance(messages, list) else []:
-        if isinstance(message, dict):
-            yield message
-
-
-@_deepcode_tolerant
-def codewhale_iter(key):
-    session = _deepcode_load_json(key)
-    if not isinstance(session, dict):
-        return
-    calls = {}
-    for message in _deepcode_codewhale_messages(session):
-        role = message.get("role")
-        content = message.get("content")
-        if isinstance(content, str):
-            content = [{"type": "text", "text": content}]
-        if not isinstance(content, list) or role == "system":
-            continue
-        texts = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            kind = block.get("type")
-            if kind == "text" and isinstance(block.get("text"), str):
-                text = block["text"]
-                if role == "user":
-                    text = _deepcode_strip_injected(text)
-                elif role == "assistant_interrupted":
-                    text = text.replace(
-                        "[The following assistant output was interrupted before completion and may be incomplete or wrong]\n", "")
-                if text.strip():
-                    texts.append(text)
-            elif kind in ("tool_use", "server_tool_use"):
-                if texts:
-                    yield ("user" if role == "user" else "assistant"), "\n".join(texts)
-                    texts = []
-                args = _deepcode_args(block.get("input"))
-                calls[block.get("id")] = _call_label(block.get("name"), args)
-                cmd = _shell_cmd(block.get("name"), args)
-                if cmd:
-                    yield "cmd", cmd
-            elif kind in ("tool_result", "tool_search_tool_result", "code_execution_tool_result"):
-                output = block.get("content")
-                if (not isinstance(output, str) or not output.strip()) and block.get("content_blocks"):
-                    output = block["content_blocks"]
-                if block.get("is_error"):
-                    output = "error\n" + (output if isinstance(output, str) else _text_of(output))
-                turn = tool_turn(calls.get(block.get("tool_use_id"), "tool"), output)
-                if turn:
-                    yield turn
-            # thinking / image_url: skipped
-        if texts:
-            yield ("user" if role == "user" else "assistant"), "\n".join(texts)
-
-
-def _deepcode_codewhale_meta(key):
-    session = _deepcode_load_json(key)
-    meta = session.get("metadata") if isinstance(session, dict) else None
-    return meta if isinstance(meta, dict) else {}
-
-
-@_deepcode_safe_str
-def codewhale_project(key):
-    return str(_deepcode_codewhale_meta(key).get("workspace") or "")
-
-
-@_deepcode_safe_str
-def codewhale_title(key):
-    return str(_deepcode_codewhale_meta(key).get("title") or "")
-
-
-def codewhale_fixture(home, cwd):
-    sid = "0f0e0d0c-0b0a-4009-8807-060504030201"
-    path = Path(home) / ".codewhale" / "sessions" / f"{sid}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    messages = [
-        {"role": "user", "content": [
-            {"type": "text", "text": "please check zebracorncodewhale"},
-            {"type": "text", "text": f"<turn_meta>\nCurrent workspace: {cwd}\nzebracorninjected\n</turn_meta>"}]},
-        {"role": "assistant", "content": [
-            {"type": "thinking", "thinking": "zebracornthinking"},
-            {"type": "tool_use", "id": "call_1", "name": "bash", "input": {"command": "echo hi-codewhale"}}]},
-        {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "call_1", "content": "hi zebracorncodewhaletool"}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "done: zebracorncodewhale"}]},
-    ]
-    entries, parent = [], None
-    for i, message in enumerate(messages):
-        entry = {"id": f"e{i}", "kind": "message", "message": message,
-                 "created_at": "2026-10-01T00:00:00Z", "spawn_depth": 0}
-        if parent:
-            entry["parent_id"] = parent
-        entries.append(entry)
-        parent = entry["id"]
-    session = {
-        "schema_version": 1,
-        "metadata": {"id": sid, "title": "please check zebracorncodewhale",
-                     "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z",
-                     "message_count": 4, "total_tokens": 0, "model": "deepseek-flash",
-                     "model_provider": "deepseek", "workspace": cwd, "mode": "agent"},
-        "messages": messages,
-        "journal": {"entries": entries, "leaf_id": parent, "schema_version": 1, "spawn_depth": 0},
-        "leaf_id": parent,
-        "system_prompt": "## Codewhale\nzebracorninjected system prompt",
-    }
-    path.write_text(json.dumps(session, indent=2), encoding="utf-8")
-    return str(path)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Reasonix ─ state root = $REASONIX_STATE_HOME | $REASONIX_HOME | ~/.reasonix
-#   2.x (Studio, Go):      <state>/[projects/<slug>/]sessions/<stem>.jsonl  (+ <stem>.events.jsonl
-#                          schema 1/3 replace|append records; may hold newer turns than the .jsonl)
-#   1.x 1.38.2–1.38.7:     same names, but <stem>.events.jsonl is a schema 2 DAG log
-#   1.x ≥1.38.8 (npm):     <state>/projects/<slug>/sessions-v4/<id>/events.frames
-#                          (RX4F frames of zstd JSON records; big payloads in ../.content-v1)
-# ─────────────────────────────────────────────────────────────────────────────
-
-_deepcode_REASONIX_SIDECARS = (".events.jsonl", ".conflicts.jsonl", ".guardian.jsonl", ".wire.jsonl",
-                      ".adjudication.jsonl", ".execution.jsonl", ".turns.jsonl")
-
-
-def reasonix_roots():
-    state = _env_path("REASONIX_STATE_HOME", "REASONIX_HOME")
-    if state:
-        return [state]
-    roots = [Path.home() / ".reasonix"]
-    # pre-dotdir installs kept state in the OS config dir
-    if sys.platform == "darwin":
-        roots.append(Path.home() / "Library" / "Application Support" / "reasonix")
-    else:
-        xdg = os.environ.get("XDG_CONFIG_HOME")
-        roots.append((Path(xdg).expanduser() if xdg else Path.home() / ".config") / "reasonix")
-    return roots
-
-
-def _deepcode_reasonix_session_dirs(state):
-    """<state>/sessions plus <state>/projects/<slug>/sessions; sessions-v4 sits beside each."""
-    dirs = [state / "sessions"]
-    try:
-        dirs += [d / "sessions" for d in sorted((state / "projects").iterdir()) if d.is_dir()] \
-            if (state / "projects").is_dir() else []
-    except OSError:
-        pass
-    return dirs
-
-
-def reasonix_list():
-    logs = []
-    for state in reasonix_roots():
-        for sessions in _deepcode_reasonix_session_dirs(state):
-            for path in _rglob(sessions, "*.jsonl"):
-                rel = path.relative_to(sessions).parts
-                if any(p.startswith(".") or p.endswith(".ckpt") or p.endswith(".inbox") for p in rel[:-1]):
-                    continue
-                if path.name.endswith(_deepcode_REASONIX_SIDECARS):
-                    continue
-                events = path.with_name(path.name[:-len(".jsonl")] + ".events.jsonl")
-                try:
-                    st = path.stat()
-                    ev = events.stat() if events.exists() else None
-                except OSError:
-                    continue
-                mtime = max(st.st_mtime, ev.st_mtime if ev else 0)
-                logs.append((str(path), mtime, st.st_size + (ev.st_size if ev else 0), "reasonix"))
-            v4 = sessions.parent / "sessions-v4"
-            try:
-                session_dirs = sorted(v4.iterdir()) if v4.is_dir() else []
-            except OSError:
-                session_dirs = []
-            for sdir in session_dirs:
-                frames = sdir / "events.frames"
-                if sdir.name.startswith(".") or not (sdir / "manifest.json").is_file() or not frames.is_file():
-                    continue
-                imported = sessions / f"v4-{sdir.name}.jsonl"  # a 2.x import of this 1.x session
-                try:
-                    if imported.exists() and imported.stat().st_mtime >= frames.stat().st_mtime:
-                        continue
-                except OSError:
-                    pass
-                logs.extend(_file_logs([frames], "reasonix"))
-    return logs
-
-
-def _deepcode_rx4f_records(frames_path):
-    """Decode an RX4F log: 12-byte header (magic, compressed len, raw len; big-endian)
-    then one zstd frame per JSON record. A torn tail is a write in progress."""
-    try:
-        data = Path(frames_path).read_bytes()
-    except OSError:
-        return []
-    chunks, sizes, off = [], [], 0
-    while off + 12 <= len(data) and data[off:off + 4] == b"RX4F":
-        clen, rlen = struct.unpack(">II", data[off + 4:off + 12])
-        if off + 12 + clen > len(data):
-            break
-        chunks.append(data[off + 12:off + 12 + clen])
-        sizes.append(rlen)
-        off += 12 + clen
-    if not chunks:
-        return []
-    # zstd frames concatenate: decode them in one pass with navcom's reader, then split.
-    with tempfile.NamedTemporaryFile(suffix=".zst", delete=False) as tmp:
-        tmp.write(b"".join(chunks))
-    try:
-        raw = read_zstd(tmp.name)
-    finally:
-        os.unlink(tmp.name)
-    records, pos = [], 0
-    for size in sizes:
-        piece = raw[pos:pos + size]
-        pos += size
-        try:
-            records.append(json.loads(piece))
-        except Exception:
-            break
-    return records
-
-
-def _deepcode_reasonix_v4(frames_path):
-    """-> (messages, title). Keeps every message the log ever committed (upserts in
-    place; retracted and history-replaced messages are kept), in first-seen order."""
-    sdir = Path(frames_path).parent
-    manifest = _deepcode_load_json(sdir / "manifest.json") or {}
-    pool = (sdir if manifest.get("contentRoot") == ".content-v1" else sdir.parent) / ".content-v1"
-    order, by_id, title, pending = [], {}, "", []
-
-    def body_of(event):
-        ref = event.get("payloadRef")
-        try:
-            if isinstance(ref, dict) and len(str(ref.get("digest", ""))) == 64:
-                d = ref["digest"]
-                return json.loads((pool / "objects" / d[:2] / d[2:4] / d).read_bytes())
-            if event.get("payload"):
-                return json.loads(base64.b64decode(event["payload"]))
-        except Exception:
-            pass
-        return {}
-
-    def add(message):
-        if not isinstance(message, dict):
-            return
-        mid = message.get("id")
-        if mid and mid in by_id:
-            order[by_id[mid]] = message
-        else:
-            if mid:
-                by_id[mid] = len(order)
-            order.append(message)
-
-    for rec in _deepcode_rx4f_records(frames_path):
-        kind = rec.get("recordType")
-        if kind == "batch/begin":
-            pending = []
-        elif kind == "batch/event" and isinstance(rec.get("event"), dict):
-            pending.append(rec["event"])
-        elif kind == "batch/end":
-            for event in pending:
-                ek = event.get("kind")
-                if ek in ("message/complete", "message/upsert"):
-                    msg = body_of(event).get("message")
-                    if ek == "message/complete" and isinstance(msg, dict) and msg.get("id") in by_id:
-                        continue
-                    add(msg)
-                elif ek in ("history/replace", "legacy/import"):
-                    for msg in body_of(event).get("messages") or []:
-                        if not (isinstance(msg, dict) and msg.get("id") in by_id):
-                            add(msg)
-                elif ek == "session/title":
-                    title = str(body_of(event).get("title") or "").strip() or title
-            pending = []
-    return order, title
-
-
-def _deepcode_reasonix_events_kind(events_path):
-    for rec in _deepcode_jsonl(events_path):
-        return rec.get("schema_version")
-    return None
-
-
-def _deepcode_reasonix_dag(events_path):
-    """1.x schema 2 DAG log: every message node of every head, patches/redactions applied."""
-    order, by_id = [], {}
-    for rec in _deepcode_jsonl(events_path):
-        kind = rec.get("type")
-        if kind == "message" and rec.get("id") and rec["id"] not in by_id:
-            msgs = rec.get("msgs") or []
-            if msgs and isinstance(msgs[0], dict):
-                by_id[rec["id"]] = len(order)
-                order.append(msgs[0])
-        elif kind == "patch" and rec.get("target") in by_id:
-            msgs = rec.get("msgs") or []
-            if msgs and isinstance(msgs[0], dict):
-                order[by_id[rec["target"]]] = msgs[0]
-        elif kind == "redact" and isinstance(rec.get("targets"), dict):
-            for target, msgs in rec["targets"].items():
-                if target in by_id and msgs and isinstance(msgs[0], dict):
-                    order[by_id[target]] = msgs[0]
-    return order
-
-
-def _deepcode_reasonix_replay(events_path):
-    """2.x schema 1/3 log: replace resets, append extends. Messages a later replace
-    dropped (rewinds, compaction) are kept, in first-seen order."""
-    snapshots, cur, records = [], [], 0
-    for rec in _deepcode_jsonl(events_path):
-        msgs = rec.get("messages") if isinstance(rec.get("messages"), list) else []
-        msgs = [m for m in msgs if isinstance(m, dict)]
-        if rec.get("type") == "replace":
-            snapshots.append(cur)
-            cur = msgs
-        elif rec.get("type") == "append":
-            idx = rec.get("message_index")
-            cur = cur[:idx if isinstance(idx, int) else len(cur)] + msgs
-        else:
-            continue
-        records += 1
-    if not records:
-        return None
-    out, seen = [], set()
-    for snap in snapshots + [cur]:
-        counts = {}
-        for msg in snap:
-            sig = json.dumps(msg, sort_keys=True, ensure_ascii=False)
-            counts[sig] = counts.get(sig, 0) + 1
-            if (sig, counts[sig]) not in seen:
-                seen.add((sig, counts[sig]))
-                out.append(msg)
-    return out
-
-
-def _deepcode_reasonix_messages(key):
-    if key.endswith("events.frames"):
-        return _deepcode_reasonix_v4(key)[0]
-    events = key[:-len(".jsonl")] + ".events.jsonl"
-    if os.path.exists(events):
-        schema = _deepcode_reasonix_events_kind(events)
-        msgs = _deepcode_reasonix_dag(events) if schema == 2 else _deepcode_reasonix_replay(events)
-        if msgs:
-            return msgs
-    return list(_deepcode_jsonl(key))
-
-
-def _deepcode_openai_calls(tool_calls):
-    for call in tool_calls if isinstance(tool_calls, list) else []:
-        if not isinstance(call, dict):
-            continue
-        fn = call.get("function") if isinstance(call.get("function"), dict) else call
-        yield call.get("id"), fn.get("name") or call.get("resolved_name"), _deepcode_args(fn.get("arguments"))
-
-
-@_deepcode_tolerant
-def reasonix_iter(key):
-    calls = {}
-    for msg in _deepcode_reasonix_messages(key):
-        role = msg.get("role")
-        if role == "user":
-            if msg.get("host_authored") or msg.get("origin") == "host":
-                continue  # session-context snapshots, steer notes: injected
-            raw = msg.get("raw_content")
-            text = raw if isinstance(raw, str) and raw.strip() else _deepcode_strip_injected(_text_of(msg.get("content")))
-            if text.strip():
-                yield "user", text
-        elif role == "assistant":
-            text = _text_of(msg.get("content"))
-            if text.strip():
-                yield "assistant", text.strip()
-            for cid, name, args in _deepcode_openai_calls(msg.get("tool_calls")):
-                calls[cid] = _call_label(name, args)
-                cmd = _shell_cmd(name, args)
-                if cmd:
-                    yield "cmd", cmd
-        elif role == "tool":
-            output = msg.get("content")
-            if isinstance(output, list):
-                output = _text_of(output)
-            label = calls.get(msg.get("tool_call_id")) or msg.get("name") or "tool"
-            turn = tool_turn(label, output)
-            if turn:
-                yield turn
-
-
-_deepcode_WORKSPACE_RE = re.compile(r'Current workspace: "([^"]+)"')
-
-
-@_deepcode_safe_str
-def reasonix_project(key):
-    for msg in _deepcode_reasonix_messages(key)[:8]:
-        if msg.get("role") in ("user", "system"):
-            m = _deepcode_WORKSPACE_RE.search(_text_of(msg.get("content")) or "")
-            if m:
-                return m.group(1)
-    parts = Path(key).parts
-    if "projects" in parts:
-        i = len(parts) - 1 - parts[::-1].index("projects")
-        if i + 1 < len(parts):
-            return parts[i + 1]  # lossy slug (/ → -), same as navcom does for Claude
-    return ""
-
-
-@_deepcode_safe_str
-def reasonix_title(key):
-    if key.endswith("events.frames"):
-        title = _deepcode_reasonix_v4(key)[1]
-        if title:
-            return title
-        cache = _deepcode_load_json(Path(key).parent.parent / ".query-cache" / Path(key).parent.name / "catalog-metadata.json")
-        return str((cache or {}).get("title") or "").strip()
-    meta = _deepcode_load_json(key + ".meta") or {}
-    return str(meta.get("title") or "").strip()  # 2.x keeps only a preview of the first prompt
-
-
-def reasonix_fixture(home, cwd):
-    slug = cwd.replace("/", "-")
-    sessions = Path(home) / ".reasonix" / "projects" / slug / "sessions"
-    sessions.mkdir(parents=True, exist_ok=True)
-    stem = sessions / "20261001-000000.000000000-deepseek-flash"
-    system = {"role": "system", "content": "You are Reasonix, a coding agent. zebracorninjected"}
-    user = {"role": "user",
-            "content": f'<workspace>\nCurrent workspace: "{cwd}".\nzebracorninjected\n</workspace>\n\n'
-                       "run it zebracornreasonix\n\n<execution-policy preset=\"balanced\" version=\"3\">\nverify=targeted\n</execution-policy>",
-            "raw_content": "run it zebracornreasonix", "createdAt": 1790000000000}
-    call = {"role": "assistant", "content": " ", "reasoning_content": "zebracornthinking",
-            "tool_calls": [{"id": "call_1", "name": "bash", "arguments": json.dumps({"command": "echo hi-reasonix"})}]}
-    result = {"role": "tool", "content": "hi zebracornreasonixtool\n", "tool_call_id": "call_1", "name": "bash"}
-    steer = {"role": "user", "content": f'<workspace>\nCurrent workspace: "{cwd}"\n</workspace>\nzebracorninjected steer',
-             "host_authored": True}
-    reply = {"role": "assistant", "content": "done zebracornreasonix"}
-    # checkpoint .jsonl lags the event log: the newest turns exist only in the sidecar
-    with open(f"{stem}.jsonl", "w", encoding="utf-8") as fh:
-        for m in (system, user):
-            fh.write(json.dumps(m) + "\n")
-    with open(f"{stem}.events.jsonl", "w", encoding="utf-8") as fh:
-        fh.write(json.dumps({"schema_version": 1, "type": "replace", "revision": 1, "messages": [system, user],
-                             "created_at": "2026-10-01T00:00:00Z"}) + "\n")
-        fh.write(json.dumps({"schema_version": 1, "type": "append", "revision": 2, "base_revision": 1,
-                             "message_index": 2, "messages": [call, result, steer, reply],
-                             "created_at": "2026-10-01T00:00:01Z"}) + "\n")
-    Path(f"{stem}.jsonl.meta").write_text(json.dumps({"id": stem.name, "model": "deepseek/deepseek-flash",
-                                                       "revision": 2, "schema_version": 2, "turns": 1,
-                                                       "preview": "run it zebracornreasonix"}), encoding="utf-8")
-    return f"{stem}.jsonl"
-
-
-def reasonix_v4_fixture(home, cwd):
-    """A 1.x sessions-v4 store (RX4F frames), built with the zstd CLI."""
-    import hashlib
-    import subprocess
-    sid = "0123456789abcdef0123456789abcdef"
-    sdir = Path(home) / ".reasonix" / "projects" / cwd.replace("/", "-") / "sessions-v4" / sid
-    sdir.mkdir(parents=True, exist_ok=True)
-    (sdir / "manifest.json").write_text(json.dumps({
-        "schemaVersion": 4, "codec": "reasonix.session.linear/v4", "storageRevision": 3,
-        "contentRoot": "../.content-v1", "sessionId": sid, "createdAt": "2026-10-01T00:00:00Z",
-        "writerGeneration": 1, "kind": "headless-run"}), encoding="utf-8")
-    big = json.dumps({"message": {"role": "tool", "id": "m5", "content": "hi zebracornreasonixv4tool\n",
-                                  "tool_call_id": "c1", "name": "bash"}}).encode()
-    digest = hashlib.sha256(big).hexdigest()
-    obj = sdir.parent / ".content-v1" / "objects" / digest[:2] / digest[2:4] / digest
-    obj.parent.mkdir(parents=True, exist_ok=True)
-    obj.write_bytes(big)
-    events = [
-        ("message/complete", {"message": {"role": "user", "id": "m1", "origin": "host",
-                                          "content": f'<session-context version="1">\n## Workspace\n\nCurrent workspace: "{cwd}"\nzebracorninjected\n</session-context>'}}),
-        ("message/complete", {"message": {"role": "user", "id": "m2", "origin": "user",
-                                          "content": "v4 zebracornreasonixv4", "raw_content": "v4 zebracornreasonixv4"}}),
-        ("message/complete", {"message": {"role": "assistant", "id": "m3", "reasoning_content": "zebracornthinking",
-                                          "tool_calls": [{"id": "c1", "name": "bash",
-                                                          "arguments": json.dumps({"command": "echo hi-reasonixv4"})}]}}),
-        ("message/complete", None),  # payload in the content pool
-        ("message/complete", {"message": {"role": "assistant", "id": "m6", "content": "done zebracornreasonixv4"}}),
-        ("session/title", {"title": "v4 zebracorn title"}),
-    ]
-    out = bytearray()
-
-    def frame(rec):
-        raw = json.dumps(rec).encode()
-        comp = subprocess.run(["zstd", "-q", "-c"], input=raw, capture_output=True).stdout
-        out.extend(b"RX4F" + struct.pack(">II", len(comp), len(raw)) + comp)
-
-    head = {"schemaVersion": 4, "codec": "reasonix.session.linear/v4"}
-    for seq, (kind, body) in enumerate(events, start=1):
-        frame({**head, "recordType": "batch/begin", "commitId": f"c{seq}", "firstSeq": seq, "eventCount": 1})
-        ev = {"id": f"e{seq}", "seq": seq, "kind": kind}
-        if body is None:
-            ev["payloadRef"] = {"digest": digest, "bytes": len(big)}
-        else:
-            ev["payload"] = base64.b64encode(json.dumps(body).encode()).decode()
-        frame({**head, "recordType": "batch/event", "event": ev})
-        frame({**head, "recordType": "batch/end", "commitId": f"c{seq}", "firstSeq": seq, "eventCount": 1, "sha256": ""})
-    (sdir / "events.frames").write_bytes(bytes(out))
-    return str(sdir / "events.frames")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Deep Code (lessweb/deepcode-cli, npm @vegamo/deepcode-cli)
-#   ~/.deepcode/projects/<cwd with / → ->/<sessionId>.jsonl  (+ sessions-index.json)
-#   os.homedir() only; no env override.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def deepcode_roots():
-    return [Path.home() / ".deepcode" / "projects"]
-
-
-def deepcode_list():
-    paths = []
-    for root in deepcode_roots():
-        try:
-            paths += sorted(root.glob("*/*.jsonl")) if root.is_dir() else []
-        except OSError:
-            pass
-    return _file_logs(paths, "deepcode")
-
-
-def _deepcode_deepcode_tool_output(content):
-    """Tool results are a JSON envelope {"ok","name","output"|"error","metadata":{exitCode…}}."""
-    if not isinstance(content, str):
-        return content
-    try:
-        env = json.loads(content)
-    except Exception:
-        return content
-    if not isinstance(env, dict) or not ({"output", "error", "ok"} & set(env)):
-        return content
-    body = env.get("output")
-    if not isinstance(body, str):
-        body = json.dumps(body, ensure_ascii=False) if body not in (None, "") else ""
-    meta = env.get("metadata") if isinstance(env.get("metadata"), dict) else {}
-    code = meta.get("exitCode")
-    head = []
-    if env.get("ok") is False:
-        head.append("error" + (f": {env['error']}" if isinstance(env.get("error"), str) else ""))
-    if code not in (None, 0):
-        head.append(f"exit {code}")
-    return "\n".join(head + [body]).strip()
-
-
-@_deepcode_tolerant
-def deepcode_iter(key):
-    calls = {}
-    for msg in _deepcode_jsonl(key):
-        role = msg.get("role")
-        params = msg.get("messageParams") if isinstance(msg.get("messageParams"), dict) else {}
-        meta = msg.get("meta") if isinstance(msg.get("meta"), dict) else {}
-        if role == "user":
-            prompt = meta.get("userPrompt") if isinstance(meta.get("userPrompt"), dict) else {}
-            text = prompt.get("text") if isinstance(prompt.get("text"), str) else _text_of(msg.get("content"))
-            if text and text.strip():
-                yield "user", text
-        elif role == "assistant":
-            text = _text_of(msg.get("content"))
-            if text.strip():
-                yield "assistant", text.strip()
-            for cid, name, args in _deepcode_openai_calls(params.get("tool_calls")):
-                calls[cid] = _call_label(name, args)
-                cmd = _shell_cmd(name, args)
-                if cmd:
-                    yield "cmd", cmd
-        elif role == "tool":
-            label = calls.get(params.get("tool_call_id"))
-            if not label and isinstance(meta.get("function"), dict):
-                fn = meta["function"]
-                label = _call_label(fn.get("name"), _deepcode_args(fn.get("arguments")))
-            turn = tool_turn(label or "tool", _deepcode_deepcode_tool_output(msg.get("content")))
-            if turn:
-                yield turn
-        # system: prompt, environment, skill bodies, compaction summaries (meta.isSummary)
-
-
-def _deepcode_deepcode_index_entry(key):
-    index = _deepcode_load_json(Path(key).parent / "sessions-index.json") or {}
-    sid = Path(key).stem
-    for entry in index.get("entries") or []:
-        if isinstance(entry, dict) and entry.get("id") == sid:
-            return index, entry
-    return index, {}
-
-
-_deepcode_ROOT_PATH_RE = re.compile(r'"root path":\s*"((?:[^"\\]|\\.)*)"')
-
-
-@_deepcode_safe_str
-def deepcode_project(key):
-    index, _ = _deepcode_deepcode_index_entry(key)
-    if isinstance(index.get("originalPath"), str) and index["originalPath"]:
-        return index["originalPath"]
-    for msg in _deepcode_jsonl(key):
-        if msg.get("role") == "system":
-            m = _deepcode_ROOT_PATH_RE.search(_text_of(msg.get("content")) or "")
-            if m:
-                try:
-                    return json.loads(f'"{m.group(1)}"')
-                except Exception:
-                    return m.group(1)
-        elif msg.get("role") == "user":
-            break
-    return Path(key).parent.name
-
-
-@_deepcode_safe_str
-def deepcode_title(key):
-    _, entry = _deepcode_deepcode_index_entry(key)
-    return str(entry.get("summary") or "").strip()
-
-
 # ── Hermes Agent (hermes) ────────────────────────────────────────────────────
 # Hermes Agent (NousResearch) ─ $HERMES_HOME/state.db  (default ~/.hermes/state.db)
 #
@@ -9820,12 +8386,15 @@ def dashboard_frame(stats, sel, width, height):
     return rows[:height]
 
 
-def _screen(title, body_rows, width, height, footer, cli=""):
-    """Generic full-screen page: title band, body, CLI line, key hints."""
+def _screen(title, body_rows, width, height, footer, cli="", resume=None):
+    """Generic full-screen page: title band, body, [RESUME line], CLI line, key hints."""
     rows = [_stripe(width, "black", "blue_deep"), _band(width, title, "yellow", "blue_dark"),
             _stripe(width, "blue_dark", "black")]
-    room = height - len(rows) - 4
+    room = height - len(rows) - 4 - (resume is not None)
     rows += body_rows[:room] + [_line([], width)] * max(0, room - len(body_rows))
+    if resume is not None:
+        spans = resume if isinstance(resume, list) else [resume]
+        rows.append(_line([("  RESUME ▸ ", "orange_hot", None)] + spans, width))
     rows.append(_line([("  CLI ▸ ", "orange_hot", None), (cli or "—", "yellow", None)], width))
     rows.append(_line([("  " + footer, "grey_lt", None)], width))
     rows += [_stripe(width, "orange_dk", "red_deep"), _stripe(width, "red_deep", "black")]
@@ -9916,6 +8485,59 @@ class _Term:
                 text += k
 
 
+class _ResumeNow(Exception):
+    """Leave the TUI and hand this terminal to the harness (raised out of the key loop)."""
+
+    def __init__(self, plan):
+        super().__init__(plan["line"])
+        self.plan = plan
+
+
+RESUME_KEYS = "r resume here · t new tab · c copy"
+
+
+def _resume_span(plan, flash=""):
+    """The RESUME line's text span for a session (or why it can't be reopened)."""
+    if flash:
+        return (flash, "green" if flash.startswith("✓") else "amber", None)
+    if not plan:
+        return ("this harness can't reopen past sessions — read it here instead", "grey_lt", None)
+    if plan["gone"] and not plan["archived"]:
+        return (f"{plan['provider']} deleted this transcript before navcom archived it — read-only", "grey_lt", None)
+    keys = [("   ", None, None), (" r ", "ink", "amber"), (" here ", "amber", None), (" t ", "ink", "amber"),
+            (" tab ", "amber", None), (" c ", "ink", "amber"), (" copy", "amber", None)]
+    if plan["gone"]:
+        return [(f"navcom --resume {short_ref(plan['key'])}   (restores {plan['provider']}'s deleted file first)", "cream", None)] + keys
+    return [(plan["line"], "cream", None)] + keys
+
+
+def _resume_action(conn, plan, k):
+    """Handle r / t / c on a session. Returns a one-line status; 'r' leaves the TUI via _ResumeNow."""
+    if not plan:
+        return "· this harness can't reopen past sessions"
+    if k == "c":
+        if plan["gone"] and not plan["archived"]:
+            text = f"navcom --open {short_ref(plan['key'])}"  # can't be reopened; reading it is what's left
+        else:
+            text = plan["line"] if not plan["gone"] else f"navcom --resume {short_ref(plan['key'])}"
+        return "✓ copied: " + text if copy_to_clipboard(text) else "· no clipboard here — " + text
+    if plan["gone"]:
+        ok, message = ensure_resumable(conn, plan)
+        conn.commit()
+        if not ok:
+            return "· " + message
+        plan = dict(plan, gone=False)
+    if k == "t":
+        ok, message = resume_in_new_tab(plan)
+        return ("✓ " if ok else "· ") + message
+    exe = plan["argv"][0]
+    if not (shutil.which(exe) or os.path.exists(exe)):
+        return f"· {exe} isn't installed here"
+    if plan["cwd"] and not os.path.isdir(plan["cwd"]):
+        return f"· its folder {plan['cwd']} no longer exists"
+    raise _ResumeNow(plan)
+
+
 def _menu_search(term, conn, query):
     import shlex
     try:
@@ -9941,14 +8563,14 @@ def _menu_search(term, conn, query):
         for h in g["hits"]:
             items.append(("hit", (g, h)))
     sel = next((i for i, it in enumerate(items) if it[0] == "hit"), 0)
-    top = 0
+    top, plans, flash = 0, {}, ""
     while True:
         w, hgt = term.size()
         body = [_line([("  query ", "grey_lt", None), (cooked or "(nothing searchable)", "cyan", None),
                        (f"   {len(hits)} hits in {len(groups)} sessions", "grey_lt", None)], w)]
         if note:
             body.append(_line([("  note: " + note, "amber", None)], w))
-        view = hgt - 9 - len(body)
+        view = hgt - 10 - len(body)
         if sel < top:
             top = sel
         if sel >= top + view:
@@ -9972,8 +8594,17 @@ def _menu_search(term, conn, query):
         cur = items[sel][1] if items and items[sel][0] == "hit" else None
         cli = f"navcom {query}" + (f"   →   navcom --open {display_ref(conn, cur[0]['key'], cur[0]['provider'])}:{cur[1].msg_index}"
                                     if cur else "")
-        term.draw(_screen(f"SEARCH ▸ {query}", body, w, hgt, "↑↓ move · enter read · / new search · esc back", cli))
+        if cur and cur[0]["key"] not in plans:
+            plans[cur[0]["key"]] = resume_plan(conn, cur[0]["key"], cur[0]["provider"])
+        plan = plans.get(cur[0]["key"]) if cur else None
+        term.draw(_screen(f"SEARCH ▸ {query}", body, w, hgt,
+                          f"↑↓ move · enter read · {RESUME_KEYS} · / new search · esc back", cli,
+                          resume=_resume_span(plan, flash) if cur else None))
+        flash = ""
         k = term.key()
+        if k in ("r", "t", "c") and cur:
+            flash = _resume_action(conn, plan, k)
+            continue
         if k in ("esc", "q", "left"):
             return
         if k == "/":
@@ -9993,7 +8624,8 @@ def _menu_view(term, conn, key, provider, focus=None):
     turns = fetch_window_rows(conn, key, [(lo, hi)])
     project, title = session_meta(conn, key, provider)
     ref = display_ref(conn, key, provider)
-    scroll = None
+    plan = resume_plan(conn, key, provider)
+    scroll, flash = None, ""
     while True:
         w, hgt = term.size()
         rows, anchor = [], 0
@@ -10003,15 +8635,19 @@ def _menu_view(term, conn, key, provider, focus=None):
             rows += _turn_rows(role, text, provider, msg_index, w, marked=msg_index == focus)
         if scroll is None:
             scroll = max(0, anchor - 3)
-        view = hgt - 9
+        view = hgt - 10
         scroll = max(0, min(scroll, max(0, len(rows) - view)))
         head = [_line([("  ", None, None), (session_date(conn, key), "grey_lt", None), (f"  {provider}", "cyan", None),
                        (f"  {pretty_project(project)}", "cream", None), (f"  turns {lo}-{min(hi, last)} of {last}", "grey_lt", None)], w),
                 _line([("  " + (title or "")[:w - 4], "gold", None)], w)]
         cli = f"navcom --open {ref}:{focus}" if focus else f"navcom --open {ref}"
         term.draw(_screen(f"SESSION ▸ {ref}", head + rows[scroll:scroll + view - 2], w, hgt,
-                          "↑↓ scroll · pgup/pgdn page · esc back", cli))
+                          f"↑↓ scroll · pgup/pgdn page · {RESUME_KEYS} · esc back", cli, resume=_resume_span(plan, flash)))
+        flash = ""
         k = term.key()
+        if k in ("r", "t", "c"):
+            flash = _resume_action(conn, plan, k)
+            continue
         if k in ("esc", "q", "left"):
             return
         if k in ("up", "k"):
@@ -10028,12 +8664,12 @@ def _menu_view(term, conn, key, provider, focus=None):
             scroll = len(rows)
 
 
-def _menu_list(term, conn, title, entries, cli, on_enter=None):
-    """entries: [(spans, payload)]"""
-    sel, top = 0, 0
+def _menu_list(term, conn, title, entries, cli, on_enter=None, resumable=False):
+    """entries: [(spans, payload)]; resumable: payloads are (key, provider) and r/t/c reopen them."""
+    sel, top, plans, flash = 0, 0, {}, ""
     while True:
         w, hgt = term.size()
-        view = hgt - 9
+        view = hgt - 9 - resumable
         sel = max(0, min(sel, len(entries) - 1))
         if sel < top:
             top = sel
@@ -10044,8 +8680,20 @@ def _menu_list(term, conn, title, entries, cli, on_enter=None):
             on = i == sel and on_enter is not None
             body.append(_line([("  ▶ " if on else "    ", "orange_hot", None)]
                               + [(t, "ink" if on else fg, "amber" if on else bg) for t, fg, bg in spans], w))
-        term.draw(_screen(title, body, w, hgt, ("↑↓ move · enter open · " if on_enter else "↑↓ scroll · ") + "esc back", cli))
+        payload = entries[sel][1] if entries else None
+        plan = None
+        if resumable and payload:
+            if payload[0] not in plans:
+                plans[payload[0]] = resume_plan(conn, payload[0], payload[1])
+            plan = plans[payload[0]]
+        term.draw(_screen(title, body, w, hgt, ("↑↓ move · enter open · " if on_enter else "↑↓ scroll · ")
+                          + (RESUME_KEYS + " · " if resumable else "") + "esc back", cli,
+                          resume=_resume_span(plan, flash) if resumable else None))
+        flash = ""
         k = term.key()
+        if resumable and payload and k in ("r", "t", "c"):
+            flash = _resume_action(conn, plan, k)
+            continue
         if k in ("esc", "q", "left"):
             return
         if k in ("up", "k"):
@@ -10065,6 +8713,10 @@ LEARN_PAGES = [
                    "navcom --open <ref>:<n>   read the turns around one hit, full text\n\n"
                    "That's the whole loop. Agents (Claude Code, Codex, Gemini, Copilot, …) already know it from\n"
                    "the skill card navcom installed for them."),
+    ("GET BACK IN", "On any search hit or open session:   r  resume here   ·   t  new tab   ·   c  copy the command\n"
+                    "The RESUME line shows exactly what runs: cd <its folder> && <harness> resume <id>.\n"
+                    "From the shell: navcom --resume <ref>  (--tab for a new tab, --print to just print it).\n"
+                    "A transcript its harness deleted is restored from navcom's archive first."),
     ("QUERIES", "Type anything — punctuation is safe: 10.10.1.223  don't  PR #76  main()  cerbos-wave-2\n"
                 "words      all must be in one turn, prefix-matched (auth → authentication)\n"
                 "a OR b     either one · a, b, c = any of them · NOT x excludes · \"exact phrase\"\n"
@@ -10085,6 +8737,15 @@ LEARN_PAGES = [
 
 
 def run_menu(conn):
+    try:
+        return _run_menu(conn)
+    except _ResumeNow as now:  # the terminal is restored by now; hand it to the harness
+        conn.commit()
+        conn.close()
+        return resume_here(now.plan)
+
+
+def _run_menu(conn):
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         safe_print("navcom --menu is the interactive terminal UI — run it in a terminal. "
                    "For scripts and agents: navcom --help")
@@ -10130,7 +8791,7 @@ def run_menu(conn):
                                          (f"{pretty_project(project)[:26]:<28}", "cream", None),
                                          (title[:80], "gold", None)], (key, prov)))
                     _menu_list(term, conn, "RECENT SESSIONS", entries, "navcom --sessions",
-                               on_enter=lambda kp: _menu_view(term, conn, kp[0], kp[1]))
+                               on_enter=lambda kp: _menu_view(term, conn, kp[0], kp[1]), resumable=True)
                 elif action == "open":
                     ref = term.prompt("REF", "a ref from search results, e.g. 7ec78a59 or 7ec78a59:533 · esc back")
                     if ref:
@@ -10194,6 +8855,7 @@ SQLite FTS5 + BM25, ~0.2s.  `navcom --where` shows which ones are on this machin
 THE RECIPE (agents: this is all you need)
   1. navcom <words>                 find: hits grouped by session → date, harness, project, ref, #turn
   2. navcom --open <ref>:<turn>     read the turns around one hit, full text
+  3. navcom --resume <ref>          (humans) get back into it: cd to its folder + reopen it in its harness
   Don't grep raw session logs, don't strip punctuation, don't bother with --compact (it's the default).
   navcom --skill                    print navcom's SKILL.md skill card (already auto-installed for
                                     every harness here: Claude, Codex, Gemini, Copilot, pi, omo, opencode,
@@ -10238,12 +8900,18 @@ READ
   navcom deploy --context           expand every hit in place with its neighbouring turns
   navcom --sessions                 your 20 most recent sessions, with titles
   navcom --menu                     the retro full-screen UI: live dashboard, search, read, learn
+
+GET BACK INTO A CONVERSATION (every search ends with the copy-paste command for the top session)
+  navcom --resume 7ec78a59          cd to the session's folder and reopen it in its own harness, right
+                                    here (claude --resume, codex resume, opencode --session, pi --session…)
+  navcom --resume 7ec78a59 --tab    … in a new tab: cmux, tmux, iTerm2, WezTerm, kitty, Terminal.app
+  navcom --resume 7ec78a59 --print  just print `cd <folder> && <harness> resume <id>` (pipes/agents get this)
   navcom --restore 7ec78a59         put a deleted transcript back from navcom's archive, so
                                     `claude --resume` works again   (--restore all: every one)
 
 OUTPUT
   default    plain text grouped by session, matches marked «like this»; colour only on a terminal
-  --json     {"query","note","sessions":[{"ref","key","provider","date","project","title",
+  --json     {"query","note","sessions":[{"ref","key","provider","date","project","title","resume",
               "hits":[{"msg_index","role","snippet"}]}]}
   --newest   sessions newest-first instead of best-match-first
   --max-chars N    snippet/turn length (0 = everything)
@@ -10369,6 +9037,13 @@ def build_parser():
     o.add_argument("--open", "--show", "--read", "--view", dest="open_ref", metavar="REF[:N]",
                    help="Read a session by the ref printed in results.  --open 7ec78a59:533  (3 turns either side)\n"
                         "--open 7ec78a59:520-560 (range)   --open 7ec78a59 (whole session)")
+    o.add_argument("--resume", "--reopen", dest="resume_ref", metavar="REF",
+                   help="Get back into that conversation yourself: cd to its folder and reopen it in its harness\n"
+                        "(claude --resume, codex resume, …), right here in this terminal.\n"
+                        "--resume REF --tab   in a new tab instead (cmux, tmux, iTerm2, WezTerm, kitty, Terminal)\n"
+                        "--resume REF --print just print the command (also what pipes and agents get)")
+    o.add_argument("--tab", "--new-tab", action="store_true", help=argparse.SUPPRESS)
+    o.add_argument("--print", "--print-only", dest="print_only", action="store_true", help=argparse.SUPPRESS)
     o.add_argument("--context", "--full", "--expand", "--verbose", action="store_true",
                    help="Expand every hit in place with its neighbouring turns.")
     o.add_argument("--window-turns", "--window", "--turns", "--around", type=int, metavar="N",
@@ -10377,7 +9052,7 @@ def build_parser():
                    help="Trim each snippet/turn to N chars (0 = everything). Defaults: 220 hits, 200 context,\n"
                         "3000 --open REF:N, 400 --open REF.")
     o.add_argument("--json", action="store_true",
-                   help='JSON: {"query","note","sessions":[{"ref","key","provider","date","project","title","hits":[…]}]}')
+                   help='JSON: {"query","note","sessions":[{"ref","key","provider","date","project","title","resume","hits":[…]}]}')
     o.add_argument("--newest", "--recent-first", "--sort-date", action="store_true",
                    help="Order sessions newest-first instead of best-match-first.")
     o.add_argument("--compact", "--brief", "--short", action="store_true",
@@ -10669,6 +9344,23 @@ def print_compact(conn, groups, max_chars, total_hits, cooked, note):
             f"→ read around a hit: navcom --open {display_ref(conn, first['key'], first['provider'])}:{first['hits'][0].msg_index}"
             "   · expand all: add --context"
         ))
+        hint = resume_hint(conn, groups)
+        if hint:
+            safe_print(STYLE.dim(hint))
+
+
+def resume_hint(conn, groups):
+    """Footer line: the copy-paste command that reopens the best still-resumable session."""
+    for g in groups[:5]:
+        try:
+            plan = resume_plan(conn, g["key"], g["provider"])
+        except Exception:
+            plan = None
+        if plan and (not plan["gone"] or plan["archived"]):
+            ref = display_ref(conn, g["key"], g["provider"])
+            line = plan["line"] if not plan["gone"] else f"navcom --resume {ref}"
+            return f"→ get back into [{groups.index(g) + 1}] yourself: {line}   · any session: navcom --resume <ref> (--tab: new tab)"
+    return ""
 
 
 def print_json(conn, groups, cooked, note):
@@ -10682,12 +9374,20 @@ def print_json(conn, groups, cooked, note):
             "date": session_date(conn, g["key"]),
             "project": project,
             "title": title,
+            "resume": _resume_json(conn, g["key"], g["provider"]),
             "hits": [
                 {"msg_index": h.msg_index, "role": h.role, "snippet": re.sub(r"\s+", " ", h.snip or "").strip()}
                 for h in g["hits"]
             ],
         })
     safe_print(json.dumps(out, indent=2, ensure_ascii=False))
+
+
+def _resume_json(conn, key, provider):
+    plan = resume_plan(conn, key, provider)
+    if not plan or (plan["gone"] and not plan["archived"]):
+        return None
+    return plan["line"] if not plan["gone"] else f"navcom --resume {short_ref(key)}"
 
 
 def print_context(conn, groups, window, max_chars):
@@ -10759,6 +9459,324 @@ def resolve_ref(conn, ref, providers=None):
     return matches[0][0], [m[0] for m in matches[1:]]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Resume: get back into a past conversation yourself (cd to its folder, reopen it)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_UUID_ANY = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _json_field(path, *names, limit=65536):
+    """First of `names` found in a JSON / JSONL file's head (no full parse of big files)."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            head = handle.read(limit)
+    except OSError:
+        return ""
+    for name in names:
+        match = re.search(rf'"{re.escape(name)}"\s*:\s*"([^"]+)"', head)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _grok_build_bin():
+    # /opt/homebrew/bin/grok is often the community grok-cli; Grok Build installs to ~/.grok/bin
+    home_bin = Path.home() / ".grok" / "bin" / "grok"
+    return str(home_bin) if home_bin.exists() else "grok"
+
+
+def _resume_claude(key, ref):
+    match = re.search(r"/([0-9a-f-]{36})/subagents/", key)  # a subagent sidechain → its parent session
+    return ["claude", "--resume", match.group(1) if match else ref]
+
+
+def _resume_gemini(key, ref):
+    sid = _json_field(key, "sessionId") or ref
+    return ["gemini", "--resume", sid]
+
+
+def _resume_vibe(key, ref):
+    return ["vibe", "--resume", ref.rsplit("_", 1)[-1]]  # vibe matches the short id in session_<date>_<time>_<id>
+
+
+def _resume_kimi(key, ref):
+    folder = next((part for part in Path(key).parts if part.startswith("session_")), f"session_{ref}")
+    return ["kimi", "-S", folder]  # Kimi wants the session_<uuid> folder name, not the bare uuid
+
+
+def _resume_kiro(key, ref):
+    if "#" in key:  # v1 SQLite: conversations are keyed by folder, so "resume" = the latest one there
+        return None
+    return ["kiro-cli", "--v3", "--resume-id", ref] if ref.startswith("sess_") else ["kiro-cli", "chat", "--resume-id", ref]
+
+
+def _resume_goose(key, ref):
+    if key.endswith(".jsonl"):  # pre-SQLite goose named sessions by file
+        return ["goose", "session", "--resume", "--name", ref]
+    return ["goose", "session", "--resume", "--session-id", ref]
+
+
+def _resume_cline(key, ref):
+    if "saoudrizwan.claude-dev" in key or "/tasks/" in key:
+        return None  # a VS Code extension task: the Cline CLI can't open those
+    return ["cline", "--id", ref]
+
+
+def _resume_codewhale(key, ref):
+    return ["deepseek", "resume", ref] if "/.deepseek/" in key else ["codewhale", "--resume", ref]
+
+
+def _resume_amp(key, ref):
+    return ["amp", "threads", "continue", ref if ref.startswith("T-") else f"T-{ref}"]
+
+
+# provider → argv builder (key, ref) → argv (None: can't).  navcom cds into the session's folder first:
+# most harnesses file sessions per folder, and the rest at least run their tools there.
+RESUME_COMMANDS = {
+    "claude": _resume_claude,
+    "codex": lambda key, ref: ["codex", "resume", ref],
+    "gemini": _resume_gemini,
+    "opencode": lambda key, ref: ["opencode", "--session", ref],
+    "kilo": lambda key, ref: ["kilo", "--session", ref],
+    "pi": lambda key, ref: ["pi", "--session", ref],
+    "omo": lambda key, ref: ["omo", "--session", ref],
+    "goose": _resume_goose,
+    "dsh": lambda key, ref: ["dsh", "tui", "--resume", f"session-{ref}"],
+    "grok": lambda key, ref: [_grok_build_bin(), "--resume", ref],
+    "qwen": lambda key, ref: ["qwen", "--resume", ref],
+    "kimi": _resume_kimi,
+    "crush": lambda key, ref: ["crush", "--session", ref],
+    "copilot": lambda key, ref: ["copilot", "--resume", ref],
+    "cline": _resume_cline,
+    "codewhale": _resume_codewhale,
+    "reasonix": lambda key, ref: ["reasonix", "--resume", ref],
+    "deepcode": lambda key, ref: ["deepcode", "-r", ref],
+    "hermes": lambda key, ref: ["hermes", "--resume", ref],
+    "openhands": lambda key, ref: ["openhands", "--resume", ref],
+    "vibe": _resume_vibe,
+    "agy": lambda key, ref: ["agy", "--conversation", ref],
+    "droid": lambda key, ref: ["droid", "--resume", ref],
+    "cursor": lambda key, ref: ["cursor-agent", "--resume", ref],
+    "kiro": _resume_kiro,
+    "amp": _resume_amp,
+    "auggie": lambda key, ref: ["auggie", "--resume", ref],
+    "grokdev": lambda key, ref: ["grok", "--session", ref],
+}
+# harnesses with no resume-by-id: the closest thing, and what it really does
+RESUME_FALLBACKS = {
+    "continue": lambda key, ref: (["cn", "--fork", ref], "Continue can't reopen a session by id — this starts a "
+                                                          "new session with a copy of its history (cn --fork)"),
+    "aider": lambda key, ref: (["aider", "--restore-chat-history"], "Aider has no per-session resume — this reloads "
+                                                                    "the folder's whole chat history"),
+    "kiro": lambda key, ref: (["kiro-cli", "chat", "--resume"], "this older Kiro conversation is stored per folder — "
+                                                                "this reopens the latest one there"),
+}
+
+
+def resume_plan(conn, key, provider=None):
+    """How to get back into a session: {cwd, argv, line, exact, note}. None if the harness can't."""
+    provider = provider or _key_provider(conn, key)
+    project, _title = session_meta(conn, key, provider)
+    if project.startswith("-"):
+        project = decode_encoded_dir(project) or project
+    cwd = project if project and project.startswith("/") else ""
+    if provider == "claude" or not cwd:
+        # the transcript's own record of where it ran beats a folder name decoded from '-Users-t-x'
+        recorded = _json_field(key, "cwd") if "#" not in key and os.path.isfile(key) else ""
+        if recorded.startswith("/"):
+            cwd = recorded
+    ref = session_ref(key)
+    note = ""
+    argv, exact = (RESUME_COMMANDS[provider](key, ref) if provider in RESUME_COMMANDS else None), True
+    if not argv and provider in RESUME_FALLBACKS:
+        argv, note = RESUME_FALLBACKS[provider](key, ref)
+        exact = False
+    if not argv:
+        return None
+    shown = [_shell_path(argv[0]) if argv[0].startswith("/") else argv[0]] + argv[1:]
+    line = " ".join([shown[0], shlex.join(shown[1:])]) if len(shown) > 1 else shown[0]
+    if cwd:
+        line = f"cd {_shell_path(cwd)} && {line}"
+    store = key.split("#", 1)[0]
+    gone = not os.path.exists(store)
+    archived = False
+    if gone:
+        try:
+            _ensure_archive_table(conn)
+            row = conn.execute("SELECT path FROM archive_state WHERE file=?", (key,)).fetchone()
+            archived = bool(row and Path(row[0]).exists())
+        except sqlite3.Error:
+            pass
+    return {"cwd": cwd, "argv": argv, "line": line, "exact": exact, "note": note, "provider": provider,
+            "key": key, "gone": gone, "archived": archived}
+
+
+def ensure_resumable(conn, plan):
+    """A session its harness already deleted: put navcom's archived copy back first. → (ok, message)."""
+    if not plan["gone"]:
+        return True, ""
+    if plan["archived"]:
+        import contextlib
+        with contextlib.redirect_stdout(io.StringIO()):
+            cmd_restore(conn, plan["key"], None)
+        if os.path.exists(plan["key"].split("#", 1)[0]):
+            return True, f"{plan['provider']} had deleted this session — restored it from navcom's archive"
+    return False, (f"{plan['provider']} deleted this session's transcript and navcom's archive doesn't have it, "
+                   f"so {plan['provider']} can't reopen it. navcom still has the text: navcom --open {short_ref(plan['key'])}")
+
+
+def _shell_path(path):
+    """~/dev/x when that is safe to type unquoted, else a quoted absolute path."""
+    home = str(Path.home())
+    if path == home or path.startswith(home + "/"):
+        rest = path[len(home):]
+        if re.fullmatch(r"[\w./@+-]*", rest):
+            return "~" + rest
+    return shlex.quote(path)
+
+
+def resume_here(plan):
+    """Replace navcom with the harness, in the session's folder, in this terminal."""
+    exe = plan["argv"][0]
+    if not (shutil.which(exe) or os.path.exists(exe)):
+        sys.stderr.write(f"navcom: {exe} isn't installed here. The command is:\n  {plan['line']}\n")
+        return 1
+    if plan["cwd"]:
+        if not os.path.isdir(plan["cwd"]):
+            sys.stderr.write(f"navcom: the session's folder {plan['cwd']} no longer exists. The command is:\n  {plan['line']}\n")
+            return 1
+        os.chdir(plan["cwd"])
+    sys.stderr.write(f"navcom ▸ {plan['line']}\n")
+    sys.stderr.flush()
+    try:
+        os.execvp(exe, plan["argv"])
+    except OSError as exc:
+        sys.stderr.write(f"navcom: could not start {exe}: {exc}\n")
+        return 1
+
+
+def _tab_title(plan):
+    return f"{plan['provider']} · {Path(plan['cwd']).name or '~'}" if plan["cwd"] else plan["provider"]
+
+
+def resume_in_new_tab(plan):
+    """Open the resume command in a new tab of the terminal you're in. → (ok, message)."""
+    import subprocess
+    cwd = plan["cwd"] if plan["cwd"] and os.path.isdir(plan["cwd"]) else str(Path.home())
+    shell = os.environ.get("SHELL") or "/bin/sh"
+    keep_open = [shell, "-lic", f"{shlex.join(plan['argv'])}; exec {shlex.quote(shell)} -l"]
+    title = _tab_title(plan)
+
+    def run(cmd, env=None):
+        try:
+            done = subprocess.run(cmd, capture_output=True, text=True, timeout=15, env=env)
+            return done.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    term = os.environ.get("TERM_PROGRAM", "")
+    cmux = os.environ.get("CMUX_BUNDLED_CLI_PATH") or shutil.which("cmux")
+    if cmux and (os.environ.get("CMUX_WORKSPACE_ID") or os.environ.get("CMUX_SOCKET_PATH")):
+        env = dict(os.environ, CMUX_QUIET="1")
+        if run([cmux, "new-workspace", "--name", title, "--cwd", cwd, "--command", shlex.join(plan["argv"])], env):
+            return True, "opened in a new cmux workspace"
+    if os.environ.get("TMUX") and shutil.which("tmux"):
+        if run(["tmux", "new-window", "-c", cwd, "-n", title, shlex.join(keep_open)]):
+            return True, "opened in a new tmux window"
+    if os.environ.get("WEZTERM_PANE") and shutil.which("wezterm"):
+        if run(["wezterm", "cli", "spawn", "--cwd", cwd, "--"] + keep_open):
+            return True, "opened in a new WezTerm tab"
+    if os.environ.get("KITTY_WINDOW_ID") and shutil.which("kitty"):
+        if run(["kitty", "@", "launch", "--type=tab", "--cwd", cwd, "--tab-title", title] + keep_open):
+            return True, "opened in a new kitty tab"
+    line = f"cd {shlex.quote(cwd)} && {shlex.join(plan['argv'])}"
+    if sys.platform == "darwin" and term == "iTerm.app":
+        script = ('tell application "iTerm2" to tell current window\n'
+                  '  set t to (create tab with default profile)\n'
+                  f'  tell current session of t to write text {_applescript_str(line)}\nend tell')
+        if run(["osascript", "-e", script]):
+            return True, "opened in a new iTerm2 tab"
+    if sys.platform == "darwin" and term == "Apple_Terminal":
+        if run(["osascript", "-e", f'tell application "Terminal" to do script {_applescript_str(line)}',
+                "-e", 'tell application "Terminal" to activate']):
+            return True, "opened in a new Terminal window"
+    if sys.platform == "darwin" and term == "ghostty":
+        if run(["open", "-na", "Ghostty.app", "--args", f"--working-directory={cwd}", "-e"] + keep_open):
+            return True, "opened in a new Ghostty window"
+    if sys.platform.startswith("linux") and shutil.which("gnome-terminal") and \
+            (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        if run(["gnome-terminal", "--tab", f"--working-directory={cwd}", "--"] + keep_open):
+            return True, "opened in a new terminal tab"
+    copied = copy_to_clipboard(plan["line"])
+    return False, ("can't open a tab in this terminal — " + ("command copied, paste it in a new tab" if copied
+                                                             else f"run: {plan['line']}"))
+
+
+def _applescript_str(text):
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def copy_to_clipboard(text):
+    """System clipboard (pbcopy / wl-copy / xclip / xsel / clip), else OSC 52 via the terminal."""
+    import subprocess
+    for cmd in (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"], ["clip.exe"]):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, input=text, text=True, timeout=5, check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True
+            except (OSError, subprocess.SubprocessError):
+                continue
+    if sys.stdout.isatty():
+        import base64
+        sys.stdout.write("\033]52;c;" + base64.b64encode(text.encode()).decode() + "\a")
+        sys.stdout.flush()
+        return True
+    return False
+
+
+def cmd_resume(conn, args, providers):
+    ref = args.resume_ref.strip()
+    if not Path(ref).exists():
+        ref = re.sub(r"[:#]\d+(-\d+)?$", "", ref)  # a hit ref (abc123:73) names its session
+    key, _others = resolve_ref(conn, ref, providers)
+    if not key:
+        safe_print(f"navcom: no session matches ref {ref!r}. Refs are printed in search results (e.g. 'ref 395e14b4').")
+        return 1
+    plan = resume_plan(conn, key)
+    if not plan:
+        prov = _key_provider(conn, key)
+        safe_print(f"navcom: {prov} has no way to reopen a past session from the command line. "
+                   f"Read it instead: navcom --open {display_ref(conn, key, prov)}")
+        return 1
+    if plan["gone"] and not plan["archived"]:
+        _ok, message = ensure_resumable(conn, plan)
+        safe_print(f"navcom: {message}")
+        return 1
+    if plan["note"]:
+        sys.stderr.write(f"navcom: {plan['note']}\n")
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if (args.print_only or not interactive) and not args.tab:
+        if plan["gone"]:
+            sys.stderr.write(f"navcom: {plan['provider']} deleted this session — `navcom --resume {short_ref(key)}` "
+                             "restores it from the archive first (or: navcom --restore REF)\n")
+        safe_print(plan["line"])  # scripts, agents, `| pbcopy`: just the command
+        return 0
+    if plan["gone"]:
+        ok, message = ensure_resumable(conn, plan)
+        conn.commit()
+        sys.stderr.write(f"navcom: {message}\n")
+        if not ok:
+            return 1
+    if args.tab:
+        ok, message = resume_in_new_tab(plan)
+        safe_print(f"{'✓' if ok else '·'} {message}\n  {plan['line']}")
+        return 0 if ok else 1
+    conn.close()
+    return resume_here(plan)
+
+
 def cmd_open(conn, args, providers):
     ref = args.open_ref
     lo = hi = None
@@ -10786,6 +9804,13 @@ def cmd_open(conn, args, providers):
     project, title = session_meta(conn, key, prov)
     safe_print(f"{session_date(conn, key)}  {STYLE.provider(prov)}  {pretty_project(project) or '-'}  ref {display_ref(conn, key, prov)}  turns {span[0]}-{min(span[1], last)} of {last}")
     safe_print(STYLE.dim(key))
+    plan = resume_plan(conn, key, prov)
+    if plan and not plan["gone"]:
+        safe_print(STYLE.dim(f"resume: {plan['line']}"))
+    elif plan and plan["archived"]:
+        safe_print(STYLE.dim(f"resume: navcom --resume {display_ref(conn, key, prov)}   ({prov} deleted it; navcom restores it from its archive)"))
+    elif plan:
+        safe_print(STYLE.dim(f"resume: not possible — {prov} deleted this transcript before navcom archived it (the text below is navcom's copy)"))
     if others:
         safe_print(STYLE.warn(f"note: {len(others)} other session(s) also match {ref!r}; showing the most recent"))
     safe_print("")
@@ -10810,7 +9835,7 @@ def cmd_recent_sessions(conn, logs, limit, keys=None):
         pool = logs
     shown = pool[-limit:] if limit else pool
     index_logs(conn, shown)
-    safe_print(f"navcom: {len(shown)} most recent session{'s' if len(shown) != 1 else ''} of {len(pool)} · search: navcom <words> · read: navcom --open <ref>")
+    safe_print(f"navcom: {len(shown)} most recent session{'s' if len(shown) != 1 else ''} of {len(pool)} · search: navcom <words> · read: navcom --open <ref> · reopen: navcom --resume <ref>")
     for key, mtime, size, prov in reversed(shown):
         project, title = session_meta(conn, key, prov)
         stamp = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M") if mtime else "????-??-?? ??:??"
@@ -10990,6 +10015,11 @@ def run(argv=None):
             targets.extend([l for l in logs if l[3] == prov][-args.recent:])
     else:
         targets = logs
+
+    if args.resume_ref:
+        index_logs(conn, logs)
+        conn.commit()
+        return cmd_resume(conn, args, providers)
 
     if args.open_ref:
         index_logs(conn, logs)

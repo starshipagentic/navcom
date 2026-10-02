@@ -58,6 +58,7 @@ navcom --open 7ec78a59:520-560   # a range of turns
 navcom --open 7ec78a59 --user    # every user turn in that session
 navcom deploy --context          # expand every hit in place
 navcom deploy --json             # structured: sessions[] with ref, date, project, hits[]
+navcom --resume 7ec78a59 --print # user wants to reopen it themselves? hand them this cd + resume command
 navcom --restore 7ec78a59        # transcript deleted by its harness? put it back, then resume it
 ```
 
