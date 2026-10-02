@@ -1,6 +1,6 @@
 ---
 name: navcom-session-recall
-description: Search every past AI coding session on this machine (Claude Code, Codex, Gemini CLI, pi, omo, opencode, goose, DeepSeek dsh, Grok Build, Kilo) with the local `navcom` CLI. Use when the user says "use navcom", asks to find an old conversation or thread, asks what was done/decided/tried before on a topic, wants to recover context after a compaction, or needs evidence from past sessions (commands run, errors seen, decisions) before continuing work.
+description: Search every past AI coding session on this machine (Claude Code, Codex, Gemini CLI, Copilot CLI, Cline, Continue, Qwen Code, Kimi Code, Crush, pi, omo, opencode, goose, Kilo, DeepSeek dsh/Codewhale/Reasonix/Deep Code, Grok Build) with the local `navcom` CLI. Use when the user says "use navcom", asks to find an old conversation or thread, asks what was done/decided/tried before on a topic, wants to recover context after a compaction, or needs evidence from past sessions (commands run, errors seen, decisions) before continuing work.
 ---
 <!-- managed by navcom: updated automatically on upgrade; edit freely and it will be left alone -->
 

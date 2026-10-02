@@ -1,6 +1,6 @@
 # navcom
 
-Super-fast search over your past AI coding sessions, from one command.
+Super-fast search over your past AI coding sessions, from one command, across 22 harnesses.
 
 navcom indexes the transcripts your coding agents already write to disk (SQLite FTS5, incremental) and
 answers "where did we talk about X?" in well under a second. It's built to be called by LLM agents
@@ -18,6 +18,18 @@ from their shell tool, and by you.
 | DeepSeek Harness (`dsh`) | `$DSH_HOME/sessions/--<cwd>--/<id>/session.v4.jsonl.zstd` (zstd: Python 3.14, `zstandard`, or the `zstd` CLI) |
 | Grok Build (xAI `grok`) | `$GROK_HOME/sessions/<url-encoded cwd>/<id>/updates.jsonl` |
 | Kilo Code CLI | `$KILO_DB` or `$XDG_DATA_HOME/kilo/kilo.db` (opencode's schema) |
+| GitHub Copilot CLI | `$COPILOT_HOME/session-state/<id>/events.jsonl` |
+| Cline (CLI 3.x + VS Code extension tasks) | `~/.cline/data/sessions/` and `…/globalStorage/saoudrizwan.claude-dev/tasks/` |
+| Continue (`cn` + IDE) | `$CONTINUE_GLOBAL_DIR/sessions/*.json` |
+| Qwen Code | `~/.qwen/projects/<cwd>/chats/*.jsonl` (+ subagents; rewinds followed) |
+| Kimi Code (+ legacy Kimi CLI) | `~/.kimi-code/sessions/…/wire.jsonl`, `~/.kimi/sessions/…/context.jsonl` |
+| Crush | `<project>/.crush/crush.db` (found via `~/.local/share/crush/projects.json`) |
+| Codewhale (DeepSeek-TUI) | `~/.codewhale/sessions/*.json` (+ legacy `~/.deepseek/sessions`) |
+| DeepSeek Reasonix | `~/.reasonix/…/sessions-v4/*/events.frames` and `sessions/*.jsonl` + `.events.jsonl` |
+| Deep Code | `~/.deepcode/projects/<cwd>/*.jsonl` |
+| Hermes Agent | `$HERMES_HOME/state.db` (+ `profiles/*/state.db`) |
+| OpenHands CLI | `~/.openhands/conversations/<id>/events/*.json` |
+| Mistral Vibe | `~/.vibe/logs/session/session_*/messages.jsonl` |
 
 Run `navcom --where` to see what it found on your machine.
 
@@ -151,6 +163,14 @@ in `~/.claude/settings.json`. It writes atomically and keeps a one-time backup i
 - A settings file that isn't plain JSON is never touched.
 - It never writes `0`: Claude rejects it, and older versions read 0 as "save nothing".
 - `NAVCOM_NO_RETENTION_FIX=1` opts out.
+
+Other harnesses that delete history get the same treatment, but only when you haven't set the
+value yourself:
+- **Qwen Code**: subagent transcripts after 30 days (`general.cleanupPeriodDays` → 36500).
+- **Hermes Agent**: ended sessions after 90 days, from v2026.9.7 (`sessions.auto_prune: false`). This
+  one is a single-line YAML edit with a backup kept.
+
+`navcom --where` lists every harness's retention.
 
 Gemini CLI deletes chats after 30 days by default too (`general.sessionRetention`). When that
 setting is unset, navcom turns it off (`{"enabled": false}`) in `~/.gemini/settings.json`, following

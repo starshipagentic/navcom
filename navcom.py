@@ -56,7 +56,7 @@ def load_module(code, name):
 clean_mod = load_module(LOG_CLEAN_QUICK_CODE, "log_clean_quick")
 fts_mod = load_module(LOG_SEARCH_FTS5_CODE, "log_search_fts5")
 
-NAVCOM_VERSION = "0.4.0"
+NAVCOM_VERSION = "0.5.0"
 DEFAULT_LIMIT = 20  # hits per harness (and sessions listed by a bare `navcom`)
 
 # Every harness navcom knows how to read. Order = display order in help/listings.
@@ -1468,6 +1468,68 @@ def ensure_json_setting(path, dotted, value):
     return True
 
 
+def _yaml_value(value):
+    return "true" if value is True else "false" if value is False else str(value)
+
+
+def yaml_setting(path, dotted):
+    """Read a two-level `section.key` from simple block YAML without a YAML library."""
+    section, key = dotted.split(".", 1)
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    inside = False
+    for line in lines:
+        if re.match(rf"^{re.escape(section)}:\s*(#.*)?$", line):
+            inside = True
+            continue
+        if inside and line and not line[0].isspace() and not line.lstrip().startswith("#"):
+            inside = False
+        m = re.match(rf"^\s+{re.escape(key)}:\s*([^#]*?)\s*(#.*)?$", line) if inside else None
+        if m:
+            return m.group(1)
+    return None
+
+
+def ensure_yaml_setting(path, dotted, value):
+    """Add `section.key: value` to block YAML when unset — the only edit ever made: one line
+    under an existing top-level `section:` (matching its indentation), or a new block at the end.
+    Flow-style or otherwise unusual files are left alone."""
+    path = Path(path)
+    if not path.parent.is_dir() or yaml_setting(path, dotted) is not None:
+        return False
+    section, key = dotted.split(".", 1)
+    try:
+        raw = path.read_text(encoding="utf-8") if path.exists() else ""
+    except OSError:
+        return False
+    lines = raw.splitlines()
+    header = next((i for i, l in enumerate(lines) if re.match(rf"^{re.escape(section)}:\s*(#.*)?$", l)), None)
+    if header is None:
+        if re.search(rf"^{re.escape(section)}:", raw, re.M):
+            return False  # e.g. `sessions: {…}` flow style — don't guess
+        new = raw + ("" if raw.endswith("\n") or not raw else "\n") + f"{section}:\n  {key}: {_yaml_value(value)}  # set by navcom: keep history\n"
+    else:
+        child = next((l for l in lines[header + 1:] if l.strip() and not l.lstrip().startswith("#")), "")
+        indent = (re.match(r"^(\s+)", child).group(1) if child[:1].isspace() else "  ")
+        lines.insert(header + 1, f"{indent}{key}: {_yaml_value(value)}  # set by navcom: keep history")
+        new = "\n".join(lines) + "\n"
+    try:
+        if raw:
+            backup = path.with_name(path.name + ".navcom-backup")
+            if not backup.exists():
+                backup.write_text(raw, encoding="utf-8")
+        tmp = path.with_name(path.name + f".navcom-tmp-{os.getpid()}")
+        tmp.write_text(new, encoding="utf-8")
+        if path.exists():
+            os.chmod(tmp, path.stat().st_mode & 0o777)
+        os.replace(tmp, path)
+    except OSError:
+        return False
+    return True
+
+
 def json_setting(path, dotted):
     try:
         node = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -1487,8 +1549,11 @@ def ensure_registered_retention():
             continue
         try:
             spec = h["retention"]()
-            if spec and str(spec.get("settings_path", "")).endswith(".json"):
-                ensure_json_setting(spec["settings_path"], spec["key_path"], spec["never_delete_value"])
+            target = str(spec.get("settings_path", "")) if spec else ""
+            if target.endswith(".json"):
+                ensure_json_setting(target, spec["key_path"], spec["never_delete_value"])
+            elif target.endswith((".yaml", ".yml")) and spec["key_path"].count(".") == 1:
+                ensure_yaml_setting(target, spec["key_path"], spec["never_delete_value"])
             elif spec and spec.get("apply"):
                 spec["apply"]()  # non-JSON settings (YAML…) supply their own careful editor
         except Exception:
@@ -2865,7 +2930,7 @@ SKILL_NAME = "navcom-session-recall"
 SKILL_MARKER = "<!-- managed by navcom: updated automatically on upgrade; edit freely and it will be left alone -->"
 SKILL_MD = """---
 name: navcom-session-recall
-description: Search every past AI coding session on this machine (Claude Code, Codex, Gemini CLI, pi, omo, opencode, goose, DeepSeek dsh, Grok Build, Kilo) with the local `navcom` CLI. Use when the user says "use navcom", asks to find an old conversation or thread, asks what was done/decided/tried before on a topic, wants to recover context after a compaction, or needs evidence from past sessions (commands run, errors seen, decisions) before continuing work.
+description: Search every past AI coding session on this machine (Claude Code, Codex, Gemini CLI, Copilot CLI, Cline, Continue, Qwen Code, Kimi Code, Crush, pi, omo, opencode, goose, Kilo, DeepSeek dsh/Codewhale/Reasonix/Deep Code, Grok Build) with the local `navcom` CLI. Use when the user says "use navcom", asks to find an old conversation or thread, asks what was done/decided/tried before on a topic, wants to recover context after a compaction, or needs evidence from past sessions (commands run, errors seen, decisions) before continuing work.
 ---
 """ + SKILL_MARKER + """
 
@@ -3019,7 +3084,7 @@ def install_skills(force=False, report=False):
     return done
 
 
-SKILL_SUMMARY = ("Search every past AI coding session (Claude Code, Codex, Gemini, pi, omo, opencode, goose, DeepSeek, Grok, Kilo) "
+SKILL_SUMMARY = ("Search every past AI coding session (Claude Code, Codex, Gemini, Copilot, Cline, Qwen, Kimi, DeepSeek, Grok, …) "
                  "with navcom: find, then --open")
 
 
@@ -6955,6 +7020,495 @@ def deepcode_title(key):
     return str(entry.get("summary") or "").strip()
 
 
+# ── Hermes Agent (hermes) ────────────────────────────────────────────────────
+# Hermes Agent (NousResearch) ─ $HERMES_HOME/state.db  (default ~/.hermes/state.db)
+#
+# One SQLite DB holds every session (CLI, gateway: telegram/slack/discord/…, cron, subagents):
+#   sessions(id, source, cwd, git_repo_root, title, started_at, ended_at, …)
+#   messages(id, session_id, role user|assistant|tool, content, tool_calls JSON, tool_name,
+#            tool_call_id, timestamp, active, compacted, [display_kind, _compressed_summary] …)
+# List/dict content is stored as "\x00json:" + json. Thinking lives in reasoning* columns (skipped).
+# Named profiles keep their own DB: <hermes root>/profiles/<name>/state.db.
+
+def _hermes_hermes_home():
+    return _env_path("HERMES_HOME") or Path.home() / ".hermes"
+
+
+def hermes_roots():
+    dbs, seen = [], set()
+    for home in (_hermes_hermes_home(), Path.home() / ".hermes"):
+        profiles = home / "profiles"
+        candidates = [home / "state.db"] + (sorted(profiles.glob("*/state.db")) if profiles.is_dir() else [])
+        for db in candidates:
+            if str(db) not in seen:
+                seen.add(str(db))
+                dbs.append(db)
+    return dbs
+
+
+def hermes_list():
+    logs = []
+    for db in hermes_roots():
+        if not db.is_file():
+            continue
+        try:
+            conn = _ro_connect(db)
+            rows = conn.execute(
+                "SELECT s.id, COALESCE(MAX(m.timestamp), s.ended_at, s.started_at), COUNT(m.id) "
+                "FROM sessions s JOIN messages m ON m.session_id = s.id GROUP BY s.id").fetchall()
+            conn.close()
+        except sqlite3.Error:
+            continue
+        for sid, last, count in rows:
+            logs.append((f"{db}#{sid}", float(last or 0), int(count or 0), "hermes"))
+    return logs
+
+
+def _hermes_split(key):
+    db, _, sid = str(key).rpartition("#")
+    return db, sid
+
+
+def _hermes_decode(content):
+    if isinstance(content, str) and content.startswith("\x00json:"):
+        try:
+            return _text_of(json.loads(content[len("\x00json:"):]))
+        except Exception:
+            return content
+    return content if isinstance(content, str) else ""
+
+
+_hermes_COMPACTION = ("[CONTEXT COMPACTION", "[CONTEXT SUMMARY]:")
+_hermes_INJECTED = ("[System note:", "[System:", "[SYSTEM:", "[IMPORTANT:", "[Note:", "[Runtime note:") + _hermes_COMPACTION
+_hermes_SKILL_PREFIX = "[IMPORTANT: The user has invoked the "
+
+
+def _hermes_user_text(text):
+    """What the human typed: strip Hermes' bracketed notes, memory fences and skill scaffolding."""
+    text = (text or "").strip()
+    if text.startswith(_hermes_COMPACTION):
+        return ""
+    if text.startswith(_hermes_SKILL_PREFIX):  # mirrors agent/skill_commands.extract_user_instruction_from_skill_message
+        if " skill bundle," in text:
+            i = text.find("\nUser instruction: ")
+            text = text[i + 19:].split("\n\n[Loaded as part of the ")[0] if i >= 0 else ""
+        else:
+            marker = "The user has provided the following instruction alongside the skill invocation: "
+            i = text.rfind(marker)
+            text = text[i + len(marker):].split("\n\n[Runtime note:")[0] if i >= 0 else ""
+    text = re.sub(r"<memory-context>.*?</memory-context>", "", text, flags=re.S).strip()
+    while text.startswith(_hermes_INJECTED):
+        end = text.find("]\n\n")
+        text = "" if end < 0 else text[end + 3:].lstrip()
+    for tail in ("\n\n[Note: Some earlier conversation turns", "\n\n[Runtime note:"):
+        text = text.split(tail)[0]
+    return text.strip()
+
+
+def hermes_iter(key):
+    db, sid = _hermes_split(key)
+    try:
+        conn = _ro_connect(db)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
+        source = (conn.execute("SELECT source FROM sessions WHERE id = ?", (sid,)).fetchone() or [""])[0]
+        extra = [c for c in ("display_kind", "_compressed_summary") if c in cols]
+        where = " AND (active = 1 OR compacted = 1)" if {"active", "compacted"} <= cols else ""
+        rows = conn.execute(
+            "SELECT role, content, tool_calls, tool_name, tool_call_id"
+            + "".join(f", {c}" for c in extra)
+            + f" FROM messages WHERE session_id = ?{where} ORDER BY id", (sid,)).fetchall()
+        conn.close()
+    except sqlite3.Error:
+        return
+    calls = {}
+    for row in rows:
+        role, content, tool_calls, tool_name, call_id = row[:5]
+        flags = dict(zip(extra, row[5:]))
+        if flags.get("display_kind") == "hidden" or flags.get("_compressed_summary"):
+            continue  # model-facing scaffolding / compaction summary
+        text = _hermes_decode(content)
+        if role == "user":
+            text = "" if source == "subagent" else _hermes_user_text(text)
+            if text:
+                yield "user", text
+        elif role == "assistant":
+            if text.strip() and not text.lstrip().startswith(_hermes_COMPACTION):
+                yield "assistant", text
+            try:
+                parsed = json.loads(tool_calls) if tool_calls else []
+            except Exception:
+                parsed = []
+            for call in parsed if isinstance(parsed, list) else []:
+                fn = (call or {}).get("function") or {}
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        pass
+                label = _call_label(fn.get("name"), args)
+                for cid in (call.get("id"), call.get("call_id")):
+                    if cid:
+                        calls[cid] = label
+                cmd = _shell_cmd(fn.get("name"), args)
+                if cmd:
+                    yield "cmd", cmd
+        elif role == "tool":
+            turn = tool_turn(calls.get(call_id) or tool_name or "tool", text)
+            if turn:
+                yield turn
+
+
+def _hermes_session_row(key, column):
+    db, sid = _hermes_split(key)
+    try:
+        conn = _ro_connect(db)
+        row = conn.execute(f"SELECT {column}, source FROM sessions WHERE id = ?", (sid,)).fetchone()
+        conn.close()
+        return row
+    except sqlite3.Error:
+        return None
+
+
+def hermes_project(key):
+    row = _hermes_session_row(key, "COALESCE(NULLIF(cwd, ''), git_repo_root, '')")
+    return (row[0] or "") if row else ""
+
+
+def hermes_title(key):
+    row = _hermes_session_row(key, "title")
+    if not row or not row[0]:
+        return ""
+    title, source = row
+    return title if source in (None, "", "cli") else f"[{source}] {title}"
+
+
+def _hermes_sessions_yaml_block(path):
+    """Line-based read of the top-level `sessions:` mapping in config.yaml (stdlib has no YAML)."""
+    out, inside = {}, False
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        if re.match(r"^sessions:\s*(#.*)?$", line):
+            inside = True
+            continue
+        if inside:
+            if line and not line[0].isspace() and not line.lstrip().startswith("#"):
+                break
+            m = re.match(r"^\s+(auto_prune|retention_days):\s*([^#\s]+)", line)
+            if m:
+                out[m.group(1)] = m.group(2).strip("'\"")
+    return out
+
+
+def hermes_retention():
+    path = _hermes_hermes_home() / "config.yaml"
+    block = _hermes_sessions_yaml_block(path)
+    try:
+        days = int(block.get("retention_days", 90))
+    except ValueError:
+        days = 90
+    current = block.get("auto_prune")
+    return {
+        "settings_path": str(path),
+        "key_path": "sessions.auto_prune",
+        "never_delete_value": False,
+        "default_days": days,
+        "note": ("YAML, not JSON (stdlib cannot round-trip it). Since release v2026.9.7 Hermes defaults "
+                 "sessions.auto_prune: true (hermes_cli/config_defaults.py) and deletes ENDED sessions inactive "
+                 "for sessions.retention_days (90) from state.db at CLI/gateway/cron startup, at most once per "
+                 "sessions.min_interval_hours (24); v2026.8.31 and older (this Mac: v0.17.0 / 2026.6.19) "
+                 "defaulted it to false. Safe fix: `hermes config set sessions.auto_prune false`, or append a "
+                 "top-level 'sessions:' block with 'auto_prune: false' when the file has none. Each profile "
+                 "(<root>/profiles/<name>/config.yaml) has its own setting. "
+                 f"Currently: auto_prune={current if current is not None else 'unset (version default)'}."),
+    }
+
+
+# ── OpenHands (openhands) ────────────────────────────────────────────────────
+# OpenHands CLI (V1 / software-agent-sdk) ─ $OPENHANDS_CONVERSATIONS_DIR
+# (default $OPENHANDS_PERSISTENCE_DIR/conversations = ~/.openhands/conversations)
+#
+#   <conv hex>/base_state.json                        agent config + workspace.working_dir
+#   <conv hex>/events/event-NNNNN-<uuid>.json         one JSON object per event, "kind" discriminator
+#   <conv hex>/subagents/<hex>/{base_state.json,events/}  task/delegate sub-conversations
+#
+# Kinds: SystemPromptEvent (skip) · MessageEvent (source user|agent|environment; llm_message.content parts;
+# extended_content = injected agent context, skipped) · ActionEvent (tool_name, action{…}, thought = visible text,
+# reasoning_content skipped; FinishAction.message = final reply) · ObservationEvent (observation.content parts) ·
+# UserRejectObservation · AgentErrorEvent · Condensation*/ConversationStateUpdate/Pause/Token… (skip).
+# The key is the conversation directory.
+
+def openhands_roots():
+    explicit = _env_path("OPENHANDS_CONVERSATIONS_DIR")
+    if explicit:
+        return [explicit]
+    return [(_env_path("OPENHANDS_PERSISTENCE_DIR") or Path.home() / ".openhands") / "conversations"]
+
+
+def _openhands_event_files(conv):
+    def idx(p):
+        m = re.match(r"event-(\d+)-", p.name)
+        return int(m.group(1)) if m else 0
+    try:
+        return sorted(Path(conv, "events").glob("event-*.json"), key=idx)
+    except OSError:
+        return []
+
+
+def openhands_list():
+    logs = []
+    for root in openhands_roots():
+        if not root.is_dir():
+            continue
+        for conv in list(root.glob("*")) + list(root.glob("*/subagents/*")):
+            events = conv / "events"
+            if not events.is_dir():
+                continue
+            files = _openhands_event_files(conv)
+            if not files:
+                continue
+            try:
+                mtime = max([events.stat().st_mtime] + [f.stat().st_mtime for f in files[-3:]])
+            except OSError:
+                continue
+            logs.append((str(conv), mtime, len(files), "openhands"))
+    return logs
+
+
+# Messages the SDK itself sends with source="user" (response_dispatch nudge, critic refinement).
+_openhands_NUDGES = ("Your last response did not include a function call or a message",
+           "The task appears incomplete (iteration ")
+
+
+def _openhands_parts_text(parts):
+    return _text_of(parts if isinstance(parts, list) else [parts] if parts else [])
+
+
+def _openhands_args(event):
+    action = event.get("action")
+    if isinstance(action, dict):
+        return {k: v for k, v in action.items() if k != "kind"}
+    raw = (event.get("tool_call") or {}).get("arguments")
+    try:
+        return json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return raw
+
+
+def openhands_iter(key):
+    sub = "/subagents/" in str(key)
+    calls = {}
+    for path in _openhands_event_files(key):
+        try:
+            ev = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        kind = ev.get("kind")
+        if kind == "MessageEvent":
+            msg = ev.get("llm_message") or {}
+            text = _openhands_parts_text(msg.get("content"))  # extended_content (skills/hook context) deliberately ignored
+            if not text.strip():
+                continue
+            if ev.get("source") == "user" and msg.get("role") == "user":
+                if not sub and not ev.get("sender") and not text.startswith(_openhands_NUDGES):
+                    yield "user", text
+            elif ev.get("source") == "agent" and msg.get("role") == "assistant":
+                yield "assistant", text
+        elif kind == "ActionEvent":
+            thought = _openhands_parts_text(ev.get("thought"))
+            if thought.strip():
+                yield "assistant", thought
+            name, args = ev.get("tool_name"), _openhands_args(ev)
+            action = ev.get("action") or {}
+            if action.get("kind") == "FinishAction" or name == "finish":
+                if isinstance(args, dict) and str(args.get("message") or "").strip():
+                    yield "assistant", str(args["message"])
+                continue
+            if name == "think":
+                continue  # the think tool is reasoning
+            label_args = args
+            if isinstance(args, dict) and args.get("path") and not _is_shell_tool(name):
+                label_args = {"path": f"{args.get('command', '')} {args['path']}".strip()}
+            calls[ev.get("tool_call_id")] = _call_label(name, label_args)
+            cmd = _shell_cmd(name, args)
+            if cmd:
+                yield "cmd", cmd
+        elif kind in ("ObservationEvent", "UserRejectObservation", "AgentErrorEvent"):
+            if ev.get("tool_name") in ("finish", "think"):
+                continue
+            obs = ev.get("observation") or {}
+            if kind == "ObservationEvent":
+                output = _openhands_parts_text(obs.get("content"))
+                code = obs.get("exit_code")
+                if obs.get("is_error") or code not in (None, 0, -1):
+                    output = f"exit {code}\n{output}" if code not in (None, 0) else "error\n" + output
+            elif kind == "UserRejectObservation":
+                output = "rejected: " + str(ev.get("rejection_reason") or "")
+            else:
+                output = "error\n" + str(ev.get("error") or "")
+            turn = tool_turn(calls.get(ev.get("tool_call_id"), ev.get("tool_name") or "tool"), output)
+            if turn:
+                yield turn
+
+
+def _openhands_base_state(key):
+    try:
+        with open(Path(key) / "base_state.json", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def openhands_project(key):
+    ws = _openhands_base_state(key).get("workspace") or {}
+    if isinstance(ws.get("working_dir"), str):
+        return ws["working_dir"]
+    for path in _openhands_event_files(key):  # fall back to the first terminal observation's cwd
+        try:
+            ev = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        wd = ((ev.get("observation") or {}).get("metadata") or {}).get("working_dir")
+        if isinstance(wd, str) and wd:
+            return wd
+    return ""
+
+
+def openhands_title(key):
+    # The CLI stores no title; it shows the first user prompt (conversations/store/local.py).
+    tags = _openhands_base_state(key).get("tags") or {}
+    return str(tags.get("title") or "") if isinstance(tags, dict) else ""
+
+
+# ── Mistral Vibe (vibe) ──────────────────────────────────────────────────────
+# Mistral Vibe ─ <session_logging.save_dir>/<prefix>_<YYYYmmdd_HHMMSS UTC>_<id8>/{meta.json,messages.jsonl}
+# (default save_dir = $VIBE_HOME/logs/session = ~/.vibe/logs/session; prefix "session")
+#
+# messages.jsonl: one LLMMessage per line (system prompt is NOT written; it lives in meta.json):
+#   {"role": "user"|"assistant"|"tool", "content": str, "injected": bool, "input_text"?, "reasoning_content"?,
+#    "tool_calls"?: [{"id","function":{"name","arguments": json-str}}], "name"?, "tool_call_id"?,
+#    "tool_result"?, "manual_shell"?: {"command","cwd","stdout","stderr","output_text","exit_code",…},
+#    "context_boundary"?: "compaction"}
+# meta.json: session_id, title, environment.working_directory, origin_directory, config, system_prompt, stats…
+
+def _vibe_vibe_home():
+    return _env_path("VIBE_HOME") or Path.home() / ".vibe"
+
+
+def vibe_roots():
+    roots = []
+    try:
+        import tomllib
+        cfg = tomllib.loads((_vibe_vibe_home() / "config.toml").read_text(encoding="utf-8"))
+        save_dir = (cfg.get("session_logging") or {}).get("save_dir")
+        if isinstance(save_dir, str) and save_dir.strip():
+            roots.append(Path(save_dir).expanduser())
+    except Exception:
+        pass
+    default = _vibe_vibe_home() / "logs" / "session"
+    if default not in roots:
+        roots.append(default)
+    return roots
+
+
+def vibe_list():
+    paths = []
+    for root in vibe_roots():
+        try:
+            if root.is_dir():
+                paths.extend(p for p in root.glob("*/messages.jsonl") if (p.parent / "meta.json").exists())
+        except OSError:
+            continue
+    return _file_logs(paths, "vibe")
+
+
+def vibe_iter(key):
+    calls = {}
+    try:
+        handle = open(key, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with handle:
+        for line in handle:
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            shell = msg.get("manual_shell")
+            if isinstance(shell, dict) and shell.get("command"):
+                # user typed `!<command>` in the TUI: the message text is Vibe's context wrapper
+                yield "cmd", shell["command"]
+                output = shell.get("output_text") or "\n".join(
+                    s for s in (shell.get("stdout"), shell.get("stderr")) if s)
+                code = shell.get("exit_code")
+                turn = tool_turn(f"!: {shell['command']}", (f"exit {code}\n" if code not in (None, 0) else "") + (output or ""))
+                if turn:
+                    yield turn
+                continue
+            if role == "user":
+                if msg.get("injected") or msg.get("context_boundary"):
+                    continue  # retries, hook output, compaction summaries, skill/file expansions
+                text = msg.get("input_text") or _text_of(msg.get("content") or "")
+                if text.strip():
+                    yield "user", text
+            elif role == "assistant":
+                text = _text_of(msg.get("content") or "")
+                if text.strip() and not msg.get("injected") and not msg.get("context_boundary"):
+                    yield "assistant", text
+                for call in msg.get("tool_calls") or []:
+                    fn = (call or {}).get("function") or {}
+                    args = fn.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except Exception:
+                            pass
+                    calls[call.get("id")] = _call_label(fn.get("name"), args)
+                    cmd = _shell_cmd(fn.get("name"), args)
+                    if cmd:
+                        yield "cmd", cmd
+            elif role == "tool":
+                output = _text_of(msg.get("content") or "")
+                result = (msg.get("tool_result") or {}).get("output") if isinstance(msg.get("tool_result"), dict) else None
+                if isinstance(result, dict) and ("stdout" in result or "stderr" in result):
+                    code = result.get("returncode", result.get("exit_code"))
+                    output = (f"exit {code}\n" if code not in (None, 0) else "") + "\n".join(
+                        str(result[k]) for k in ("stdout", "stderr") if result.get(k))
+                elif not output.strip() and result:
+                    output = result
+                turn = tool_turn(calls.get(msg.get("tool_call_id"), msg.get("name") or "tool"), output)
+                if turn:
+                    yield turn
+
+
+def _vibe_meta(key):
+    try:
+        with open(Path(key).parent / "meta.json", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def vibe_project(key):
+    meta = _vibe_meta(key)
+    env = meta.get("environment") if isinstance(meta.get("environment"), dict) else {}
+    for value in (env.get("working_directory"), meta.get("origin_directory")):
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def vibe_title(key):
+    title = _vibe_meta(key).get("title")
+    return title if isinstance(title, str) else ""
+
+
 register_harness('qwen', list_fn=qwen_list, iter_fn=qwen_iter, project_fn=qwen_project,
                  title_fn=qwen_title, roots_fn=qwen_roots, match=lambda p: '/.qwen/' in p,
                  aliases=['qwen-code', 'qwencode', 'alibaba'], color='93', archivable=True, label='Qwen Code',
@@ -6983,6 +7537,16 @@ register_harness('reasonix', list_fn=reasonix_list, iter_fn=reasonix_iter, proje
 register_harness('deepcode', list_fn=deepcode_list, iter_fn=deepcode_iter, project_fn=deepcode_project,
                  title_fn=deepcode_title, roots_fn=deepcode_roots, match=lambda p: '/.deepcode/' in p,
                  aliases=['deep-code', 'deepcode-cli'], color='92', archivable=True, label='Deep Code')
+register_harness('hermes', list_fn=hermes_list, iter_fn=hermes_iter, project_fn=hermes_project,
+                 title_fn=hermes_title, roots_fn=hermes_roots, match=lambda p: '/.hermes/' in p,
+                 aliases=['nous', 'hermes-agent'], color='33', archivable=False, label='Hermes Agent',
+                 retention_fn=hermes_retention)
+register_harness('openhands', list_fn=openhands_list, iter_fn=openhands_iter, project_fn=openhands_project,
+                 title_fn=openhands_title, roots_fn=openhands_roots, match=lambda p: '/.openhands/' in p,
+                 aliases=['open-hands', 'all-hands'], color='32', archivable=False, label='OpenHands')
+register_harness('vibe', list_fn=vibe_list, iter_fn=vibe_iter, project_fn=vibe_project,
+                 title_fn=vibe_title, roots_fn=vibe_roots, match=lambda p: '/.vibe/' in p,
+                 aliases=['mistral', 'mistral-vibe'], color='91', archivable=True, label='Mistral Vibe')
 # <<< registered harnesses
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6991,8 +7555,8 @@ register_harness('deepcode', list_fn=deepcode_list, iter_fn=deepcode_iter, proje
 
 HELP_TEXT = """\
 navcom — instant full-text search over every AI coding session on this machine:
-Claude Code, Codex, Gemini CLI, pi, omo, opencode, goose, DeepSeek dsh, Grok Build, Kilo.
-SQLite FTS5 + BM25, ~0.2s.
+{HARNESSES}.
+SQLite FTS5 + BM25, ~0.2s.  `navcom --where` shows which ones are on this machine.
 
 THE RECIPE (agents: this is all you need)
   1. navcom <words>                 find: hits grouped by session → date, harness, project, ref, #turn
@@ -7100,11 +7664,25 @@ class NavcomArgumentParser(argparse.ArgumentParser):
         raise SystemExit(2)
 
 
+def harness_names_wrapped(width=96):
+    names = ["Claude Code", "Codex", "Gemini CLI", "pi", "omo", "opencode", "goose", "DeepSeek dsh",
+             "Grok Build", "Kilo"] + [h["label"] for h in EXTRA_HARNESSES.values()]
+    lines, line = [], ""
+    for name in names:
+        piece = (", " if line else "") + name
+        if len(line) + len(piece) > width:
+            lines.append(line + ",")
+            line = name
+        else:
+            line += piece
+    return "\n".join(lines + [line])
+
+
 def build_parser():
     parser = NavcomArgumentParser(
         prog="navcom",
         usage="navcom [words ...] [options]      (full manual below; examples in every section)",
-        description=HELP_TEXT,
+        description=HELP_TEXT.replace("{HARNESSES}", harness_names_wrapped()),
         formatter_class=argparse.RawTextHelpFormatter,
         allow_abbrev=True,
     )
@@ -7629,7 +8207,8 @@ def cmd_where(conn, providers):
             continue
         if not spec or not Path(spec["settings_path"]).parent.is_dir():
             continue
-        current = spec.get("status")() if spec.get("status") else json_setting(spec["settings_path"], spec["key_path"])
+        reader = yaml_setting if str(spec["settings_path"]).endswith((".yaml", ".yml")) else json_setting
+        current = reader(spec["settings_path"], spec["key_path"])
         if current is None:
             safe_print(f"  {hid:8s} retention: DELETES after {spec.get('default_days', '?')} days by default "
                        f"({spec['key_path']} unset in {spec['settings_path']})")
