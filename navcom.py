@@ -56,7 +56,7 @@ def load_module(code, name):
 clean_mod = load_module(LOG_CLEAN_QUICK_CODE, "log_clean_quick")
 fts_mod = load_module(LOG_SEARCH_FTS5_CODE, "log_search_fts5")
 
-NAVCOM_VERSION = "0.7.0"
+NAVCOM_VERSION = "0.7.1"
 DEFAULT_LIMIT = 20  # hits per harness (and sessions listed by a bare `navcom`)
 
 # Every harness navcom knows how to read. Order = display order in help/listings.
@@ -3114,22 +3114,62 @@ separately from what you verified live now, and flag anything memory-derived as 
 """
 
 
-def skill_targets():
-    """Skill folders of the harnesses that are actually installed here."""
+def _home_dir(env, default):
+    return _env_path(env) or Path.home() / default
+
+
+# Where each harness discovers USER-LEVEL Agent Skills (verified per harness: live runs, shipped
+# bundles, source). Each entry: (skills dir, harness homes whose presence means "install here",
+# who it serves). Shared dirs come first; per-harness dirs only where a harness reads neither
+# ~/.claude/skills nor ~/.agents/skills. Deliberately NOT written (they'd only add duplicates —
+# Codex 0.159 lists both ~/.codex/skills and ~/.agents/skills copies, Gemini warns on conflicts,
+# Factory treats a second personal copy as invalid, OpenHands warns): ~/.codex/skills, ~/.factory/skills,
+# ~/.openhands/skills, ~/.cline/skills, ~/.codewhale/skills, ~/.reasonix/skills, ~/.deepcode/skills,
+# ~/.vibe/skills, ~/.augment/skills, ~/.cursor/skills. Aider has no global mechanism (only the
+# user's own ~/.aider.conf.yml), so it is skipped.
+def skill_target_table():
     home = Path.home()
-    claude_home = _env_path("CLAUDE_CONFIG_DIR") or home / ".claude"
-    codex_home = _env_path("CODEX_HOME") or home / ".codex"
-    targets = []
-    if claude_home.is_dir():
-        targets.append(claude_home / "skills")          # Claude Code (opencode/goose read it too)
-    if codex_home.is_dir():
-        targets.append(codex_home / "skills")           # Codex
-    agents_users = [home / ".agents", home / ".pi", home / ".omo", opencode_data_root(),
-                    home / ".config" / "opencode", home / ".config" / "goose", home / ".gemini",
-                    home / ".dsh", home / ".grok", kilo_db_path().parent]
-    if any(p.is_dir() for p in agents_users):
-        targets.append(home / ".agents" / "skills")     # Agent Skills standard: pi, omo, opencode, goose
-    return targets
+    claude = _home_dir("CLAUDE_CONFIG_DIR", ".claude")
+    codex = _home_dir("CODEX_HOME", ".codex")
+    hermes = _home_dir("HERMES_HOME", ".hermes")
+    table = [
+        (claude / "skills", [claude], "Claude Code (opencode, Kilo, goose, Grok, Crush, Amp, Augment, Cursor also read it)"),
+        (home / ".agents" / "skills",
+         [home / ".agents", codex, home / ".gemini", home / ".pi", home / ".omo", opencode_data_root(),
+          home / ".config" / "opencode", home / ".config" / "goose", home / ".dsh", home / ".grok",
+          kilo_db_path().parent, home / ".config" / "kilo", home / ".kilocode", _home_dir("QWEN_HOME", ".qwen"),
+          _home_dir("KIMI_CODE_HOME", ".kimi-code"), _home_dir("COPILOT_HOME", ".copilot"), home / ".config" / "crush",
+          home / ".cline", home / ".codewhale", home / ".reasonix", home / ".deepcode", home / ".openhands",
+          home / ".vibe", home / ".factory", home / ".cursor", home / ".config" / "amp", home / ".augment"],
+         "Agent Skills standard: Codex, Gemini CLI, Copilot CLI, pi, omo, opencode, Kilo, goose, Qwen, Kimi, Crush, "
+         "DeepSeek dsh, Grok Build, Cline, Codewhale, Reasonix, Deep Code, OpenHands, Mistral Vibe, Factory, "
+         "Cursor, Amp, Augment, grok-dev"),
+        (_home_dir("CONTINUE_GLOBAL_DIR", ".continue") / "skills", [_home_dir("CONTINUE_GLOBAL_DIR", ".continue")],
+         "Continue (cn + IDE)"),
+        (hermes / "skills", [hermes], "Hermes Agent"),
+        (_home_dir("KIRO_HOME", ".kiro") / "skills", [_home_dir("KIRO_HOME", ".kiro")], "Kiro CLI"),
+        (home / ".gemini" / "config" / "skills", [home / ".gemini" / "antigravity-cli", home / ".gemini" / "config"],
+         "Antigravity CLI"),
+    ]
+    profiles = hermes / "profiles"
+    if profiles.is_dir():  # every Hermes profile has its own skills dir
+        for prof in sorted(p for p in profiles.iterdir() if p.is_dir()):
+            table.append((prof / "skills", [prof], f"Hermes profile {prof.name}"))
+    return table
+
+
+def retired_skill_targets():
+    """Folders older navcom versions wrote that now only create duplicates."""
+    return [_home_dir("CODEX_HOME", ".codex") / "skills"]
+
+
+def skill_targets():
+    """Skill folders of the harnesses that are actually installed here (deduped, order kept)."""
+    out = []
+    for target, homes, _who in skill_target_table():
+        if any(h.is_dir() for h in homes) and target not in out:
+            out.append(target)
+    return out
 
 
 def _skill_state_path():
@@ -3151,6 +3191,31 @@ def install_skills(force=False, report=False):
     except Exception:
         state = {}
     changed, done = False, []
+    for root in retired_skill_targets():
+        path = root / SKILL_NAME / "SKILL.md"
+        try:
+            current = path.read_text(encoding="utf-8") if path.exists() else None
+        except OSError:
+            current = None
+        if current is None or SKILL_MARKER not in current:
+            continue  # not ours (or already gone): leave it
+        try:
+            live = {(t / SKILL_NAME / "SKILL.md").resolve() for t in skill_targets()}
+            if path.resolve() in live:
+                continue  # symlinked onto a live target: deleting would remove the real card
+        except OSError:
+            continue
+        if state.get(str(path)) not in (None, digest(current)) and not force:
+            done.append((path, "left alone (edited by someone)"))
+            continue
+        try:
+            path.unlink()
+            path.parent.rmdir() if not any(path.parent.iterdir()) else None
+            state.pop(str(path), None)
+            changed = True
+            done.append((path, "removed (duplicate: also read from ~/.agents/skills)"))
+        except OSError:
+            pass
     for root in skill_targets():
         path = root / SKILL_NAME / "SKILL.md"
         key = str(path)
@@ -3187,8 +3252,13 @@ def install_skills(force=False, report=False):
     if report:
         if not done:
             safe_print("navcom: no agent harness found to install the skill into")
+        who = {str(t / SKILL_NAME / "SKILL.md"): w for t, _h, w in skill_target_table()}
         for path, what in done:
             safe_print(f"  {what:32s} {path}")
+            if str(path) in who:
+                safe_print(f"  {'':32s}   read by {who[str(path)]}")
+        if done:
+            safe_print(f"  {'':32s} Aider has no global skills folder: add the card with read: in ~/.aider.conf.yml")
     return done
 
 
@@ -10126,7 +10196,8 @@ THE RECIPE (agents: this is all you need)
   2. navcom --open <ref>:<turn>     read the turns around one hit, full text
   Don't grep raw session logs, don't strip punctuation, don't bother with --compact (it's the default).
   navcom --skill                    print navcom's SKILL.md skill card (already auto-installed for
-                                    Claude Code, Codex, pi, omo, opencode, goose — navcom --skill install)
+                                    every harness here: Claude, Codex, Gemini, Copilot, pi, omo, opencode,
+                                    goose, Qwen, Kimi, Continue, Hermes, Kiro, … — navcom --skill install)
 
 QUERIES — type anything; navcom never errors on query syntax
   navcom cognito token refresh      all words in one turn, each prefix-matched (auth → authentication)

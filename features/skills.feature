@@ -11,8 +11,10 @@ Feature: The navcom skill card installs itself
     When I run: navcom zebracorn
     Then it succeeds
     And the skill card exists for "claude"
-    And the skill card exists for "codex"
     And the skill card exists for "agents"
+    And the skill card exists for "continue"
+    And the skill card exists for "hermes"
+    And the skill card is missing for "codex"
     And stderr does not mention skills
 
   Scenario: A skill someone edited is left alone
@@ -23,9 +25,23 @@ Feature: The navcom skill card installs itself
 
   Scenario: An older navcom-managed card is updated on upgrade
     When I run: navcom zebracorn
-    And the "codex" skill card is from an older navcom
+    And the "agents" skill card is from an older navcom
     And I run: navcom zebracorn
-    Then the "codex" skill card is current
+    Then the "agents" skill card is current
+
+  Scenario: The duplicate Codex card an older navcom wrote is retired
+    When I run: navcom zebracorn
+    And an older navcom left its skill card for "codex"
+    And I run: navcom zebracorn
+    Then the skill card is missing for "codex"
+    And the skill card exists for "agents"
+
+  Scenario: An edited Codex card is never deleted
+    When I run: navcom zebracorn
+    And an older navcom left its skill card for "codex"
+    And I edit the "codex" skill card
+    And I run: navcom zebracorn
+    Then the "codex" skill card still has my edit
 
   Scenario: Opting out
     When I run with NAVCOM_NO_SKILLS=1: navcom zebracorn
@@ -47,8 +63,8 @@ Feature: The navcom skill card installs itself
     When I run with NAVCOM_NO_SKILLS=1: navcom --skill install
     Then it succeeds
     And the skill card exists for "claude"
-    And the skill card exists for "codex"
     And the skill card exists for "agents"
+    And the skill card is missing for "codex"
 
   Scenario: Skillflag-compatible list and export
     When I run: navcom --skill list

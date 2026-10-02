@@ -143,7 +143,8 @@ def step_hang(context):
 
 
 def _skill_path(context, which):
-    base = {"claude": ".claude", "codex": ".codex", "agents": ".agents"}[which]
+    base = {"claude": ".claude", "codex": ".codex", "agents": ".agents", "continue": ".continue",
+            "hermes": ".hermes", "kiro": ".kiro", "antigravity": ".gemini/config"}[which]
     return context.home / base / "skills" / "navcom-session-recall" / "SKILL.md"
 
 
@@ -184,6 +185,20 @@ def step_older(context, which):
     state = context.home / "navcom-skills.json"
     data = json.loads(state.read_text())
     data[str(p)] = hashlib.sha256(old.encode()).hexdigest()
+    state.write_text(json.dumps(data))
+
+
+@when('an older navcom left its skill card for "{which}"')
+def step_leftover(context, which):
+    import hashlib
+    import json
+    p = _skill_path(context, which)
+    card = _skill_path(context, "claude").read_text()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(card)
+    state = context.home / "navcom-skills.json"
+    data = json.loads(state.read_text())
+    data[str(p)] = hashlib.sha256(card.encode()).hexdigest()
     state.write_text(json.dumps(data))
 
 

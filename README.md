@@ -70,9 +70,22 @@ pipx upgrade navcom
 No dependencies. Python 3.10+.
 
 On every run, navcom silently installs or refreshes a small **agent skill card**
-(`navcom-session-recall/SKILL.md`) into each harness that is present:
-`~/.claude/skills` (Claude Code; opencode and goose read it too), `$CODEX_HOME/skills` (Codex) and
-`~/.agents/skills` (the Agent Skills location that pi, omo, opencode and goose read). Your agents then
+(`navcom-session-recall/SKILL.md`) into every skill folder a harness on this machine reads, one copy per
+folder so no agent sees it twice:
+
+| Folder | Read by |
+|---|---|
+| `$CLAUDE_CONFIG_DIR/skills` (`~/.claude/skills`) | Claude Code (opencode, Kilo, goose, Grok, Crush, Amp, Augment and Cursor read it too) |
+| `~/.agents/skills` | the Agent Skills standard: Codex, Gemini CLI, Copilot CLI, pi, omo, opencode, Kilo, goose, Qwen, Kimi, Crush, DeepSeek dsh, Grok Build, Cline, Codewhale, Reasonix, Deep Code, OpenHands, Mistral Vibe, Factory Droid, Cursor, Amp, Augment, grok-dev |
+| `~/.continue/skills` | Continue (cn and the IDE extension) |
+| `$HERMES_HOME/skills` (+ each profile) | Hermes Agent |
+| `$KIRO_HOME/skills` | Kiro CLI |
+| `~/.gemini/config/skills` | Antigravity CLI |
+
+Aider has no global skill mechanism; point it at the card with `read:` in `~/.aider.conf.yml` if you want.
+A folder is only written when its harness is installed. Older navcom versions also wrote
+`~/.codex/skills`; Codex reads `~/.agents/skills` too and listed the card twice, so navcom now removes
+that copy (only if it is navcom's own, unedited). Your agents
 know navcom exists before anyone mentions it. A card someone has edited is never overwritten.
 `NAVCOM_NO_SKILLS=1` turns it off.
 
