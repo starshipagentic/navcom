@@ -279,7 +279,31 @@ def build(home: Path, base_epoch: float = 1_790_000_000):
     con.commit()
     con.close()
     sessions["kilo"] = f"{kdb}#ses_kilo1"
+
+    # ── every registered harness ships its own format-faithful fixture builder ──
+    sessions.update(build_registered(home, cwd))
     return sessions, workdir
+
+
+def build_registered(home, cwd):
+    """Run <id>_fixture(home, cwd) from each features/support/harness_fixtures/<id>.py."""
+    import importlib.util
+    out = {}
+    for path in sorted((Path(__file__).parent / "harness_fixtures").glob("*.py")):
+        hid = path.stem
+        spec = importlib.util.spec_from_file_location(f"navcom_fixture_{hid}", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        fixture = getattr(module, f"{hid}_fixture", None)
+        if fixture is None:
+            continue
+        try:
+            key = fixture(home, cwd)
+        except FileNotFoundError:  # e.g. the zstd CLI is missing for Reasonix
+            continue
+        if key:
+            out[hid] = key
+    return out
 
 
 def env_for(home: Path):

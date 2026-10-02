@@ -106,3 +106,9 @@ Feature: Fast search across every harness
     When I run: navcom -v
     Then it succeeds
     And the output contains "navcom 0.4.0"
+
+  @critical
+  Scenario: Every registered harness indexes prompts, replies, commands and tool output — never injected context
+    Then every registered harness passes the four-role check
+    When I run: navcom zebracorninjected --everything --include-self
+    Then the output contains "No hits."

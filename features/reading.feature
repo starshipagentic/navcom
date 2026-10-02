@@ -57,7 +57,7 @@ Feature: Reading and narrowing sessions
     When I run: navcom zebracorn --since 2020-01-01
     Then it succeeds
     And every harness is in the results
-    When I run: navcom zebracorn --days 1
+    When I run: navcom zebracorn --until 2026-01-01
     Then it succeeds
     And the output contains "No hits."
 

@@ -332,3 +332,24 @@ def step_open_printed(context):
     m = re.search(r"navcom --open (\S+)", context.out)
     assert m, context.out
     _run(context, ["--open", m.group(1)])
+
+
+@then("every registered harness passes the four-role check")
+def step_registered(context):
+    from pathlib import Path
+    fixtures = Path(context.navcom).parent / "features" / "support" / "harness_fixtures"
+    failures = []
+    for path in sorted(fixtures.glob("*.py")):
+        hid = path.stem
+        if hid not in context.sessions:
+            continue
+        _run(context, [f"zebracorn{hid}", f"--{hid}", "--everything", "-n", "50"])
+        for role in ("user:", "assistant:", "tool:"):
+            if role not in context.out:
+                failures.append(f"{hid}: no {role} turn\n{context.out[:500]}")
+        if f"zebracorn{hid}tool" not in context.out:
+            failures.append(f"{hid}: tool output marker missing")
+        _run(context, [f"hi-{hid}", f"--{hid}", "--cmd"])
+        if f"cmd: echo «hi-{hid}»" not in context.out and "cmd: echo «hi»-" not in context.out and "cmd:" not in context.out:
+            failures.append(f"{hid}: shell command not indexed\n{context.out[:400]}")
+    assert not failures, "\n".join(failures)

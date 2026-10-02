@@ -74,6 +74,26 @@ PROVIDER_ALIASES = {
     "kilocode": "kilo", "kilo-code": "kilo",
 }
 
+# Harnesses added through register_harness(): id -> {list, iter, project, title, roots, match, …}.
+# Each is a self-contained block of functions further down; the built-in ones above are wired
+# by hand for historical reasons.
+EXTRA_HARNESSES = {}
+
+
+def register_harness(hid, *, list_fn, iter_fn, project_fn=None, title_fn=None, roots_fn=None,
+                     match=None, aliases=(), color="0", archivable=False, label=None, retention_fn=None):
+    """Plug a harness into listing, parsing, titles, projects, --where, flags and aliases."""
+    EXTRA_HARNESSES[hid] = {
+        "list": list_fn, "iter": iter_fn, "project": project_fn, "title": title_fn,
+        "roots": roots_fn, "match": match, "archivable": archivable, "label": label or hid,
+        "retention": retention_fn,
+    }
+    if hid not in ALL_PROVIDERS:
+        ALL_PROVIDERS.append(hid)
+    for alias in aliases:
+        PROVIDER_ALIASES[alias] = hid
+    _Style.PROVIDER_CODES[hid] = color
+
 
 @dataclass
 class Hit:
@@ -239,6 +259,7 @@ def provider_roots():
         "dsh": [dsh_sessions_root()],
         "grok": [grok_sessions_root()],
         "kilo": [kilo_db_path()],
+        **{hid: list(h["roots"]() if h["roots"] else []) for hid, h in EXTRA_HARNESSES.items()},
     }
 
 
@@ -259,6 +280,9 @@ def detect_provider_from_path(path):
     path_str = str(path)
     if path_str in _PROVIDER_BY_KEY:
         return _PROVIDER_BY_KEY[path_str]
+    for hid, h in EXTRA_HARNESSES.items():
+        if h["match"] and h["match"](path_str):
+            return hid
     if "opencode" in path_str:
         return "opencode"
     if "/.dsh/" in path_str:
@@ -412,6 +436,12 @@ def list_logs(providers):
         logs.extend(list_grok_logs())
     if "kilo" in providers:
         logs.extend(list_opencode_logs(kilo_db_path(), "kilo"))
+    for hid, h in EXTRA_HARNESSES.items():
+        if hid in providers:
+            try:
+                logs.extend(h["list"]())
+            except Exception as exc:  # one broken harness must never break search
+                sys.stderr.write(f"[navcom] skipped {hid}: {type(exc).__name__}: {exc}\n")
     logs.sort(key=lambda x: x[1])
     for key, _, _, provider in logs:
         _PROVIDER_BY_KEY[key] = provider
@@ -706,6 +736,8 @@ def _rescue_slash_command(text):
 
 
 def _raw_turns(key, provider, text_chunk=None):
+    if provider in EXTRA_HARNESSES:
+        return EXTRA_HARNESSES[provider]["iter"](key)
     if provider == "gemini":
         return iter_gemini_jsonl(key) if key.endswith(".jsonl") else iter_gemini_file(key)
     if provider == "dsh":
@@ -1401,6 +1433,68 @@ def gemini_retention_status():
     return days, "set in " + str(path)
 
 
+def ensure_json_setting(path, dotted, value):
+    """Set a dotted key in a plain-JSON settings file when it is unset (backup, atomic, never JSONC)."""
+    path = Path(path)
+    if not path.parent.is_dir():
+        return False
+    try:
+        raw = path.read_text(encoding="utf-8") if path.exists() else ""
+        data = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    node, keys = data, dotted.split(".")
+    for k in keys[:-1]:
+        if not isinstance(node.get(k, {}), dict):
+            return False
+        node = node.setdefault(k, {})
+    if keys[-1] in node:
+        return False  # the owner chose a value — respect it
+    node[keys[-1]] = value
+    try:
+        if raw:
+            backup = path.with_name(path.name + ".navcom-backup")
+            if not backup.exists():
+                backup.write_text(raw, encoding="utf-8")
+        tmp = path.with_name(path.name + f".navcom-tmp-{os.getpid()}")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        if path.exists():
+            os.chmod(tmp, path.stat().st_mode & 0o777)
+        os.replace(tmp, path)
+    except OSError:
+        return False
+    return True
+
+
+def json_setting(path, dotted):
+    try:
+        node = json.loads(Path(path).read_text(encoding="utf-8"))
+        for k in dotted.split("."):
+            node = node[k]
+        return node
+    except Exception:
+        return None
+
+
+def ensure_registered_retention():
+    """Harnesses that auto-delete history declare how to stop it (see <id>_retention())."""
+    if os.environ.get("NAVCOM_NO_RETENTION_FIX"):
+        return
+    for hid, h in EXTRA_HARNESSES.items():
+        if not h.get("retention"):
+            continue
+        try:
+            spec = h["retention"]()
+            if spec and str(spec.get("settings_path", "")).endswith(".json"):
+                ensure_json_setting(spec["settings_path"], spec["key_path"], spec["never_delete_value"])
+            elif spec and spec.get("apply"):
+                spec["apply"]()  # non-JSON settings (YAML…) supply their own careful editor
+        except Exception:
+            pass
+
+
 def ensure_gemini_retention():
     """Turn Gemini's automatic chat deletion off when nobody has configured it."""
     if os.environ.get("NAVCOM_NO_RETENTION_FIX"):
@@ -1441,6 +1535,12 @@ def ensure_gemini_retention():
 
 def _project_from_key(key, provider):
     """Best-effort working directory for a session without touching the index."""
+    if provider in EXTRA_HARNESSES:
+        fn = EXTRA_HARNESSES[provider]["project"]
+        try:
+            return (fn(key) if fn else "") or ""
+        except Exception:
+            return ""
     path = Path(key.split("#", 1)[0])
     if provider == "claude":
         # ~/.claude/projects/<-Users-t-dev-navcom>/<uuid>.jsonl (subagents nest deeper)
@@ -1638,7 +1738,11 @@ def _opencode_legacy_info(key):
     return {}
 
 
-_GENERIC_SESSION_FILES = re.compile(r"^(updates\.jsonl|session(\.v\d+)?\.jsonl(\.zstd)?|wire\.jsonl|events\.jsonl)$")
+_GENERIC_SESSION_FILES = re.compile(
+    r"^(updates\.jsonl|session(\.v\d+)?\.jsonl(\.zstd)?|wire\.jsonl|events\.jsonl|events\.frames|messages\.jsonl"
+    r"|transcript(_full)?\.jsonl|ui_messages\.json|api_conversation_history\.json|context(_\d+)?\.jsonl)$")
+# folder names inside a session folder that say nothing about which session it is
+_GENERIC_SESSION_DIRS = {"main", "agents", "logs", ".system_generated", "events", "sessions", "chats", "state"}
 
 
 def session_ref(key):
@@ -1646,7 +1750,11 @@ def session_ref(key):
     folder, for harnesses that name every transcript file the same: dsh, Grok Build)."""
     tail = key.split("#", 1)[1] if "#" in key else Path(key).name
     if "#" not in key and _GENERIC_SESSION_FILES.match(tail):
-        tail = Path(key).parent.name
+        for parent in Path(key).parents:  # nearest ancestor folder that names the session
+            if parent.name and parent.name not in _GENERIC_SESSION_DIRS and not parent.name.startswith("agent-"):
+                tail = parent.name
+                break
+    tail = re.sub(r"\.messages$", "", re.sub(r"\.(jsonl|json)$", "", tail))
     for ext in (".jsonl", ".json"):
         if tail.endswith(ext):
             tail = tail[: -len(ext)]
@@ -1918,6 +2026,12 @@ def session_meta(conn, key, provider=None):
 
 
 def _native_title(key, provider):
+    if provider in EXTRA_HARNESSES:
+        fn = EXTRA_HARNESSES[provider]["title"]
+        try:
+            return ((fn(key) if fn else "") or "").strip()[:160]
+        except Exception:
+            return ""
     """Titles some harnesses store themselves (opencode, goose)."""
     if provider == "opencode" and "#" not in key:
         return (_opencode_legacy_info(key).get("title") or "").strip()[:160]
@@ -3063,9 +3177,10 @@ def archive_providers():
     raw = (os.environ.get("NAVCOM_ARCHIVE") or ARCHIVE_DEFAULT).strip().lower()
     if raw in ("off", "0", "no", "none", "false"):
         return []
+    archivable = list(ARCHIVABLE) + [hid for hid, h in EXTRA_HARNESSES.items() if h["archivable"]]
     if raw == "all":
-        return list(ARCHIVABLE)
-    return [p for p in re.split(r"[,\s]+", raw) if p in ARCHIVABLE]
+        return archivable
+    return [p for p in re.split(r"[,\s]+", raw) if p in archivable]
 
 
 def _provider_root(provider):
@@ -3073,6 +3188,7 @@ def _provider_root(provider):
         "claude": fts_mod.claude_projects_root(), "codex": fts_mod.codex_sessions_root(),
         "gemini": fts_mod.gemini_tmp_root(), "pi": pi_sessions_root(), "omo": omo_sessions_root(),
         "dsh": dsh_sessions_root(), "grok": grok_sessions_root(),
+        **{hid: (h["roots"]() or [None])[0] for hid, h in EXTRA_HARNESSES.items() if h["roots"]},
     }.get(provider)
 
 
@@ -3400,6 +3516,3474 @@ def cmd_maintain(conn, force=False):
                f"{upgraded} re-parsed, {files} archived ({raw / 1e6:.1f} MB) in {time.monotonic() - start:.0f}s")
     return 0
 
+
+# >>> registered harnesses (generated by harness/integrate.py — edit the parsers, not this block)
+from pathlib import Path  # noqa: E402 (harness parsers)
+from urllib.parse import unquote, urlparse  # noqa: E402 (harness parsers)
+import base64  # noqa: E402 (harness parsers)
+import hashlib  # noqa: E402 (harness parsers)
+import html  # noqa: E402 (harness parsers)
+import json  # noqa: E402 (harness parsers)
+import os  # noqa: E402 (harness parsers)
+import re  # noqa: E402 (harness parsers)
+import sqlite3  # noqa: E402 (harness parsers)
+import struct  # noqa: E402 (harness parsers)
+import sys  # noqa: E402 (harness parsers)
+import tempfile  # noqa: E402 (harness parsers)
+import uuid  # noqa: E402 (harness parsers)
+
+
+# ── Qwen Code (qwen) ─────────────────────────────────────────────────────────
+# Qwen Code (npm @qwen-code/qwen-code) transcripts for navcom.
+#
+# $QWEN_RUNTIME_DIR | $QWEN_HOME | ~/.qwen
+#   projects/<cwd with [^a-zA-Z0-9] -> '-'>/chats/<sessionId>.jsonl            main sessions
+#   projects/<sanitized cwd>/subagents/<sessionId>/agent-<agentId>.jsonl       subagent sidechains
+#
+# One JSON record per line: {uuid, parentUuid, sessionId, type: user|assistant|tool_result|system,
+# subtype?, provenance?, cwd, message: {role, parts[]}} with Gemini-style parts
+# (text / thought / functionCall{id,name,args} / functionResponse{id,name,response}).
+# /rewind leaves dead branches in the file; Qwen rebuilds a conversation by walking parentUuid back
+# from the last conversation record, so we index exactly that chain.
+
+_qwen_HOOK_CONTEXT_OPEN = "<qwen:user-prompt-submit-context>"
+_qwen_REFERENCED_FILES = "\n--- Content from referenced files ---"
+_qwen_NON_CONVERSATION = {"session_sources_snapshot", "session_artifact_event", "session_artifact_snapshot",
+                     "managed_session_header_v1", "managed_session_event_v1", "managed_session_commit_v1"}
+
+
+def qwen_roots():
+    roots = []
+    for root in (_env_path("QWEN_RUNTIME_DIR"), _env_path("QWEN_HOME"), Path.home() / ".qwen"):
+        if root and root / "projects" not in roots:
+            roots.append(root / "projects")
+    return roots
+
+
+def qwen_list():
+    paths = []
+    for root in qwen_roots():
+        if root.is_dir():
+            paths += list(root.glob("*/chats/*.jsonl")) + list(root.glob("*/subagents/*/agent-*.jsonl"))
+    return _file_logs(sorted(set(paths)), "qwen")
+
+
+def _qwen_records(key):
+    out = []
+    try:
+        with open(key, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(obj, dict) and obj.get("uuid"):
+                    out.append(obj)
+    except OSError:
+        pass
+    return out
+
+
+def _qwen_live_chain(records):
+    """Records on the surviving branch, oldest first (fragments sharing a uuid are merged)."""
+    by_uuid = {}
+    for rec in records:
+        first = by_uuid.get(rec["uuid"])
+        if first is None:
+            by_uuid[rec["uuid"]] = dict(rec)
+        elif isinstance(rec.get("message"), dict):
+            msg = dict(first.get("message") or {"role": rec["message"].get("role")})
+            msg["parts"] = list(msg.get("parts") or []) + list(rec["message"].get("parts") or [])
+            first["message"] = msg
+    leaf = next((r["uuid"] for r in reversed(records)
+                 if not (r.get("type") == "system" and r.get("subtype") in _qwen_NON_CONVERSATION)), None)
+    chain, seen = [], set()
+    while leaf and leaf not in seen and leaf in by_uuid:
+        seen.add(leaf)
+        chain.append(by_uuid[leaf])
+        leaf = by_uuid[leaf].get("parentUuid")
+    return chain[::-1]
+
+
+def _qwen_user_text(rec):
+    payload = rec.get("systemPayload") if isinstance(rec.get("systemPayload"), dict) else {}
+    if isinstance(payload.get("displayText"), str) and payload["displayText"].strip():
+        return payload["displayText"]
+    texts = [p["text"] for p in (rec.get("message") or {}).get("parts") or []
+             if isinstance(p, dict) and isinstance(p.get("text"), str) and not p.get("thought")]
+    texts = [t for t in texts if not t.strip().startswith(_qwen_HOOK_CONTEXT_OPEN)]
+    return "\n".join(texts).split(_qwen_REFERENCED_FILES, 1)[0]
+
+
+def qwen_iter(key):
+    calls = {}
+    for rec in _qwen_live_chain(_qwen_records(key)):
+        kind, parts = rec.get("type"), (rec.get("message") or {}).get("parts") or []
+        if kind == "user":
+            typed = rec.get("provenance", "real_user") == "real_user" and rec.get("subtype") in (None, "mid_turn_user_message")
+            if typed and not rec.get("isSidechain"):  # sidechain prompts are written by the parent agent
+                text = _qwen_user_text(rec)
+                if text.strip():
+                    yield "user", text
+        elif kind == "assistant":
+            text = []
+            for part in parts:
+                if not isinstance(part, dict) or part.get("thought"):
+                    continue
+                if isinstance(part.get("text"), str):
+                    text.append(part["text"])
+                call = part.get("functionCall")
+                if isinstance(call, dict):
+                    if text and "".join(text).strip():
+                        yield "assistant", "".join(text)
+                    text = []
+                    args = call.get("args")
+                    calls[call.get("id")] = _call_label(call.get("name"), args)
+                    cmd = _shell_cmd(call.get("name"), args)
+                    if cmd:
+                        yield "cmd", cmd
+            if "".join(text).strip():
+                yield "assistant", "".join(text)
+        elif kind == "tool_result":
+            for part in parts:
+                resp = part.get("functionResponse") if isinstance(part, dict) else None
+                if not isinstance(resp, dict):
+                    continue
+                body = resp.get("response")
+                if isinstance(body, dict):
+                    output = body.get("output") if body.get("output") is not None else body.get("error")
+                    if output is None:
+                        output = body
+                    elif body.get("error") and body.get("output") is not None:
+                        output = f"error\n{body['error']}\n{output}"
+                else:
+                    output = body
+                label = calls.get(resp.get("id")) or resp.get("name") or "tool"
+                turn = tool_turn(label, output)
+                if turn:
+                    yield turn
+
+
+def qwen_project(key):
+    for rec in _qwen_records(key)[:50]:
+        if isinstance(rec.get("cwd"), str) and rec["cwd"]:
+            return rec["cwd"]
+    return ""
+
+
+def qwen_title(key):
+    title = ""
+    for rec in _qwen_records(key):
+        if rec.get("type") == "system" and rec.get("subtype") == "custom_title":
+            title = ((rec.get("systemPayload") or {}).get("customTitle") or title)
+    if not title and "/subagents/" in str(key):
+        try:
+            title = json.loads(Path(str(key)[:-len(".jsonl")] + ".meta.json").read_text()).get("description") or ""
+        except Exception:
+            pass
+    return title
+
+
+def qwen_retention():
+    home = _env_path("QWEN_HOME") or Path.home() / ".qwen"
+    return {
+        "settings_path": str(home / "settings.json"),
+        "key_path": "general.cleanupPeriodDays",
+        "never_delete_value": 36500,
+        "default_days": 30,
+        "note": "Qwen Code's daily housekeeping deletes subagent transcripts (projects/*/subagents/<session>/), "
+                "/rewind file-history backups and debug logs older than general.cleanupPeriodDays (default 30). "
+                "Main chats/*.jsonl are never auto-deleted. There is no 'off' value (0 means ~1 hour), "
+                "so set a very large number of days.",
+    }
+
+
+def _qwen_sanitize(cwd):
+    return "".join(c if c.isalnum() and c.isascii() else "-" for c in cwd)
+
+
+# ── Kimi Code (kimi) ─────────────────────────────────────────────────────────
+# Kimi Code (npm @moonshot-ai/kimi-code, v2 engine) transcripts for navcom, plus legacy Kimi CLI.
+#
+# $KIMI_CODE_HOME | ~/.kimi-code
+#   sessions/wd_<slug>_<sha256[:12]>/session_<uuid>/state.json             {cwd, title, agents{…}}
+#   sessions/wd_…/session_<uuid>/agents/main/wire.jsonl                     main agent
+#   sessions/wd_…/session_<uuid>/agents/agent-<n>/wire.jsonl                subagents (Agent tool)
+# wire.jsonl is an append-only event log. The model context is rebuilt from:
+#   context.append_message      {message: {role, content[], toolCalls[], toolCallId?, origin{kind}}}
+#                               origin.kind "user" = typed; "injection"/"system_trigger"/… = not typed;
+#                               "shell_command" = a `!cmd` the user ran (phase input|output)
+#   context.append_loop_event   {event: content.part{part{type:text|think}} | tool.call{toolCallId,name,args}
+#                                | tool.result{toolCallId, result{output, isError}}}
+# `agent.message.appended` events duplicate the same content for live UIs and are ignored.
+#
+# Legacy Kimi CLI ($KIMI_SHARE_DIR | ~/.kimi): sessions/<md5(workdir)>/<uuid>/context*.jsonl (or a flat
+# sessions/<md5>/<uuid>.jsonl): OpenAI-style rows {role: user|assistant|tool|_system_prompt|_checkpoint|_usage,
+# content, tool_calls[{id, function{name, arguments}}], tool_call_id}; workdirs in kimi.json work_dirs[].path.
+
+def _kimi_kimi_home():
+    return _env_path("KIMI_CODE_HOME") or Path.home() / ".kimi-code"
+
+
+def _kimi_legacy_home():
+    return _env_path("KIMI_SHARE_DIR") or Path.home() / ".kimi"
+
+
+def kimi_roots():
+    return [_kimi_kimi_home() / "sessions", _kimi_legacy_home() / "sessions"]
+
+
+def kimi_list():
+    current, legacy = kimi_roots()
+    paths = list(current.glob("*/*/agents/*/wire.jsonl")) if current.is_dir() else []
+    if legacy.is_dir():
+        paths += [p for p in legacy.glob("*/*/context*.jsonl") if re.fullmatch(r"context(_\d+)?\.jsonl", p.name)]
+        paths += [p for p in legacy.glob("*/*.jsonl") if re.fullmatch(r"[0-9a-f]{32}", p.parent.name)]
+    return _file_logs(sorted(set(paths)), "kimi")
+
+
+def _kimi_lines(key):
+    try:
+        with open(key, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    yield obj
+    except OSError:
+        return
+
+
+def _kimi_parts_text(content, kinds=("text",)):
+    if isinstance(content, str):
+        return content
+    out = []
+    for part in content or []:
+        if isinstance(part, dict) and part.get("type", "text") in kinds and isinstance(part.get("text"), str):
+            out.append(part["text"])
+    return "\n".join(t for t in out if t)
+
+
+def _kimi_args(raw):
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return raw
+    return raw
+
+
+def _kimi_message_turns(msg, calls, legacy=False):
+    """Turns for one whole message (v2 context.append_message, or a legacy context.jsonl row)."""
+    role = msg.get("role")
+    origin = (msg.get("origin") or {}).get("kind") if isinstance(msg.get("origin"), dict) else None
+    if role == "user":
+        text = _kimi_parts_text(msg.get("content"))
+        if origin == "shell_command":
+            m = re.search(r"<bash-input>\n?(.*?)\n?</bash-input>", text, re.S)
+            if m:
+                cmd = html.unescape(m.group(1)).strip()
+                calls["!shell"] = _call_label("Bash", {"command": cmd})
+                yield "cmd", cmd
+            elif "<bash-stdout>" in text:
+                out = "\n".join(html.unescape(x) for x in re.findall(r"<bash-std(?:out|err)>(.*?)</bash-std(?:out|err)>", text, re.S))
+                turn = tool_turn(calls.get("!shell", "Bash"), out)
+                if turn:
+                    yield turn
+        elif origin == "user" or (legacy and origin is None and not text.lstrip().startswith("<system")):
+            if text.strip():
+                yield "user", text
+    elif role == "assistant":
+        text = _kimi_parts_text(msg.get("content"))
+        if text.strip():
+            yield "assistant", text
+        for call in msg.get("toolCalls") or msg.get("tool_calls") or []:
+            fn = call.get("function") if isinstance(call.get("function"), dict) else call
+            args = _kimi_args(fn.get("arguments"))
+            calls[call.get("id")] = _call_label(fn.get("name"), args)
+            cmd = _shell_cmd(fn.get("name"), args)
+            if cmd:
+                yield "cmd", cmd
+    elif role == "tool":
+        output = _kimi_parts_text(msg.get("content"))
+        if legacy:
+            output = re.sub(r"</?system>", "", output)
+        turn = tool_turn(calls.get(msg.get("toolCallId") or msg.get("tool_call_id"), "tool"), output)
+        if turn:
+            yield turn
+
+
+def kimi_iter(key):
+    calls, text, legacy = {}, [], not str(key).endswith("wire.jsonl")
+    for obj in _kimi_lines(key):
+        if legacy:
+            yield from _kimi_message_turns(obj, calls, legacy=True)
+            continue
+        kind = obj.get("type")
+        event = obj.get("event") if isinstance(obj.get("event"), dict) else {}
+        if kind == "context.append_loop_event" and event.get("type") == "content.part":
+            part = event.get("part") or {}
+            if part.get("type") == "text" and isinstance(part.get("text"), str):
+                text.append(part["text"])
+            continue
+        if kind not in ("context.append_message", "context.append_loop_event"):
+            continue
+        if text and "\n".join(text).strip():
+            yield "assistant", "\n".join(text)
+        text = []
+        if kind == "context.append_message":
+            yield from _kimi_message_turns(obj.get("message") or {}, calls)
+        elif event.get("type") == "tool.call":
+            args = event.get("args")
+            calls[event.get("toolCallId")] = _call_label(event.get("name"), args)
+            cmd = _shell_cmd(event.get("name"), args)
+            if cmd:
+                yield "cmd", cmd
+        elif event.get("type") == "tool.result":
+            result = event.get("result") or {}
+            output = result.get("output")
+            output = _kimi_parts_text(output) if isinstance(output, list) else output
+            if result.get("isError"):
+                output = "error\n" + str(output or "")
+            turn = tool_turn(calls.get(event.get("toolCallId"), "tool"), output)
+            if turn:
+                yield turn
+    if text and "\n".join(text).strip():
+        yield "assistant", "\n".join(text)
+
+
+def _kimi_session_dir(key):
+    path = Path(key)
+    return path.parents[2] if path.name == "wire.jsonl" else (path.parent if path.name.startswith("context") else None)
+
+
+def _kimi_state(key):
+    sdir = _kimi_session_dir(key)
+    try:
+        return json.loads((sdir / "state.json").read_text(encoding="utf-8")) if sdir else {}
+    except Exception:
+        return {}
+
+
+def kimi_project(key):
+    path = Path(key)
+    if path.name == "wire.jsonl":
+        state = _kimi_state(key)
+        if isinstance(state.get("cwd"), str):
+            return state["cwd"]
+        for obj in _kimi_lines(_kimi_kimi_home() / "session_index.jsonl"):
+            if obj.get("sessionDir") == str(path.parents[2]) and obj.get("workDir"):
+                return obj["workDir"]
+        return ""
+    bucket = path.parent.parent.name if path.name.startswith("context") else path.parent.name
+    try:
+        work_dirs = json.loads((_kimi_legacy_home() / "kimi.json").read_text(encoding="utf-8")).get("work_dirs") or []
+    except Exception:
+        work_dirs = []
+    for wd in work_dirs:
+        if isinstance(wd, dict) and hashlib.md5(str(wd.get("path", "")).encode()).hexdigest() == bucket:
+            return wd["path"]
+    return ""
+
+
+def kimi_title(key):
+    state = _kimi_state(key)
+    title = state.get("title") or state.get("customTitle") or state.get("custom_title") or ""
+    if not title and not str(key).endswith("wire.jsonl") and _kimi_session_dir(key):
+        try:
+            title = json.loads((_kimi_session_dir(key) / "metadata.json").read_text(encoding="utf-8")).get("title") or ""
+        except Exception:
+            pass
+    return title if isinstance(title, str) else ""
+
+
+def kimi_legacy_fixture(home, cwd):
+    """Legacy Kimi CLI layout (~/.kimi), used only by verify.py."""
+    bucket = hashlib.md5(cwd.encode()).hexdigest()
+    sdir = Path(home) / ".kimi" / "sessions" / bucket / "11111111-2222-4333-8444-555555555555"
+    sdir.mkdir(parents=True, exist_ok=True)
+    (Path(home) / ".kimi" / "kimi.json").write_text(json.dumps({"work_dirs": [{"path": cwd, "kaos": "local"}]}))
+    (sdir / "state.json").write_text(json.dumps({"custom_title": "Legacy kimi session"}))
+    rows = [
+        {"role": "_system_prompt", "content": "zebracorninjected system"},
+        {"role": "_checkpoint", "id": 0},
+        {"role": "user", "content": "please check zebracornkimi"},
+        {"role": "user", "content": [{"type": "text", "text": "<system>zebracorninjected</system>"}]},
+        {"role": "assistant", "content": [{"type": "think", "think": "zebracorninjected"}, {"type": "text", "text": "Running it."}],
+         "tool_calls": [{"type": "function", "id": "Shell:0", "function": {"name": "Shell", "arguments": "{\"command\": \"echo hi-kimi\"}"}}]},
+        {"role": "tool", "tool_call_id": "Shell:0", "content": [{"type": "text", "text": "<system>Command executed successfully.</system>"},
+                                                                {"type": "text", "text": "zebracornkimitool"}]},
+        {"role": "assistant", "content": "Done: zebracornkimi"},
+        {"role": "_usage", "token_count": 123},
+    ]
+    with open(sdir / "context.jsonl", "w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+    return str(sdir / "context.jsonl")
+
+
+# ── Crush (crush) ────────────────────────────────────────────────────────────
+# Crush (charmbracelet, npm @charmland/crush / brew charmbracelet/tap/crush) transcripts for navcom.
+#
+# Per-project SQLite at <project>/.crush/crush.db (or --data-dir / options.data_directory). Every project
+# Crush has opened is listed in <global data>/projects.json {projects: [{path, data_dir, last_accessed}]},
+# global data = $CRUSH_GLOBAL_DATA | $XDG_DATA_HOME/crush | ~/.local/share/crush (%LOCALAPPDATA%\crush).
+#   sessions(id, parent_session_id, title, message_count, updated_at, created_at, …)
+#      parent_session_id set for Agent-tool child sessions (id = tool call id) and for
+#      "title-<parent>" title-generation sessions (skipped)
+#   messages(id, session_id, role user|assistant|tool, parts JSON, created_at, is_summary_message, …)
+#      parts: [{type: text{text, hidden?} | reasoning{thinking} | tool_call{id,name,input(JSON str)}
+#              | tool_result{tool_call_id,name,content,is_error} | shell_command{command,output,exit_code}
+#              | image_url | binary | finish, data: {…}}]
+# Injected context (todo reminders, system prompt) is added at request time and never stored.
+
+def _crush_global_data():
+    explicit = _env_path("CRUSH_GLOBAL_DATA")
+    if explicit:
+        return explicit
+    if os.environ.get("XDG_DATA_HOME"):
+        return _xdg_data_home() / "crush"
+    if os.name == "nt":
+        return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "crush"
+    return Path.home() / ".local" / "share" / "crush"
+
+
+def _crush_projects():
+    try:
+        data = json.loads((_crush_global_data() / "projects.json").read_text(encoding="utf-8"))
+        return [p for p in data.get("projects") or [] if isinstance(p, dict)]
+    except Exception:
+        return []
+
+
+def crush_roots():
+    dbs = [Path(p["data_dir"]).expanduser() / "crush.db" for p in _crush_projects() if p.get("data_dir")]
+    dbs.append(_crush_global_data() / ".crush" / "crush.db")  # `crush server` meta-workspace
+    out = []
+    for db in dbs:
+        if db not in out:
+            out.append(db)
+    return out
+
+
+def crush_list():
+    logs = []
+    for db in crush_roots():
+        if not db.is_file():
+            continue
+        try:
+            conn = _ro_connect(db)
+            rows = conn.execute(
+                "SELECT s.id, MAX(s.updated_at, COALESCE(MAX(m.updated_at), 0)), COUNT(m.id),"
+                " COALESCE(SUM(LENGTH(m.parts)), 0) FROM sessions s LEFT JOIN messages m ON m.session_id = s.id"
+                " WHERE s.id NOT LIKE 'title-%' GROUP BY s.id").fetchall()
+            conn.close()
+        except sqlite3.Error:
+            continue
+        for sid, updated, count, size in rows:
+            if count:
+                logs.append((f"{db}#{sid}", float(updated or 0), int(size), "crush"))
+    return logs
+
+
+def _crush_split(key):
+    db, _, sid = str(key).partition("#")
+    return db, sid
+
+
+def _crush_session(key):
+    db, sid = _crush_split(key)
+    try:
+        conn = _ro_connect(db)
+        row = conn.execute("SELECT parent_session_id, title FROM sessions WHERE id = ?", (sid,)).fetchone()
+        conn.close()
+        return row or (None, "")
+    except sqlite3.Error:
+        return (None, "")
+
+
+def crush_iter(key):
+    db, sid = _crush_split(key)
+    try:
+        conn = _ro_connect(db)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
+        summary = "is_summary_message" if "is_summary_message" in cols else "0"  # older Crush schemas
+        rows = conn.execute(f"SELECT role, parts, {summary} FROM messages WHERE session_id = ?"
+                            " ORDER BY created_at, rowid", (sid,)).fetchall()
+        is_child = bool(conn.execute("SELECT parent_session_id FROM sessions WHERE id = ?", (sid,)).fetchone()[0])
+        conn.close()
+    except (sqlite3.Error, TypeError):
+        return
+    calls = {}
+    for role, raw, is_summary in rows:
+        if is_summary:
+            continue  # auto-compaction summary, not a reply
+        try:
+            parts = json.loads(raw or "[]")
+        except Exception:
+            continue
+        text = []
+        for part in parts if isinstance(parts, list) else []:
+            kind, data = (part.get("type"), part.get("data") or {}) if isinstance(part, dict) else (None, {})
+            if kind == "text" and isinstance(data.get("text"), str) and not data.get("hidden"):
+                text.append(data["text"])
+                continue
+            if kind in ("tool_call", "tool_result", "shell_command"):
+                yield from _crush_flush(role, text, is_child)
+                text = []
+            if kind == "tool_call":
+                args = data.get("input")
+                try:
+                    args = json.loads(args) if isinstance(args, str) and args.strip() else args
+                except Exception:
+                    pass
+                calls[data.get("id")] = _call_label(data.get("name"), args)
+                cmd = _shell_cmd(data.get("name"), args)
+                if cmd:
+                    yield "cmd", cmd
+            elif kind == "tool_result":
+                output = data.get("content") or ""
+                if data.get("is_error"):
+                    output = "error\n" + output
+                turn = tool_turn(calls.get(data.get("tool_call_id")) or data.get("name") or "tool", output)
+                if turn:
+                    yield turn
+            elif kind == "shell_command" and data.get("command"):  # user's `!cmd` (bang mode)
+                yield "cmd", data["command"]
+                output = data.get("output") or ""
+                if data.get("exit_code"):
+                    output = f"exit {data['exit_code']}\n{output}"
+                turn = tool_turn(_call_label("bash", {"command": data["command"]}), output)
+                if turn:
+                    yield turn
+        yield from _crush_flush(role, text, is_child)
+
+
+def _crush_flush(role, text, is_child):
+    body = "\n".join(t for t in text if t)
+    if body.strip():
+        if role == "assistant":
+            yield "assistant", body
+        elif role == "user" and not is_child:  # child (Agent tool) sessions are prompted by the parent agent
+            yield "user", body
+
+
+def crush_project(key):
+    db = Path(_crush_split(key)[0])
+    for proj in _crush_projects():
+        if proj.get("data_dir") and Path(proj["data_dir"]).expanduser() / "crush.db" == db:
+            return proj.get("path") or ""
+    return str(db.parent.parent) if db.parent.name == ".crush" else ""
+
+
+def crush_title(key):
+    return _crush_session(key)[1] or ""
+
+
+# ── GitHub Copilot CLI (copilot) ─────────────────────────────────────────────
+# GitHub Copilot CLI (npm @github/copilot) session parser for navcom.
+#
+# On disk ($COPILOT_HOME, default ~/.copilot):
+#   session-state/<uuid>/events.jsonl   one event per line {type, data, id, parentId, timestamp}
+#   session-state/<uuid>/workspace.yaml id, cwd, name, summary, user_named, created_at, updated_at
+#   session-state/<uuid>.jsonl          older flat layout (same events, no workspace.yaml)
+#   history-session-state/*.json        oldest layout {sessionId, chatMessages:[OpenAI-style messages]}
+#   session-store.db                    derived SQLite/FTS5 index (ignored)
+
+def copilot_home():
+    return _env_path("COPILOT_HOME") or Path.home() / ".copilot"
+
+
+def copilot_roots():
+    home = copilot_home()
+    return [home / "session-state", home / "history-session-state"]
+
+
+def copilot_list():
+    state, legacy = copilot_roots()
+    paths = []
+    try:
+        if state.is_dir():
+            paths += list(state.glob("*/events.jsonl")) + list(state.glob("*.jsonl"))
+        if legacy.is_dir():
+            paths += list(legacy.glob("*.json"))
+    except OSError:
+        pass
+    return _file_logs(paths, "copilot")
+
+
+def _copilot_json_args(args):
+    if isinstance(args, str):
+        try:
+            return json.loads(args)
+        except Exception:
+            return args
+    return args
+
+
+def _copilot_copilot_events(key):
+    try:
+        handle = open(key, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with handle:
+        for line in handle:
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                yield obj.get("type"), obj.get("data") if isinstance(obj.get("data"), dict) else {}
+
+
+_copilot_SHELL_TAIL_RE = re.compile(r"\n?<shellId: [^>]*? exit code (-?\d+)>\s*$")
+
+
+def _copilot_copilot_output(data, tool=""):
+    result = data.get("result") if isinstance(data.get("result"), dict) else {}
+    output = result.get("content") or ""
+    detailed = result.get("detailedContent")
+    # detailedContent carries full diffs for edit tools; for view it re-renders the file as a diff
+    if isinstance(detailed, str) and detailed.strip() and (not output or tool not in ("view", "read", "glob", "grep")):
+        output = detailed
+    if not output and isinstance(result.get("contents"), list):
+        output = _text_of(result["contents"])
+    if isinstance(output, str):  # bash results end with "<shellId: 0 completed with exit code N>"
+        tail = _copilot_SHELL_TAIL_RE.search(output)
+        if tail:
+            output = (f"exit {tail.group(1)}\n" if tail.group(1) != "0" else "") + output[:tail.start()]
+    if data.get("success") is False:
+        error = data.get("error") if isinstance(data.get("error"), dict) else {}
+        output = "error\n" + "\n".join(t for t in (error.get("message"), output) if isinstance(t, str) and t)
+    return output
+
+
+def copilot_iter(key):
+    if key.endswith(".json"):
+        yield from _copilot_copilot_legacy_iter(key)
+        return
+    calls, names = {}, {}
+    for kind, data in _copilot_copilot_events(key):
+        if kind == "user.message":
+            source = data.get("source")
+            if (source and source != "user") or data.get("isAutopilotContinuation"):
+                continue  # skill injections, inter-agent prompts, autopilot "continue" nudges
+            text = data.get("content")  # 'transformedContent' adds <current_datetime> etc. — not typed
+            if isinstance(text, str) and text.strip():
+                yield "user", text
+        elif kind == "assistant.message":
+            text = data.get("content")  # reasoningText / encryptedContent are thinking — skipped
+            if isinstance(text, str) and text.strip():
+                yield "assistant", text
+            for req in data.get("toolRequests") or []:
+                if isinstance(req, dict):
+                    calls[req.get("toolCallId")] = _call_label(req.get("name"), _copilot_json_args(req.get("arguments")))
+        elif kind == "tool.execution_start":
+            args = _copilot_json_args(data.get("arguments"))
+            calls[data.get("toolCallId")] = _call_label(data.get("toolName"), args)
+            names[data.get("toolCallId")] = data.get("toolName") or ""
+            cmd = _shell_cmd(data.get("toolName"), args)  # bash / powershell; write_bash has no command
+            if cmd:
+                yield "cmd", cmd
+        elif kind == "tool.execution_complete":
+            turn = tool_turn(calls.get(data.get("toolCallId"), "tool"),
+                                 _copilot_copilot_output(data, names.get(data.get("toolCallId"), "")))
+            if turn:
+                yield turn
+        # system.message (system prompt), system.notification, skill.invoked, session.*, hook.*,
+        # assistant.reasoning, subagent.* and the rest are injected/bookkeeping: skipped.
+
+
+_copilot_DATETIME_RE = re.compile(r"^\s*<current_datetime>.*?</current_datetime>\s*", re.S)
+
+
+def _copilot_copilot_legacy_iter(key):
+    """history-session-state/*.json (Copilot CLI 0.0.x): OpenAI-style chatMessages. Unverified on disk."""
+    try:
+        data = json.loads(Path(key).read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return
+    calls = {}
+    for msg in (data.get("chatMessages") if isinstance(data, dict) else None) or []:
+        if not isinstance(msg, dict):
+            continue
+        role, text = msg.get("role"), _text_of(msg.get("content") or "")
+        if role == "user":
+            text = _copilot_DATETIME_RE.sub("", text)
+            if text.strip() and not text.lstrip().startswith("<reminder>"):
+                yield "user", text
+        elif role == "assistant":
+            if text.strip():
+                yield "assistant", text
+            for call in msg.get("tool_calls") or []:
+                fn = (call or {}).get("function") or {}
+                args = _copilot_json_args(fn.get("arguments"))
+                calls[call.get("id")] = _call_label(fn.get("name"), args)
+                cmd = _shell_cmd(fn.get("name"), args)
+                if cmd:
+                    yield "cmd", cmd
+        elif role == "tool":
+            turn = tool_turn(calls.get(msg.get("tool_call_id"), "tool"), msg.get("content"))
+            if turn:
+                yield turn
+
+
+def _copilot_copilot_workspace(key):
+    """workspace.yaml is flat `key: value` YAML; parse the scalars we need without a YAML lib."""
+    out = {}
+    try:
+        lines = (Path(key).parent / "workspace.yaml").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        m = re.match(r"^([A-Za-z_]+):\s?(.*)$", line)
+        if not m:
+            continue
+        value = m.group(2).strip()
+        if len(value) >= 2 and value[0] == value[-1] == "'":
+            value = value[1:-1].replace("''", "'")
+        elif len(value) >= 2 and value[0] == value[-1] == '"':
+            try:
+                value = json.loads(value)
+            except Exception:
+                value = value[1:-1]
+        out[m.group(1)] = value
+    return out
+
+
+def copilot_project(key):
+    if key.endswith("events.jsonl"):
+        cwd = _copilot_copilot_workspace(key).get("cwd")
+        if cwd:
+            return cwd
+    for kind, data in _copilot_copilot_events(key) if key.endswith(".jsonl") else []:
+        if kind in ("session.start", "session.resume"):
+            ctx = data.get("context") if isinstance(data.get("context"), dict) else {}
+            if isinstance(ctx.get("cwd"), str):
+                return ctx["cwd"]
+    return ""
+
+
+def copilot_title(key):
+    if not key.endswith(".jsonl"):
+        return ""
+    title = ""
+    for kind, data in _copilot_copilot_events(key):
+        if kind == "session.title_changed" and isinstance(data.get("title"), str):
+            title = data["title"]
+    if title:
+        return title
+    ws = _copilot_copilot_workspace(key) if key.endswith("events.jsonl") else {}
+    if ws.get("user_named") == "true" and ws.get("name"):
+        return ws["name"]
+    return ws.get("summary") or ws.get("name") or ""
+
+
+# ── Cline (cline) ────────────────────────────────────────────────────────────
+# Cline session parser for navcom. Two on-disk shapes:
+#
+# 1. Cline CLI 3.x / SDK (npm `cline`):
+#      $CLINE_SESSION_DATA_DIR or $CLINE_DATA_DIR/sessions or $CLINE_DIR/data/sessions (default ~/.cline/data/sessions)
+#        <id>/<id>.messages.json  {version, sessionId, agent, origin, system_prompt, messages:[Anthropic-style]}
+#        <id>/<id>.json           manifest {session_id, cwd, workspace_root, prompt, metadata.title, ...}
+#      db/sessions.db mirrors the manifests (index only; not needed to read transcripts).
+# 2. Cline VS Code extension (and forks: Cursor, Windsurf, ...; also older ~/.cline/data/tasks):
+#      <app>/User/globalStorage/saoudrizwan.claude-dev/tasks/<ts>/ui_messages.json   (UI timeline: say/ask)
+#      .../tasks/<ts>/api_conversation_history.json  (model-facing; full of injected environment_details)
+#      .../state/taskHistory.json  [{id, task, cwdOnTaskInitialization?, ...}]
+#    We parse ui_messages.json: it separates typed text, replies, commands and outputs cleanly
+#    across both the XML-tool era (2024) and the native-tool era.
+
+_cline_CLINE_EXT_ID = "saoudrizwan.claude-dev"
+
+
+def cline_data_dir():
+    return _env_path("CLINE_DATA_DIR") or (_env_path("CLINE_DIR") or Path.home() / ".cline") / "data"
+
+
+def cline_sessions_dir():
+    return _env_path("CLINE_SESSION_DATA_DIR") or cline_data_dir() / "sessions"
+
+
+def _cline_editor_config_bases():
+    if sys.platform == "darwin":
+        return [Path.home() / "Library" / "Application Support"]
+    if sys.platform.startswith("win"):
+        return [Path(os.environ["APPDATA"])] if os.environ.get("APPDATA") else []
+    return [Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config").expanduser()]
+
+
+def _cline_cline_task_dirs():
+    dirs = [cline_data_dir() / "tasks"]
+    for base in _cline_editor_config_bases():
+        try:
+            dirs += sorted(base.glob(f"*/User/globalStorage/{_cline_CLINE_EXT_ID}/tasks"))
+        except OSError:
+            pass
+    return dirs
+
+
+def cline_roots():
+    return [cline_sessions_dir()] + _cline_cline_task_dirs()
+
+
+def cline_list():
+    paths = _rglob(cline_sessions_dir(), "*.messages.json")
+    for tasks in _cline_cline_task_dirs():
+        try:
+            if tasks.is_dir():
+                paths += list(tasks.glob("*/ui_messages.json"))
+        except OSError:
+            pass
+    return _file_logs(paths, "cline")
+
+
+def _cline_load_json(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def cline_iter(key):
+    if key.endswith("ui_messages.json"):
+        yield from _cline_cline_ui_iter(key)
+    else:
+        yield from _cline_cline_sdk_iter(key)
+
+
+# ── Cline CLI 3.x / SDK ──────────────────────────────────────────────────────
+
+_cline_WRAP_RE = re.compile(r"<user_(?:input|command)\b")
+_cline_FILE_RE = re.compile(r"<file_content\b[^>]*>.*?</file_content>", re.S)
+_cline_NOTICE_RE = re.compile(r"<mode_notice>.*?</mode_notice>", re.S)
+_cline_COMMAND_RE = re.compile(r'^\s*<user_command\b[^>]*\bslash="([^"]+)"[^>]*>(.*?)</user_command>\s*$', re.S | re.I)
+
+
+def _cline_cline_typed(text):
+    """Cline's own normalizeUserInput: unwrap <user_input>, render <user_command slash> as /slash."""
+    slash = _cline_COMMAND_RE.match(text)
+    text = _cline_NOTICE_RE.sub("", _cline_FILE_RE.sub("", text))
+    for tag in ("user_input", "user_command"):
+        text = re.sub(rf"<{tag}\b[^>]*>(.*?)</{tag}>", r"\1", text, flags=re.S)
+        text = re.sub(rf"</?{tag}\b[^>]*>", "", text)
+    text = text.strip()
+    if slash:
+        return f"/{slash.group(1)} {text}".strip()
+    return text
+
+
+def _cline_cline_commands(name, args):
+    """run_commands takes {commands:[str | {command, args}]} (or a bare string/list); others: navcom's rule."""
+    if name != "run_commands":
+        cmd = _shell_cmd(name, args)
+        return [cmd] if cmd else []
+    items = args.get("commands", args.get("command", args.get("cmd"))) if isinstance(args, dict) else args
+    if not isinstance(items, list):
+        items = [items]
+    cmds = []
+    for item in items:
+        if isinstance(item, dict):
+            argv = [a if not re.search(r'[\s"]', str(a)) else json.dumps(a) for a in item.get("args") or []]
+            item = " ".join([str(item.get("command") or "")] + argv).strip()
+        if isinstance(item, str) and item.strip():
+            cmds.append(item.strip())
+    return cmds
+
+
+def _cline_cline_label_args(args):
+    """read_files {files:[{path}]} / fetch_web_content {requests:[{url}]} -> a dict _call_label understands."""
+    if isinstance(args, dict):
+        for field, key in (("files", "path"), ("requests", "url")):
+            items = args.get(field)
+            if isinstance(items, list):
+                vals = [str(i.get(key) if isinstance(i, dict) else i) for i in items]
+                return {key: ", ".join(v for v in vals if v and v != "None")}
+    return args
+
+
+def _cline_cline_result(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        content = [content]
+    parts = []
+    for item in content if isinstance(content, list) else []:
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, dict) and ("result" in item or "error" in item):
+            result = item.get("result")
+            text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False) if result else ""
+            if item.get("error") and str(item["error"]) not in text:
+                text = f"error: {item['error']}\n{text}".strip()
+            if len(content) > 1 and item.get("query"):
+                text = f"$ {item['query']}\n{text}"
+            parts.append(text)
+        elif isinstance(item, dict) and item.get("type") == "text":
+            parts.append(item.get("text") or "")
+    return "\n".join(p for p in parts if p)
+
+
+def _cline_cline_sdk_iter(key):
+    data = _cline_load_json(key)
+    messages = data.get("messages") if isinstance(data, dict) else data
+    if not isinstance(messages, list):
+        return
+    blocks = lambda m: [{"type": "text", "text": m["content"]}] if isinstance(m.get("content"), str) else (
+        m.get("content") if isinstance(m.get("content"), list) else [])
+    # 3.x wraps typed input in <user_input>; once a session uses the wrapper, any bare user text is
+    # runtime-injected (loop/mistake notices, file attachments). Imported/older sessions have no wrapper.
+    wrapped = any(m.get("role") == "user" and any(b.get("type") == "text" and _cline_WRAP_RE.search(b.get("text") or "")
+                                                  for b in blocks(m) if isinstance(b, dict))
+                  for m in messages if isinstance(m, dict))
+    calls = {}
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        meta = msg.get("metadata") if isinstance(msg.get("metadata"), dict) else {}
+        injected = bool(meta.get("kind")) or meta.get("displayRole") == "system"  # compaction summaries
+        for block in blocks(msg):
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if msg.get("role") == "user":
+                if kind == "tool_result":
+                    output = _cline_cline_result(block.get("content"))
+                    if block.get("is_error"):
+                        output = "error\n" + output
+                    turn = tool_turn(calls.get(block.get("tool_use_id"), block.get("name") or "tool"), output)
+                    if turn:
+                        yield turn
+                elif kind == "text" and not injected:
+                    text = block.get("text") or ""
+                    if wrapped and not _cline_WRAP_RE.search(text):
+                        continue
+                    text = _cline_cline_typed(text)
+                    if text:
+                        yield "user", text
+            elif msg.get("role") == "assistant":
+                if kind == "text" and (block.get("text") or "").strip():
+                    yield "assistant", block["text"]
+                elif kind == "tool_use":
+                    args = block.get("input")
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except Exception:
+                            pass
+                    cmds = _cline_cline_commands(block.get("name"), args)
+                    calls[block.get("id")] = _call_label(
+                        block.get("name"), {"command": " ; ".join(cmds)} if cmds else _cline_cline_label_args(args))
+                    for cmd in cmds:
+                        yield "cmd", cmd
+                # thinking / reasoning / redacted_thinking / image blocks: skipped
+
+
+# ── VS Code extension tasks (ui_messages.json) ────────────────────────────────
+
+def _cline_cline_ui_iter(key):
+    messages = _cline_load_json(key)
+    if not isinstance(messages, list):
+        return
+    seen_request = got_task = False
+    cmd_label, cmd_out, mcp_label = None, [], None
+
+    def flush():
+        return tool_turn(cmd_label, "\n".join(cmd_out)) if cmd_label and cmd_out else None
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue  # note: newer builds leave partial=True on finished text, so `partial` is not a skip signal
+        kind, text = msg.get("say") or msg.get("ask"), msg.get("text") or ""
+        if kind != "command_output" and cmd_label:
+            turn = flush()
+            if turn:
+                yield turn
+            cmd_label, cmd_out = None, []
+        if kind == "api_req_started":  # the full model request incl. environment_details — injected
+            seen_request = True
+        elif kind == "task" or (kind == "text" and msg.get("type") == "say" and not seen_request and not got_task):
+            got_task = True
+            if text.strip():
+                yield "user", text
+        elif kind == "user_feedback":
+            if text.strip():
+                yield "user", text
+        elif kind in ("text", "completion_result") and msg.get("type") == "say":
+            text = re.sub(r"\s*HAS_CHANGES\s*$", "", text)
+            if text.strip():
+                yield "assistant", text
+        elif kind in ("followup", "plan_mode_respond", "completion_result") and msg.get("type") == "ask":
+            obj = _cline_maybe_json(text)
+            if isinstance(obj, dict):
+                text = obj.get("question") or obj.get("response") or ""
+            if isinstance(text, str) and text.strip():
+                yield "assistant", text
+        elif kind == "command":
+            cmd = re.sub(r"\s*REQ_APP\s*$", "", text).strip()
+            if cmd:
+                yield "cmd", cmd
+                cmd_label, cmd_out = _call_label("execute_command", {"command": cmd}), []
+        elif kind == "command_output":
+            if cmd_label:
+                cmd_out.append(text)
+            else:
+                turn = tool_turn("command output", text)
+                if turn:
+                    yield turn
+        elif kind == "tool":
+            obj = _cline_maybe_json(text)
+            if isinstance(obj, dict):
+                output = obj.get("content") or obj.get("diff") or ""
+                turn = tool_turn(_call_label(obj.get("tool"), obj), output if isinstance(output, str) else "")
+                if turn:
+                    yield turn
+        elif kind == "use_mcp_server":
+            obj = _cline_maybe_json(text) or {}
+            mcp_label = _call_label(f"{obj.get('serverName', 'mcp')}.{obj.get('toolName') or obj.get('uri') or ''}",
+                                        _cline_maybe_json(obj.get("arguments")) if obj.get("arguments") else None)
+        elif kind == "mcp_server_response":
+            turn = tool_turn(mcp_label or "mcp", text)
+            if turn:
+                yield turn
+        # reasoning, api_req_*, error, checkpoint_created, resume_task, browser_action*, ... skipped
+    turn = flush()
+    if turn:
+        yield turn
+
+
+def _cline_maybe_json(text):
+    if not isinstance(text, str) or not text.lstrip().startswith(("{", "[")):
+        return text if isinstance(text, dict) else None
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def _cline_cline_task_meta(key):
+    task_id = Path(key).parent.name
+    history = _cline_load_json(Path(key).parent.parent.parent / "state" / "taskHistory.json")
+    for item in history if isinstance(history, list) else []:
+        if isinstance(item, dict) and str(item.get("id")) == task_id:
+            return item
+    return {}
+
+
+def _cline_cline_manifest(key):
+    sid = Path(key).name[: -len(".messages.json")]
+    manifest = _cline_load_json(Path(key).parent / f"{sid}.json")
+    if isinstance(manifest, dict):
+        return manifest
+    db = cline_data_dir() / "db" / "sessions.db"
+    try:
+        con = _ro_connect(db)
+        try:
+            row = con.execute("SELECT cwd, prompt, metadata_json FROM sessions WHERE session_id = ?", (sid,)).fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        row = None
+    if not row:
+        return {}
+    meta = _cline_maybe_json(row[2]) or {}
+    return {"cwd": row[0], "prompt": row[1], "metadata": meta if isinstance(meta, dict) else {}}
+
+
+_cline_CWD_RE = re.compile(r"# Current Working Directory \((/[^)\n]+)\) Files")
+
+
+def cline_project(key):
+    if key.endswith("ui_messages.json"):
+        cwd = _cline_cline_task_meta(key).get("cwdOnTaskInitialization")
+        if cwd:
+            return cwd
+        try:
+            with open(Path(key).parent / "api_conversation_history.json", "r", encoding="utf-8", errors="replace") as fh:
+                m = _cline_CWD_RE.search(fh.read(2_000_000))
+            return m.group(1) if m else ""
+        except OSError:
+            return ""
+    manifest = _cline_cline_manifest(key)
+    return manifest.get("cwd") or manifest.get("workspace_root") or ""
+
+
+def cline_title(key):
+    if key.endswith("ui_messages.json"):
+        task = _cline_cline_task_meta(key).get("task") or ""
+        return task.strip().splitlines()[0][:200] if task.strip() else ""
+    meta = _cline_cline_manifest(key).get("metadata") or {}
+    return meta.get("title") or "" if isinstance(meta, dict) else ""
+
+
+def cline_legacy_fixture(home, cwd):
+    """A VS Code extension task (ui_messages.json + api history + taskHistory), as on this Mac."""
+    base = Path(home) / "Library" / "Application Support" / "Code" / "User" / "globalStorage" / _cline_CLINE_EXT_ID
+    if not sys.platform == "darwin":
+        base = Path(home) / ".config" / "Code" / "User" / "globalStorage" / _cline_CLINE_EXT_ID
+    tid = "1728640760969"
+    tdir = base / "tasks" / tid
+    tdir.mkdir(parents=True, exist_ok=True)
+    ui = [
+        {"ts": 1, "type": "say", "say": "text", "text": "please check zebracornclineext", "images": []},
+        {"ts": 2, "type": "say", "say": "api_req_started",
+         "text": json.dumps({"request": "<task>x</task>\n<environment_details>zebracorninjected</environment_details>"})},
+        {"ts": 3, "type": "say", "say": "reasoning", "text": "zebracorninjected thinking"},
+        {"ts": 4, "type": "say", "say": "text", "text": "Running it for zebracornclineext.", "partial": False},
+        {"ts": 5, "type": "ask", "ask": "command", "text": "echo hi-clineext", "partial": False},
+        {"ts": 6, "type": "ask", "ask": "command_output", "text": "zebracornclineexttool"},
+        {"ts": 7, "type": "ask", "ask": "command_output", "text": "second line"},
+        {"ts": 8, "type": "say", "say": "api_req_started", "text": json.dumps({"request": "[execute_command] zebracorninjected"})},
+        {"ts": 9, "type": "say", "say": "tool", "text": json.dumps({"tool": "readFile", "path": "calc.py", "content": "def add zebracornclineextfile"})},
+        {"ts": 10, "type": "say", "say": "completion_result", "text": "All done zebracornclineext"},
+        {"ts": 11, "type": "ask", "ask": "completion_result", "text": ""},
+        {"ts": 12, "type": "say", "say": "user_feedback", "text": "thanks zebracornclineext", "images": []},
+    ]
+    (tdir / "ui_messages.json").write_text(json.dumps(ui))
+    (tdir / "api_conversation_history.json").write_text(json.dumps([{"role": "user", "content": [
+        {"type": "text", "text": "<task>\nplease check zebracornclineext\n</task>"},
+        {"type": "text", "text": f"<environment_details>\n# Current Working Directory ({cwd}) Files\nzebracorninjected\n</environment_details>"}]}]))
+    (base / "state").mkdir(parents=True, exist_ok=True)
+    (base / "state" / "taskHistory.json").write_text(json.dumps([{"id": tid, "ts": 1, "task": "please check zebracornclineext"}]))
+    return str(tdir / "ui_messages.json")
+
+
+# ── Continue (continue) ──────────────────────────────────────────────────────
+# Continue (`cn` CLI, npm @continuedev/cli, and the Continue IDE extensions) session parser for navcom.
+#
+# On disk ($CONTINUE_GLOBAL_DIR, default ~/.continue):
+#   sessions/<uuid>.json   {sessionId, title, workspaceDirectory, history:[ChatHistoryItem], usage?}
+#   sessions/sessions.json index [{sessionId, title, dateCreated, workspaceDirectory, messageCount?}]
+# ChatHistoryItem = {message:{role, content, toolCalls?, toolCallId?}, contextItems, editorState?,
+#                    toolCallStates?:[{toolCallId, toolCall, status, parsedArgs, output:[{content,name}]}],
+#                    toolCallState? (older IDE, singular), promptLogs?, conversationSummary?}
+# The IDE and the CLI share this file layout; the IDE stores content as parts, the CLI as a string.
+
+_continue_DEFAULT_TITLES = ("", "Untitled Session", "New Session")
+
+
+def continue_home():
+    return _env_path("CONTINUE_GLOBAL_DIR") or Path.home() / ".continue"
+
+
+def continue_roots():
+    return [continue_home() / "sessions"]
+
+
+def continue_list():
+    root = continue_roots()[0]
+    try:
+        paths = [p for p in root.glob("*.json") if p.name != "sessions.json"] if root.is_dir() else []
+    except OSError:
+        paths = []
+    return _file_logs(paths, "continue")
+
+
+def _continue_load(key):
+    try:
+        data = json.loads(Path(key).read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _continue_args(call):
+    fn = (call or {}).get("function") if isinstance(call, dict) else None
+    fn = fn if isinstance(fn, dict) else {}
+    args = fn.get("arguments")
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:
+            pass
+    return fn.get("name"), args
+
+
+def _continue_state_output(state):
+    output = state.get("output")
+    if isinstance(output, list):  # ContextItem[]: {content, name, description}
+        return "\n".join(o.get("content") for o in output if isinstance(o, dict) and isinstance(o.get("content"), str))
+    return output if isinstance(output, str) else ""
+
+
+def continue_iter(key):
+    calls, done, after_summary = {}, set(), False
+    for item in _continue_load(key).get("history") or []:
+        if not isinstance(item, dict):
+            continue
+        msg = item.get("message") if isinstance(item.get("message"), dict) else {}
+        role = msg.get("role")
+        if item.get("conversationSummary") is not None:
+            after_summary = True  # compaction summary (model-written context) — injected
+            continue
+        if role == "user":
+            text = _text_of(msg.get("content") or "")
+            if after_summary and text.strip() == "continue":
+                continue  # cn auto-continues after compaction with a synthetic "continue"
+            if text.strip():
+                yield "user", text
+        elif role == "assistant":
+            text = _text_of(msg.get("content") or "")
+            if text.strip():
+                yield "assistant", text
+            states = item.get("toolCallStates") or ([item["toolCallState"]] if isinstance(item.get("toolCallState"), dict) else [])
+            by_id = {s.get("toolCallId"): s for s in states if isinstance(s, dict)}
+            for call in msg.get("toolCalls") or [s.get("toolCall") for s in by_id.values()]:
+                name, args = _continue_args(call)
+                cid = (call or {}).get("id") if isinstance(call, dict) else None
+                state = by_id.get(cid) or {}
+                if isinstance(state.get("parsedArgs"), dict):
+                    args = state["parsedArgs"]
+                label_args = args
+                if isinstance(args, dict) and not args.get("path") and (args.get("filepath") or args.get("dirPath")):
+                    label_args = {**args, "path": args.get("filepath") or args.get("dirPath")}  # Read/builtin_read_file
+                calls[cid] = _call_label(name, label_args)
+                cmd = _shell_cmd(name, args)  # cn "Bash"; IDE "builtin_run_terminal_command"
+                if cmd:
+                    yield "cmd", cmd
+                if state:
+                    turn = tool_turn(calls[cid], _continue_state_output(state))
+                    done.add(cid)
+                    if turn:
+                        yield turn
+        elif role == "tool":  # IDE agent mode also logs results as role=tool items
+            if msg.get("toolCallId") not in done:
+                turn = tool_turn(calls.get(msg.get("toolCallId"), "tool"), msg.get("content"))
+                if turn:
+                    yield turn
+        # role system (system prompt, slash-command output, compaction notices) and thinking: skipped
+        after_summary = False
+
+
+def continue_project(key):
+    ws = _continue_load(key).get("workspaceDirectory") or ""
+    if isinstance(ws, str) and ws.startswith("file://"):
+        ws = unquote(urlparse(ws).path)
+    return ws if isinstance(ws, str) else ""
+
+
+def continue_title(key):
+    title = _continue_load(key).get("title")
+    return title if isinstance(title, str) and title not in _continue_DEFAULT_TITLES else ""
+
+
+# ── Codewhale (codewhale) ────────────────────────────────────────────────────
+# navcom parsers for three DeepSeek-first harnesses: Codewhale, Reasonix, Deep Code.
+#
+# The same file is copied into harness/codewhale, harness/reasonix and harness/deepcode.
+
+def _codewhale_load_json(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def _codewhale_jsonl(path):
+    try:
+        handle = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with handle:
+        for line in handle:
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                yield obj
+
+
+def _codewhale_tolerant(gen_fn):
+    """Odd records end a transcript early instead of raising into the indexer."""
+    def wrapper(key):
+        try:
+            yield from gen_fn(key)
+        except Exception:
+            return
+    wrapper.__name__ = gen_fn.__name__
+    return wrapper
+
+
+def _codewhale_safe_str(fn):
+    def wrapper(key):
+        try:
+            return fn(key) or ""
+        except Exception:
+            return ""
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+def _codewhale_args(raw):
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return raw
+    return raw
+
+
+# A text part that is one whole XML-ish element is host-injected context
+# (<turn_meta>, <session_goal>, <workspace>, <session-context>, <system-reminder>, …).
+_codewhale_INJECTED_BLOCK_RE = re.compile(r"^\s*<([A-Za-z][\w-]*)\b[^>]*>.*</\1>\s*$|^\s*<[A-Za-z][\w-]*\b[^>]*/>\s*$", re.S)
+_codewhale_EDGE_BLOCK_RE = re.compile(r"\A\s*<([A-Za-z][\w-]*)\b[^>]*>\n.*?\n</\1>\s*|\s*<([A-Za-z][\w-]*)\b[^>]*>\n.*?\n</\2>\s*\Z", re.S)
+
+
+def _codewhale_strip_injected(text):
+    """Drop whole injected XML blocks wrapped around typed text (leading or trailing)."""
+    if not isinstance(text, str):
+        return ""
+    if _codewhale_INJECTED_BLOCK_RE.match(text):
+        return ""
+    prev = None
+    while prev != text:
+        prev, text = text, _codewhale_EDGE_BLOCK_RE.sub("", text, count=1)
+    return text.strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Codewhale (formerly DeepSeek-TUI) ─ $CODEWHALE_HOME/sessions/<id>.json
+#   legacy ~/.deepseek/sessions (migrated by move, or copied when the move fails)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def codewhale_roots():
+    explicit = _env_path("CODEWHALE_HOME")
+    if explicit:
+        return [explicit / "sessions"]  # an explicit home never falls back to ~/.deepseek
+    return [Path.home() / ".codewhale" / "sessions", Path.home() / ".deepseek" / "sessions"]
+
+
+def codewhale_list():
+    seen, paths = set(), []
+    for root in codewhale_roots():
+        try:
+            entries = sorted(root.glob("*.json")) if root.is_dir() else []
+        except OSError:
+            entries = []
+        for path in entries:
+            # session_boot_owners.json etc. are bookkeeping; checkpoints/ and
+            # .work-graph-import-archive/ hold copies of the same sessions.
+            if path.name in seen or path.name == "session_boot_owners.json":
+                continue
+            seen.add(path.name)
+            paths.append(path)
+    return _file_logs(paths, "codewhale")
+
+
+def _codewhale_codewhale_messages(session):
+    """Every message the session ever held: the append-only journal (all branches,
+    pre-compaction turns included) when present, else the flat messages list."""
+    journal = session.get("journal") if isinstance(session.get("journal"), dict) else {}
+    entries = journal.get("entries") if isinstance(journal.get("entries"), list) else []
+    if entries:
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            kind = entry.get("kind")
+            if kind == "message" and isinstance(entry.get("message"), dict):
+                yield entry["message"]
+            elif kind in ("user", "assistant") and isinstance(entry.get("text"), str):
+                yield {"role": kind, "content": [{"type": "text", "text": entry["text"]}]}
+            # compaction / branch_summary / system: generated context, not typed or said
+        return
+    messages = session.get("messages")
+    for message in messages if isinstance(messages, list) else []:
+        if isinstance(message, dict):
+            yield message
+
+
+@_codewhale_tolerant
+def codewhale_iter(key):
+    session = _codewhale_load_json(key)
+    if not isinstance(session, dict):
+        return
+    calls = {}
+    for message in _codewhale_codewhale_messages(session):
+        role = message.get("role")
+        content = message.get("content")
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        if not isinstance(content, list) or role == "system":
+            continue
+        texts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if kind == "text" and isinstance(block.get("text"), str):
+                text = block["text"]
+                if role == "user":
+                    text = _codewhale_strip_injected(text)
+                elif role == "assistant_interrupted":
+                    text = text.replace(
+                        "[The following assistant output was interrupted before completion and may be incomplete or wrong]\n", "")
+                if text.strip():
+                    texts.append(text)
+            elif kind in ("tool_use", "server_tool_use"):
+                if texts:
+                    yield ("user" if role == "user" else "assistant"), "\n".join(texts)
+                    texts = []
+                args = _codewhale_args(block.get("input"))
+                calls[block.get("id")] = _call_label(block.get("name"), args)
+                cmd = _shell_cmd(block.get("name"), args)
+                if cmd:
+                    yield "cmd", cmd
+            elif kind in ("tool_result", "tool_search_tool_result", "code_execution_tool_result"):
+                output = block.get("content")
+                if (not isinstance(output, str) or not output.strip()) and block.get("content_blocks"):
+                    output = block["content_blocks"]
+                if block.get("is_error"):
+                    output = "error\n" + (output if isinstance(output, str) else _text_of(output))
+                turn = tool_turn(calls.get(block.get("tool_use_id"), "tool"), output)
+                if turn:
+                    yield turn
+            # thinking / image_url: skipped
+        if texts:
+            yield ("user" if role == "user" else "assistant"), "\n".join(texts)
+
+
+def _codewhale_codewhale_meta(key):
+    session = _codewhale_load_json(key)
+    meta = session.get("metadata") if isinstance(session, dict) else None
+    return meta if isinstance(meta, dict) else {}
+
+
+@_codewhale_safe_str
+def codewhale_project(key):
+    return str(_codewhale_codewhale_meta(key).get("workspace") or "")
+
+
+@_codewhale_safe_str
+def codewhale_title(key):
+    return str(_codewhale_codewhale_meta(key).get("title") or "")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reasonix ─ state root = $REASONIX_STATE_HOME | $REASONIX_HOME | ~/.reasonix
+#   2.x (Studio, Go):      <state>/[projects/<slug>/]sessions/<stem>.jsonl  (+ <stem>.events.jsonl
+#                          schema 1/3 replace|append records; may hold newer turns than the .jsonl)
+#   1.x 1.38.2–1.38.7:     same names, but <stem>.events.jsonl is a schema 2 DAG log
+#   1.x ≥1.38.8 (npm):     <state>/projects/<slug>/sessions-v4/<id>/events.frames
+#                          (RX4F frames of zstd JSON records; big payloads in ../.content-v1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_codewhale_REASONIX_SIDECARS = (".events.jsonl", ".conflicts.jsonl", ".guardian.jsonl", ".wire.jsonl",
+                      ".adjudication.jsonl", ".execution.jsonl", ".turns.jsonl")
+
+
+def reasonix_roots():
+    state = _env_path("REASONIX_STATE_HOME", "REASONIX_HOME")
+    if state:
+        return [state]
+    roots = [Path.home() / ".reasonix"]
+    # pre-dotdir installs kept state in the OS config dir
+    if sys.platform == "darwin":
+        roots.append(Path.home() / "Library" / "Application Support" / "reasonix")
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        roots.append((Path(xdg).expanduser() if xdg else Path.home() / ".config") / "reasonix")
+    return roots
+
+
+def _codewhale_reasonix_session_dirs(state):
+    """<state>/sessions plus <state>/projects/<slug>/sessions; sessions-v4 sits beside each."""
+    dirs = [state / "sessions"]
+    try:
+        dirs += [d / "sessions" for d in sorted((state / "projects").iterdir()) if d.is_dir()] \
+            if (state / "projects").is_dir() else []
+    except OSError:
+        pass
+    return dirs
+
+
+def reasonix_list():
+    logs = []
+    for state in reasonix_roots():
+        for sessions in _codewhale_reasonix_session_dirs(state):
+            for path in _rglob(sessions, "*.jsonl"):
+                rel = path.relative_to(sessions).parts
+                if any(p.startswith(".") or p.endswith(".ckpt") or p.endswith(".inbox") for p in rel[:-1]):
+                    continue
+                if path.name.endswith(_codewhale_REASONIX_SIDECARS):
+                    continue
+                events = path.with_name(path.name[:-len(".jsonl")] + ".events.jsonl")
+                try:
+                    st = path.stat()
+                    ev = events.stat() if events.exists() else None
+                except OSError:
+                    continue
+                mtime = max(st.st_mtime, ev.st_mtime if ev else 0)
+                logs.append((str(path), mtime, st.st_size + (ev.st_size if ev else 0), "reasonix"))
+            v4 = sessions.parent / "sessions-v4"
+            try:
+                session_dirs = sorted(v4.iterdir()) if v4.is_dir() else []
+            except OSError:
+                session_dirs = []
+            for sdir in session_dirs:
+                frames = sdir / "events.frames"
+                if sdir.name.startswith(".") or not (sdir / "manifest.json").is_file() or not frames.is_file():
+                    continue
+                imported = sessions / f"v4-{sdir.name}.jsonl"  # a 2.x import of this 1.x session
+                try:
+                    if imported.exists() and imported.stat().st_mtime >= frames.stat().st_mtime:
+                        continue
+                except OSError:
+                    pass
+                logs.extend(_file_logs([frames], "reasonix"))
+    return logs
+
+
+def _codewhale_rx4f_records(frames_path):
+    """Decode an RX4F log: 12-byte header (magic, compressed len, raw len; big-endian)
+    then one zstd frame per JSON record. A torn tail is a write in progress."""
+    try:
+        data = Path(frames_path).read_bytes()
+    except OSError:
+        return []
+    chunks, sizes, off = [], [], 0
+    while off + 12 <= len(data) and data[off:off + 4] == b"RX4F":
+        clen, rlen = struct.unpack(">II", data[off + 4:off + 12])
+        if off + 12 + clen > len(data):
+            break
+        chunks.append(data[off + 12:off + 12 + clen])
+        sizes.append(rlen)
+        off += 12 + clen
+    if not chunks:
+        return []
+    # zstd frames concatenate: decode them in one pass with navcom's reader, then split.
+    with tempfile.NamedTemporaryFile(suffix=".zst", delete=False) as tmp:
+        tmp.write(b"".join(chunks))
+    try:
+        raw = read_zstd(tmp.name)
+    finally:
+        os.unlink(tmp.name)
+    records, pos = [], 0
+    for size in sizes:
+        piece = raw[pos:pos + size]
+        pos += size
+        try:
+            records.append(json.loads(piece))
+        except Exception:
+            break
+    return records
+
+
+def _codewhale_reasonix_v4(frames_path):
+    """-> (messages, title). Keeps every message the log ever committed (upserts in
+    place; retracted and history-replaced messages are kept), in first-seen order."""
+    sdir = Path(frames_path).parent
+    manifest = _codewhale_load_json(sdir / "manifest.json") or {}
+    pool = (sdir if manifest.get("contentRoot") == ".content-v1" else sdir.parent) / ".content-v1"
+    order, by_id, title, pending = [], {}, "", []
+
+    def body_of(event):
+        ref = event.get("payloadRef")
+        try:
+            if isinstance(ref, dict) and len(str(ref.get("digest", ""))) == 64:
+                d = ref["digest"]
+                return json.loads((pool / "objects" / d[:2] / d[2:4] / d).read_bytes())
+            if event.get("payload"):
+                return json.loads(base64.b64decode(event["payload"]))
+        except Exception:
+            pass
+        return {}
+
+    def add(message):
+        if not isinstance(message, dict):
+            return
+        mid = message.get("id")
+        if mid and mid in by_id:
+            order[by_id[mid]] = message
+        else:
+            if mid:
+                by_id[mid] = len(order)
+            order.append(message)
+
+    for rec in _codewhale_rx4f_records(frames_path):
+        kind = rec.get("recordType")
+        if kind == "batch/begin":
+            pending = []
+        elif kind == "batch/event" and isinstance(rec.get("event"), dict):
+            pending.append(rec["event"])
+        elif kind == "batch/end":
+            for event in pending:
+                ek = event.get("kind")
+                if ek in ("message/complete", "message/upsert"):
+                    msg = body_of(event).get("message")
+                    if ek == "message/complete" and isinstance(msg, dict) and msg.get("id") in by_id:
+                        continue
+                    add(msg)
+                elif ek in ("history/replace", "legacy/import"):
+                    for msg in body_of(event).get("messages") or []:
+                        if not (isinstance(msg, dict) and msg.get("id") in by_id):
+                            add(msg)
+                elif ek == "session/title":
+                    title = str(body_of(event).get("title") or "").strip() or title
+            pending = []
+    return order, title
+
+
+def _codewhale_reasonix_events_kind(events_path):
+    for rec in _codewhale_jsonl(events_path):
+        return rec.get("schema_version")
+    return None
+
+
+def _codewhale_reasonix_dag(events_path):
+    """1.x schema 2 DAG log: every message node of every head, patches/redactions applied."""
+    order, by_id = [], {}
+    for rec in _codewhale_jsonl(events_path):
+        kind = rec.get("type")
+        if kind == "message" and rec.get("id") and rec["id"] not in by_id:
+            msgs = rec.get("msgs") or []
+            if msgs and isinstance(msgs[0], dict):
+                by_id[rec["id"]] = len(order)
+                order.append(msgs[0])
+        elif kind == "patch" and rec.get("target") in by_id:
+            msgs = rec.get("msgs") or []
+            if msgs and isinstance(msgs[0], dict):
+                order[by_id[rec["target"]]] = msgs[0]
+        elif kind == "redact" and isinstance(rec.get("targets"), dict):
+            for target, msgs in rec["targets"].items():
+                if target in by_id and msgs and isinstance(msgs[0], dict):
+                    order[by_id[target]] = msgs[0]
+    return order
+
+
+def _codewhale_reasonix_replay(events_path):
+    """2.x schema 1/3 log: replace resets, append extends. Messages a later replace
+    dropped (rewinds, compaction) are kept, in first-seen order."""
+    snapshots, cur, records = [], [], 0
+    for rec in _codewhale_jsonl(events_path):
+        msgs = rec.get("messages") if isinstance(rec.get("messages"), list) else []
+        msgs = [m for m in msgs if isinstance(m, dict)]
+        if rec.get("type") == "replace":
+            snapshots.append(cur)
+            cur = msgs
+        elif rec.get("type") == "append":
+            idx = rec.get("message_index")
+            cur = cur[:idx if isinstance(idx, int) else len(cur)] + msgs
+        else:
+            continue
+        records += 1
+    if not records:
+        return None
+    out, seen = [], set()
+    for snap in snapshots + [cur]:
+        counts = {}
+        for msg in snap:
+            sig = json.dumps(msg, sort_keys=True, ensure_ascii=False)
+            counts[sig] = counts.get(sig, 0) + 1
+            if (sig, counts[sig]) not in seen:
+                seen.add((sig, counts[sig]))
+                out.append(msg)
+    return out
+
+
+def _codewhale_reasonix_messages(key):
+    if key.endswith("events.frames"):
+        return _codewhale_reasonix_v4(key)[0]
+    events = key[:-len(".jsonl")] + ".events.jsonl"
+    if os.path.exists(events):
+        schema = _codewhale_reasonix_events_kind(events)
+        msgs = _codewhale_reasonix_dag(events) if schema == 2 else _codewhale_reasonix_replay(events)
+        if msgs:
+            return msgs
+    return list(_codewhale_jsonl(key))
+
+
+def _codewhale_openai_calls(tool_calls):
+    for call in tool_calls if isinstance(tool_calls, list) else []:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") if isinstance(call.get("function"), dict) else call
+        yield call.get("id"), fn.get("name") or call.get("resolved_name"), _codewhale_args(fn.get("arguments"))
+
+
+@_codewhale_tolerant
+def reasonix_iter(key):
+    calls = {}
+    for msg in _codewhale_reasonix_messages(key):
+        role = msg.get("role")
+        if role == "user":
+            if msg.get("host_authored") or msg.get("origin") == "host":
+                continue  # session-context snapshots, steer notes: injected
+            raw = msg.get("raw_content")
+            text = raw if isinstance(raw, str) and raw.strip() else _codewhale_strip_injected(_text_of(msg.get("content")))
+            if text.strip():
+                yield "user", text
+        elif role == "assistant":
+            text = _text_of(msg.get("content"))
+            if text.strip():
+                yield "assistant", text.strip()
+            for cid, name, args in _codewhale_openai_calls(msg.get("tool_calls")):
+                calls[cid] = _call_label(name, args)
+                cmd = _shell_cmd(name, args)
+                if cmd:
+                    yield "cmd", cmd
+        elif role == "tool":
+            output = msg.get("content")
+            if isinstance(output, list):
+                output = _text_of(output)
+            label = calls.get(msg.get("tool_call_id")) or msg.get("name") or "tool"
+            turn = tool_turn(label, output)
+            if turn:
+                yield turn
+
+
+_codewhale_WORKSPACE_RE = re.compile(r'Current workspace: "([^"]+)"')
+
+
+@_codewhale_safe_str
+def reasonix_project(key):
+    for msg in _codewhale_reasonix_messages(key)[:8]:
+        if msg.get("role") in ("user", "system"):
+            m = _codewhale_WORKSPACE_RE.search(_text_of(msg.get("content")) or "")
+            if m:
+                return m.group(1)
+    parts = Path(key).parts
+    if "projects" in parts:
+        i = len(parts) - 1 - parts[::-1].index("projects")
+        if i + 1 < len(parts):
+            return parts[i + 1]  # lossy slug (/ → -), same as navcom does for Claude
+    return ""
+
+
+@_codewhale_safe_str
+def reasonix_title(key):
+    if key.endswith("events.frames"):
+        title = _codewhale_reasonix_v4(key)[1]
+        if title:
+            return title
+        cache = _codewhale_load_json(Path(key).parent.parent / ".query-cache" / Path(key).parent.name / "catalog-metadata.json")
+        return str((cache or {}).get("title") or "").strip()
+    meta = _codewhale_load_json(key + ".meta") or {}
+    return str(meta.get("title") or "").strip()  # 2.x keeps only a preview of the first prompt
+
+
+def reasonix_fixture(home, cwd):
+    slug = cwd.replace("/", "-")
+    sessions = Path(home) / ".reasonix" / "projects" / slug / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    stem = sessions / "20261001-000000.000000000-deepseek-flash"
+    system = {"role": "system", "content": "You are Reasonix, a coding agent. zebracorninjected"}
+    user = {"role": "user",
+            "content": f'<workspace>\nCurrent workspace: "{cwd}".\nzebracorninjected\n</workspace>\n\n'
+                       "run it zebracornreasonix\n\n<execution-policy preset=\"balanced\" version=\"3\">\nverify=targeted\n</execution-policy>",
+            "raw_content": "run it zebracornreasonix", "createdAt": 1790000000000}
+    call = {"role": "assistant", "content": " ", "reasoning_content": "zebracornthinking",
+            "tool_calls": [{"id": "call_1", "name": "bash", "arguments": json.dumps({"command": "echo hi-reasonix"})}]}
+    result = {"role": "tool", "content": "hi zebracornreasonixtool\n", "tool_call_id": "call_1", "name": "bash"}
+    steer = {"role": "user", "content": f'<workspace>\nCurrent workspace: "{cwd}"\n</workspace>\nzebracorninjected steer',
+             "host_authored": True}
+    reply = {"role": "assistant", "content": "done zebracornreasonix"}
+    # checkpoint .jsonl lags the event log: the newest turns exist only in the sidecar
+    with open(f"{stem}.jsonl", "w", encoding="utf-8") as fh:
+        for m in (system, user):
+            fh.write(json.dumps(m) + "\n")
+    with open(f"{stem}.events.jsonl", "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"schema_version": 1, "type": "replace", "revision": 1, "messages": [system, user],
+                             "created_at": "2026-10-01T00:00:00Z"}) + "\n")
+        fh.write(json.dumps({"schema_version": 1, "type": "append", "revision": 2, "base_revision": 1,
+                             "message_index": 2, "messages": [call, result, steer, reply],
+                             "created_at": "2026-10-01T00:00:01Z"}) + "\n")
+    Path(f"{stem}.jsonl.meta").write_text(json.dumps({"id": stem.name, "model": "deepseek/deepseek-flash",
+                                                       "revision": 2, "schema_version": 2, "turns": 1,
+                                                       "preview": "run it zebracornreasonix"}), encoding="utf-8")
+    return f"{stem}.jsonl"
+
+
+def reasonix_v4_fixture(home, cwd):
+    """A 1.x sessions-v4 store (RX4F frames), built with the zstd CLI."""
+    import hashlib
+    import subprocess
+    sid = "0123456789abcdef0123456789abcdef"
+    sdir = Path(home) / ".reasonix" / "projects" / cwd.replace("/", "-") / "sessions-v4" / sid
+    sdir.mkdir(parents=True, exist_ok=True)
+    (sdir / "manifest.json").write_text(json.dumps({
+        "schemaVersion": 4, "codec": "reasonix.session.linear/v4", "storageRevision": 3,
+        "contentRoot": "../.content-v1", "sessionId": sid, "createdAt": "2026-10-01T00:00:00Z",
+        "writerGeneration": 1, "kind": "headless-run"}), encoding="utf-8")
+    big = json.dumps({"message": {"role": "tool", "id": "m5", "content": "hi zebracornreasonixv4tool\n",
+                                  "tool_call_id": "c1", "name": "bash"}}).encode()
+    digest = hashlib.sha256(big).hexdigest()
+    obj = sdir.parent / ".content-v1" / "objects" / digest[:2] / digest[2:4] / digest
+    obj.parent.mkdir(parents=True, exist_ok=True)
+    obj.write_bytes(big)
+    events = [
+        ("message/complete", {"message": {"role": "user", "id": "m1", "origin": "host",
+                                          "content": f'<session-context version="1">\n## Workspace\n\nCurrent workspace: "{cwd}"\nzebracorninjected\n</session-context>'}}),
+        ("message/complete", {"message": {"role": "user", "id": "m2", "origin": "user",
+                                          "content": "v4 zebracornreasonixv4", "raw_content": "v4 zebracornreasonixv4"}}),
+        ("message/complete", {"message": {"role": "assistant", "id": "m3", "reasoning_content": "zebracornthinking",
+                                          "tool_calls": [{"id": "c1", "name": "bash",
+                                                          "arguments": json.dumps({"command": "echo hi-reasonixv4"})}]}}),
+        ("message/complete", None),  # payload in the content pool
+        ("message/complete", {"message": {"role": "assistant", "id": "m6", "content": "done zebracornreasonixv4"}}),
+        ("session/title", {"title": "v4 zebracorn title"}),
+    ]
+    out = bytearray()
+
+    def frame(rec):
+        raw = json.dumps(rec).encode()
+        comp = subprocess.run(["zstd", "-q", "-c"], input=raw, capture_output=True).stdout
+        out.extend(b"RX4F" + struct.pack(">II", len(comp), len(raw)) + comp)
+
+    head = {"schemaVersion": 4, "codec": "reasonix.session.linear/v4"}
+    for seq, (kind, body) in enumerate(events, start=1):
+        frame({**head, "recordType": "batch/begin", "commitId": f"c{seq}", "firstSeq": seq, "eventCount": 1})
+        ev = {"id": f"e{seq}", "seq": seq, "kind": kind}
+        if body is None:
+            ev["payloadRef"] = {"digest": digest, "bytes": len(big)}
+        else:
+            ev["payload"] = base64.b64encode(json.dumps(body).encode()).decode()
+        frame({**head, "recordType": "batch/event", "event": ev})
+        frame({**head, "recordType": "batch/end", "commitId": f"c{seq}", "firstSeq": seq, "eventCount": 1, "sha256": ""})
+    (sdir / "events.frames").write_bytes(bytes(out))
+    return str(sdir / "events.frames")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Deep Code (lessweb/deepcode-cli, npm @vegamo/deepcode-cli)
+#   ~/.deepcode/projects/<cwd with / → ->/<sessionId>.jsonl  (+ sessions-index.json)
+#   os.homedir() only; no env override.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def deepcode_roots():
+    return [Path.home() / ".deepcode" / "projects"]
+
+
+def deepcode_list():
+    paths = []
+    for root in deepcode_roots():
+        try:
+            paths += sorted(root.glob("*/*.jsonl")) if root.is_dir() else []
+        except OSError:
+            pass
+    return _file_logs(paths, "deepcode")
+
+
+def _codewhale_deepcode_tool_output(content):
+    """Tool results are a JSON envelope {"ok","name","output"|"error","metadata":{exitCode…}}."""
+    if not isinstance(content, str):
+        return content
+    try:
+        env = json.loads(content)
+    except Exception:
+        return content
+    if not isinstance(env, dict) or not ({"output", "error", "ok"} & set(env)):
+        return content
+    body = env.get("output")
+    if not isinstance(body, str):
+        body = json.dumps(body, ensure_ascii=False) if body not in (None, "") else ""
+    meta = env.get("metadata") if isinstance(env.get("metadata"), dict) else {}
+    code = meta.get("exitCode")
+    head = []
+    if env.get("ok") is False:
+        head.append("error" + (f": {env['error']}" if isinstance(env.get("error"), str) else ""))
+    if code not in (None, 0):
+        head.append(f"exit {code}")
+    return "\n".join(head + [body]).strip()
+
+
+@_codewhale_tolerant
+def deepcode_iter(key):
+    calls = {}
+    for msg in _codewhale_jsonl(key):
+        role = msg.get("role")
+        params = msg.get("messageParams") if isinstance(msg.get("messageParams"), dict) else {}
+        meta = msg.get("meta") if isinstance(msg.get("meta"), dict) else {}
+        if role == "user":
+            prompt = meta.get("userPrompt") if isinstance(meta.get("userPrompt"), dict) else {}
+            text = prompt.get("text") if isinstance(prompt.get("text"), str) else _text_of(msg.get("content"))
+            if text and text.strip():
+                yield "user", text
+        elif role == "assistant":
+            text = _text_of(msg.get("content"))
+            if text.strip():
+                yield "assistant", text.strip()
+            for cid, name, args in _codewhale_openai_calls(params.get("tool_calls")):
+                calls[cid] = _call_label(name, args)
+                cmd = _shell_cmd(name, args)
+                if cmd:
+                    yield "cmd", cmd
+        elif role == "tool":
+            label = calls.get(params.get("tool_call_id"))
+            if not label and isinstance(meta.get("function"), dict):
+                fn = meta["function"]
+                label = _call_label(fn.get("name"), _codewhale_args(fn.get("arguments")))
+            turn = tool_turn(label or "tool", _codewhale_deepcode_tool_output(msg.get("content")))
+            if turn:
+                yield turn
+        # system: prompt, environment, skill bodies, compaction summaries (meta.isSummary)
+
+
+def _codewhale_deepcode_index_entry(key):
+    index = _codewhale_load_json(Path(key).parent / "sessions-index.json") or {}
+    sid = Path(key).stem
+    for entry in index.get("entries") or []:
+        if isinstance(entry, dict) and entry.get("id") == sid:
+            return index, entry
+    return index, {}
+
+
+_codewhale_ROOT_PATH_RE = re.compile(r'"root path":\s*"((?:[^"\\]|\\.)*)"')
+
+
+@_codewhale_safe_str
+def deepcode_project(key):
+    index, _ = _codewhale_deepcode_index_entry(key)
+    if isinstance(index.get("originalPath"), str) and index["originalPath"]:
+        return index["originalPath"]
+    for msg in _codewhale_jsonl(key):
+        if msg.get("role") == "system":
+            m = _codewhale_ROOT_PATH_RE.search(_text_of(msg.get("content")) or "")
+            if m:
+                try:
+                    return json.loads(f'"{m.group(1)}"')
+                except Exception:
+                    return m.group(1)
+        elif msg.get("role") == "user":
+            break
+    return Path(key).parent.name
+
+
+@_codewhale_safe_str
+def deepcode_title(key):
+    _, entry = _codewhale_deepcode_index_entry(key)
+    return str(entry.get("summary") or "").strip()
+
+
+def deepcode_fixture(home, cwd):
+    sid = "6f1c2d3e-4a5b-4c6d-8e7f-001122334455"
+    pdir = Path(home) / ".deepcode" / "projects" / cwd.replace("/", "-")
+    pdir.mkdir(parents=True, exist_ok=True)
+    base = {"sessionId": sid, "contentParams": None, "compacted": False,
+            "createTime": "2026-10-01T00:00:00.000Z", "updateTime": "2026-10-01T00:00:00.000Z"}
+    args = json.dumps({"command": "echo hi-deepcode", "description": "say hi", "sideEffects": ["read-in-cwd"]})
+    rows = [
+        {**base, "id": "s1", "role": "system", "content": "You are a helpful software engineer assistant.",
+         "messageParams": None, "visible": False},
+        {**base, "id": "s2", "role": "system",
+         "content": f'# Local Workspace Environment\n```json\n{{"root path": "{cwd}"}}\n```\nzebracorninjected',
+         "messageParams": None, "visible": False},
+        {**base, "id": "u1", "role": "user", "content": "hello zebracorndeepcode", "messageParams": None,
+         "visible": True, "meta": {"userPrompt": {"text": "hello zebracorndeepcode"}}},
+        {**base, "id": "a1", "role": "assistant", "content": " ", "visible": False,
+         "messageParams": {"tool_calls": [{"id": "call_1", "type": "function",
+                                           "function": {"name": "bash", "arguments": args}}],
+                           "reasoning_content": "zebracornthinking"},
+         "meta": {"asThinking": True}},
+        {**base, "id": "t1", "role": "tool", "visible": True, "messageParams": {"tool_call_id": "call_1"},
+         "content": json.dumps({"ok": True, "name": "bash", "output": "hi zebracorndeepcodetool\n",
+                                "metadata": {"exitCode": 0, "cwd": cwd}}, indent=2),
+         "meta": {"function": {"name": "bash", "arguments": args}}},
+        {**base, "id": "s3", "role": "system", "content": "There are earlier parts of the conversation. zebracorninjected",
+         "messageParams": None, "visible": False, "meta": {"isSummary": True}},
+        {**base, "id": "a2", "role": "assistant", "content": "all done zebracorndeepcode", "visible": True,
+         "messageParams": {"reasoning_content": "zebracornthinking"}},
+    ]
+    path = pdir / f"{sid}.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    (pdir / "sessions-index.json").write_text(json.dumps({
+        "version": 1, "originalPath": cwd,
+        "entries": [{"id": sid, "summary": "hello zebracorndeepcode", "assistantReply": "all done",
+                     "status": "completed", "createTime": base["createTime"], "updateTime": base["updateTime"]}]},
+        indent=2), encoding="utf-8")
+    return str(path)
+
+
+# ── DeepSeek Reasonix (reasonix) ─────────────────────────────────────────────
+# navcom parsers for three DeepSeek-first harnesses: Codewhale, Reasonix, Deep Code.
+#
+# The same file is copied into harness/codewhale, harness/reasonix and harness/deepcode.
+
+def _reasonix_load_json(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def _reasonix_jsonl(path):
+    try:
+        handle = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with handle:
+        for line in handle:
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                yield obj
+
+
+def _reasonix_tolerant(gen_fn):
+    """Odd records end a transcript early instead of raising into the indexer."""
+    def wrapper(key):
+        try:
+            yield from gen_fn(key)
+        except Exception:
+            return
+    wrapper.__name__ = gen_fn.__name__
+    return wrapper
+
+
+def _reasonix_safe_str(fn):
+    def wrapper(key):
+        try:
+            return fn(key) or ""
+        except Exception:
+            return ""
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+def _reasonix_args(raw):
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return raw
+    return raw
+
+
+# A text part that is one whole XML-ish element is host-injected context
+# (<turn_meta>, <session_goal>, <workspace>, <session-context>, <system-reminder>, …).
+_reasonix_INJECTED_BLOCK_RE = re.compile(r"^\s*<([A-Za-z][\w-]*)\b[^>]*>.*</\1>\s*$|^\s*<[A-Za-z][\w-]*\b[^>]*/>\s*$", re.S)
+_reasonix_EDGE_BLOCK_RE = re.compile(r"\A\s*<([A-Za-z][\w-]*)\b[^>]*>\n.*?\n</\1>\s*|\s*<([A-Za-z][\w-]*)\b[^>]*>\n.*?\n</\2>\s*\Z", re.S)
+
+
+def _reasonix_strip_injected(text):
+    """Drop whole injected XML blocks wrapped around typed text (leading or trailing)."""
+    if not isinstance(text, str):
+        return ""
+    if _reasonix_INJECTED_BLOCK_RE.match(text):
+        return ""
+    prev = None
+    while prev != text:
+        prev, text = text, _reasonix_EDGE_BLOCK_RE.sub("", text, count=1)
+    return text.strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Codewhale (formerly DeepSeek-TUI) ─ $CODEWHALE_HOME/sessions/<id>.json
+#   legacy ~/.deepseek/sessions (migrated by move, or copied when the move fails)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def codewhale_roots():
+    explicit = _env_path("CODEWHALE_HOME")
+    if explicit:
+        return [explicit / "sessions"]  # an explicit home never falls back to ~/.deepseek
+    return [Path.home() / ".codewhale" / "sessions", Path.home() / ".deepseek" / "sessions"]
+
+
+def codewhale_list():
+    seen, paths = set(), []
+    for root in codewhale_roots():
+        try:
+            entries = sorted(root.glob("*.json")) if root.is_dir() else []
+        except OSError:
+            entries = []
+        for path in entries:
+            # session_boot_owners.json etc. are bookkeeping; checkpoints/ and
+            # .work-graph-import-archive/ hold copies of the same sessions.
+            if path.name in seen or path.name == "session_boot_owners.json":
+                continue
+            seen.add(path.name)
+            paths.append(path)
+    return _file_logs(paths, "codewhale")
+
+
+def _reasonix_codewhale_messages(session):
+    """Every message the session ever held: the append-only journal (all branches,
+    pre-compaction turns included) when present, else the flat messages list."""
+    journal = session.get("journal") if isinstance(session.get("journal"), dict) else {}
+    entries = journal.get("entries") if isinstance(journal.get("entries"), list) else []
+    if entries:
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            kind = entry.get("kind")
+            if kind == "message" and isinstance(entry.get("message"), dict):
+                yield entry["message"]
+            elif kind in ("user", "assistant") and isinstance(entry.get("text"), str):
+                yield {"role": kind, "content": [{"type": "text", "text": entry["text"]}]}
+            # compaction / branch_summary / system: generated context, not typed or said
+        return
+    messages = session.get("messages")
+    for message in messages if isinstance(messages, list) else []:
+        if isinstance(message, dict):
+            yield message
+
+
+@_reasonix_tolerant
+def codewhale_iter(key):
+    session = _reasonix_load_json(key)
+    if not isinstance(session, dict):
+        return
+    calls = {}
+    for message in _reasonix_codewhale_messages(session):
+        role = message.get("role")
+        content = message.get("content")
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        if not isinstance(content, list) or role == "system":
+            continue
+        texts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if kind == "text" and isinstance(block.get("text"), str):
+                text = block["text"]
+                if role == "user":
+                    text = _reasonix_strip_injected(text)
+                elif role == "assistant_interrupted":
+                    text = text.replace(
+                        "[The following assistant output was interrupted before completion and may be incomplete or wrong]\n", "")
+                if text.strip():
+                    texts.append(text)
+            elif kind in ("tool_use", "server_tool_use"):
+                if texts:
+                    yield ("user" if role == "user" else "assistant"), "\n".join(texts)
+                    texts = []
+                args = _reasonix_args(block.get("input"))
+                calls[block.get("id")] = _call_label(block.get("name"), args)
+                cmd = _shell_cmd(block.get("name"), args)
+                if cmd:
+                    yield "cmd", cmd
+            elif kind in ("tool_result", "tool_search_tool_result", "code_execution_tool_result"):
+                output = block.get("content")
+                if (not isinstance(output, str) or not output.strip()) and block.get("content_blocks"):
+                    output = block["content_blocks"]
+                if block.get("is_error"):
+                    output = "error\n" + (output if isinstance(output, str) else _text_of(output))
+                turn = tool_turn(calls.get(block.get("tool_use_id"), "tool"), output)
+                if turn:
+                    yield turn
+            # thinking / image_url: skipped
+        if texts:
+            yield ("user" if role == "user" else "assistant"), "\n".join(texts)
+
+
+def _reasonix_codewhale_meta(key):
+    session = _reasonix_load_json(key)
+    meta = session.get("metadata") if isinstance(session, dict) else None
+    return meta if isinstance(meta, dict) else {}
+
+
+@_reasonix_safe_str
+def codewhale_project(key):
+    return str(_reasonix_codewhale_meta(key).get("workspace") or "")
+
+
+@_reasonix_safe_str
+def codewhale_title(key):
+    return str(_reasonix_codewhale_meta(key).get("title") or "")
+
+
+def codewhale_fixture(home, cwd):
+    sid = "0f0e0d0c-0b0a-4009-8807-060504030201"
+    path = Path(home) / ".codewhale" / "sessions" / f"{sid}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    messages = [
+        {"role": "user", "content": [
+            {"type": "text", "text": "please check zebracorncodewhale"},
+            {"type": "text", "text": f"<turn_meta>\nCurrent workspace: {cwd}\nzebracorninjected\n</turn_meta>"}]},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "zebracornthinking"},
+            {"type": "tool_use", "id": "call_1", "name": "bash", "input": {"command": "echo hi-codewhale"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "call_1", "content": "hi zebracorncodewhaletool"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "done: zebracorncodewhale"}]},
+    ]
+    entries, parent = [], None
+    for i, message in enumerate(messages):
+        entry = {"id": f"e{i}", "kind": "message", "message": message,
+                 "created_at": "2026-10-01T00:00:00Z", "spawn_depth": 0}
+        if parent:
+            entry["parent_id"] = parent
+        entries.append(entry)
+        parent = entry["id"]
+    session = {
+        "schema_version": 1,
+        "metadata": {"id": sid, "title": "please check zebracorncodewhale",
+                     "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z",
+                     "message_count": 4, "total_tokens": 0, "model": "deepseek-flash",
+                     "model_provider": "deepseek", "workspace": cwd, "mode": "agent"},
+        "messages": messages,
+        "journal": {"entries": entries, "leaf_id": parent, "schema_version": 1, "spawn_depth": 0},
+        "leaf_id": parent,
+        "system_prompt": "## Codewhale\nzebracorninjected system prompt",
+    }
+    path.write_text(json.dumps(session, indent=2), encoding="utf-8")
+    return str(path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reasonix ─ state root = $REASONIX_STATE_HOME | $REASONIX_HOME | ~/.reasonix
+#   2.x (Studio, Go):      <state>/[projects/<slug>/]sessions/<stem>.jsonl  (+ <stem>.events.jsonl
+#                          schema 1/3 replace|append records; may hold newer turns than the .jsonl)
+#   1.x 1.38.2–1.38.7:     same names, but <stem>.events.jsonl is a schema 2 DAG log
+#   1.x ≥1.38.8 (npm):     <state>/projects/<slug>/sessions-v4/<id>/events.frames
+#                          (RX4F frames of zstd JSON records; big payloads in ../.content-v1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_reasonix_REASONIX_SIDECARS = (".events.jsonl", ".conflicts.jsonl", ".guardian.jsonl", ".wire.jsonl",
+                      ".adjudication.jsonl", ".execution.jsonl", ".turns.jsonl")
+
+
+def reasonix_roots():
+    state = _env_path("REASONIX_STATE_HOME", "REASONIX_HOME")
+    if state:
+        return [state]
+    roots = [Path.home() / ".reasonix"]
+    # pre-dotdir installs kept state in the OS config dir
+    if sys.platform == "darwin":
+        roots.append(Path.home() / "Library" / "Application Support" / "reasonix")
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        roots.append((Path(xdg).expanduser() if xdg else Path.home() / ".config") / "reasonix")
+    return roots
+
+
+def _reasonix_reasonix_session_dirs(state):
+    """<state>/sessions plus <state>/projects/<slug>/sessions; sessions-v4 sits beside each."""
+    dirs = [state / "sessions"]
+    try:
+        dirs += [d / "sessions" for d in sorted((state / "projects").iterdir()) if d.is_dir()] \
+            if (state / "projects").is_dir() else []
+    except OSError:
+        pass
+    return dirs
+
+
+def reasonix_list():
+    logs = []
+    for state in reasonix_roots():
+        for sessions in _reasonix_reasonix_session_dirs(state):
+            for path in _rglob(sessions, "*.jsonl"):
+                rel = path.relative_to(sessions).parts
+                if any(p.startswith(".") or p.endswith(".ckpt") or p.endswith(".inbox") for p in rel[:-1]):
+                    continue
+                if path.name.endswith(_reasonix_REASONIX_SIDECARS):
+                    continue
+                events = path.with_name(path.name[:-len(".jsonl")] + ".events.jsonl")
+                try:
+                    st = path.stat()
+                    ev = events.stat() if events.exists() else None
+                except OSError:
+                    continue
+                mtime = max(st.st_mtime, ev.st_mtime if ev else 0)
+                logs.append((str(path), mtime, st.st_size + (ev.st_size if ev else 0), "reasonix"))
+            v4 = sessions.parent / "sessions-v4"
+            try:
+                session_dirs = sorted(v4.iterdir()) if v4.is_dir() else []
+            except OSError:
+                session_dirs = []
+            for sdir in session_dirs:
+                frames = sdir / "events.frames"
+                if sdir.name.startswith(".") or not (sdir / "manifest.json").is_file() or not frames.is_file():
+                    continue
+                imported = sessions / f"v4-{sdir.name}.jsonl"  # a 2.x import of this 1.x session
+                try:
+                    if imported.exists() and imported.stat().st_mtime >= frames.stat().st_mtime:
+                        continue
+                except OSError:
+                    pass
+                logs.extend(_file_logs([frames], "reasonix"))
+    return logs
+
+
+def _reasonix_rx4f_records(frames_path):
+    """Decode an RX4F log: 12-byte header (magic, compressed len, raw len; big-endian)
+    then one zstd frame per JSON record. A torn tail is a write in progress."""
+    try:
+        data = Path(frames_path).read_bytes()
+    except OSError:
+        return []
+    chunks, sizes, off = [], [], 0
+    while off + 12 <= len(data) and data[off:off + 4] == b"RX4F":
+        clen, rlen = struct.unpack(">II", data[off + 4:off + 12])
+        if off + 12 + clen > len(data):
+            break
+        chunks.append(data[off + 12:off + 12 + clen])
+        sizes.append(rlen)
+        off += 12 + clen
+    if not chunks:
+        return []
+    # zstd frames concatenate: decode them in one pass with navcom's reader, then split.
+    with tempfile.NamedTemporaryFile(suffix=".zst", delete=False) as tmp:
+        tmp.write(b"".join(chunks))
+    try:
+        raw = read_zstd(tmp.name)
+    finally:
+        os.unlink(tmp.name)
+    records, pos = [], 0
+    for size in sizes:
+        piece = raw[pos:pos + size]
+        pos += size
+        try:
+            records.append(json.loads(piece))
+        except Exception:
+            break
+    return records
+
+
+def _reasonix_reasonix_v4(frames_path):
+    """-> (messages, title). Keeps every message the log ever committed (upserts in
+    place; retracted and history-replaced messages are kept), in first-seen order."""
+    sdir = Path(frames_path).parent
+    manifest = _reasonix_load_json(sdir / "manifest.json") or {}
+    pool = (sdir if manifest.get("contentRoot") == ".content-v1" else sdir.parent) / ".content-v1"
+    order, by_id, title, pending = [], {}, "", []
+
+    def body_of(event):
+        ref = event.get("payloadRef")
+        try:
+            if isinstance(ref, dict) and len(str(ref.get("digest", ""))) == 64:
+                d = ref["digest"]
+                return json.loads((pool / "objects" / d[:2] / d[2:4] / d).read_bytes())
+            if event.get("payload"):
+                return json.loads(base64.b64decode(event["payload"]))
+        except Exception:
+            pass
+        return {}
+
+    def add(message):
+        if not isinstance(message, dict):
+            return
+        mid = message.get("id")
+        if mid and mid in by_id:
+            order[by_id[mid]] = message
+        else:
+            if mid:
+                by_id[mid] = len(order)
+            order.append(message)
+
+    for rec in _reasonix_rx4f_records(frames_path):
+        kind = rec.get("recordType")
+        if kind == "batch/begin":
+            pending = []
+        elif kind == "batch/event" and isinstance(rec.get("event"), dict):
+            pending.append(rec["event"])
+        elif kind == "batch/end":
+            for event in pending:
+                ek = event.get("kind")
+                if ek in ("message/complete", "message/upsert"):
+                    msg = body_of(event).get("message")
+                    if ek == "message/complete" and isinstance(msg, dict) and msg.get("id") in by_id:
+                        continue
+                    add(msg)
+                elif ek in ("history/replace", "legacy/import"):
+                    for msg in body_of(event).get("messages") or []:
+                        if not (isinstance(msg, dict) and msg.get("id") in by_id):
+                            add(msg)
+                elif ek == "session/title":
+                    title = str(body_of(event).get("title") or "").strip() or title
+            pending = []
+    return order, title
+
+
+def _reasonix_reasonix_events_kind(events_path):
+    for rec in _reasonix_jsonl(events_path):
+        return rec.get("schema_version")
+    return None
+
+
+def _reasonix_reasonix_dag(events_path):
+    """1.x schema 2 DAG log: every message node of every head, patches/redactions applied."""
+    order, by_id = [], {}
+    for rec in _reasonix_jsonl(events_path):
+        kind = rec.get("type")
+        if kind == "message" and rec.get("id") and rec["id"] not in by_id:
+            msgs = rec.get("msgs") or []
+            if msgs and isinstance(msgs[0], dict):
+                by_id[rec["id"]] = len(order)
+                order.append(msgs[0])
+        elif kind == "patch" and rec.get("target") in by_id:
+            msgs = rec.get("msgs") or []
+            if msgs and isinstance(msgs[0], dict):
+                order[by_id[rec["target"]]] = msgs[0]
+        elif kind == "redact" and isinstance(rec.get("targets"), dict):
+            for target, msgs in rec["targets"].items():
+                if target in by_id and msgs and isinstance(msgs[0], dict):
+                    order[by_id[target]] = msgs[0]
+    return order
+
+
+def _reasonix_reasonix_replay(events_path):
+    """2.x schema 1/3 log: replace resets, append extends. Messages a later replace
+    dropped (rewinds, compaction) are kept, in first-seen order."""
+    snapshots, cur, records = [], [], 0
+    for rec in _reasonix_jsonl(events_path):
+        msgs = rec.get("messages") if isinstance(rec.get("messages"), list) else []
+        msgs = [m for m in msgs if isinstance(m, dict)]
+        if rec.get("type") == "replace":
+            snapshots.append(cur)
+            cur = msgs
+        elif rec.get("type") == "append":
+            idx = rec.get("message_index")
+            cur = cur[:idx if isinstance(idx, int) else len(cur)] + msgs
+        else:
+            continue
+        records += 1
+    if not records:
+        return None
+    out, seen = [], set()
+    for snap in snapshots + [cur]:
+        counts = {}
+        for msg in snap:
+            sig = json.dumps(msg, sort_keys=True, ensure_ascii=False)
+            counts[sig] = counts.get(sig, 0) + 1
+            if (sig, counts[sig]) not in seen:
+                seen.add((sig, counts[sig]))
+                out.append(msg)
+    return out
+
+
+def _reasonix_reasonix_messages(key):
+    if key.endswith("events.frames"):
+        return _reasonix_reasonix_v4(key)[0]
+    events = key[:-len(".jsonl")] + ".events.jsonl"
+    if os.path.exists(events):
+        schema = _reasonix_reasonix_events_kind(events)
+        msgs = _reasonix_reasonix_dag(events) if schema == 2 else _reasonix_reasonix_replay(events)
+        if msgs:
+            return msgs
+    return list(_reasonix_jsonl(key))
+
+
+def _reasonix_openai_calls(tool_calls):
+    for call in tool_calls if isinstance(tool_calls, list) else []:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") if isinstance(call.get("function"), dict) else call
+        yield call.get("id"), fn.get("name") or call.get("resolved_name"), _reasonix_args(fn.get("arguments"))
+
+
+@_reasonix_tolerant
+def reasonix_iter(key):
+    calls = {}
+    for msg in _reasonix_reasonix_messages(key):
+        role = msg.get("role")
+        if role == "user":
+            if msg.get("host_authored") or msg.get("origin") == "host":
+                continue  # session-context snapshots, steer notes: injected
+            raw = msg.get("raw_content")
+            text = raw if isinstance(raw, str) and raw.strip() else _reasonix_strip_injected(_text_of(msg.get("content")))
+            if text.strip():
+                yield "user", text
+        elif role == "assistant":
+            text = _text_of(msg.get("content"))
+            if text.strip():
+                yield "assistant", text.strip()
+            for cid, name, args in _reasonix_openai_calls(msg.get("tool_calls")):
+                calls[cid] = _call_label(name, args)
+                cmd = _shell_cmd(name, args)
+                if cmd:
+                    yield "cmd", cmd
+        elif role == "tool":
+            output = msg.get("content")
+            if isinstance(output, list):
+                output = _text_of(output)
+            label = calls.get(msg.get("tool_call_id")) or msg.get("name") or "tool"
+            turn = tool_turn(label, output)
+            if turn:
+                yield turn
+
+
+_reasonix_WORKSPACE_RE = re.compile(r'Current workspace: "([^"]+)"')
+
+
+@_reasonix_safe_str
+def reasonix_project(key):
+    for msg in _reasonix_reasonix_messages(key)[:8]:
+        if msg.get("role") in ("user", "system"):
+            m = _reasonix_WORKSPACE_RE.search(_text_of(msg.get("content")) or "")
+            if m:
+                return m.group(1)
+    parts = Path(key).parts
+    if "projects" in parts:
+        i = len(parts) - 1 - parts[::-1].index("projects")
+        if i + 1 < len(parts):
+            return parts[i + 1]  # lossy slug (/ → -), same as navcom does for Claude
+    return ""
+
+
+@_reasonix_safe_str
+def reasonix_title(key):
+    if key.endswith("events.frames"):
+        title = _reasonix_reasonix_v4(key)[1]
+        if title:
+            return title
+        cache = _reasonix_load_json(Path(key).parent.parent / ".query-cache" / Path(key).parent.name / "catalog-metadata.json")
+        return str((cache or {}).get("title") or "").strip()
+    meta = _reasonix_load_json(key + ".meta") or {}
+    return str(meta.get("title") or "").strip()  # 2.x keeps only a preview of the first prompt
+
+
+def reasonix_v4_fixture(home, cwd):
+    """A 1.x sessions-v4 store (RX4F frames), built with the zstd CLI."""
+    import hashlib
+    import subprocess
+    sid = "0123456789abcdef0123456789abcdef"
+    sdir = Path(home) / ".reasonix" / "projects" / cwd.replace("/", "-") / "sessions-v4" / sid
+    sdir.mkdir(parents=True, exist_ok=True)
+    (sdir / "manifest.json").write_text(json.dumps({
+        "schemaVersion": 4, "codec": "reasonix.session.linear/v4", "storageRevision": 3,
+        "contentRoot": "../.content-v1", "sessionId": sid, "createdAt": "2026-10-01T00:00:00Z",
+        "writerGeneration": 1, "kind": "headless-run"}), encoding="utf-8")
+    big = json.dumps({"message": {"role": "tool", "id": "m5", "content": "hi zebracornreasonixv4tool\n",
+                                  "tool_call_id": "c1", "name": "bash"}}).encode()
+    digest = hashlib.sha256(big).hexdigest()
+    obj = sdir.parent / ".content-v1" / "objects" / digest[:2] / digest[2:4] / digest
+    obj.parent.mkdir(parents=True, exist_ok=True)
+    obj.write_bytes(big)
+    events = [
+        ("message/complete", {"message": {"role": "user", "id": "m1", "origin": "host",
+                                          "content": f'<session-context version="1">\n## Workspace\n\nCurrent workspace: "{cwd}"\nzebracorninjected\n</session-context>'}}),
+        ("message/complete", {"message": {"role": "user", "id": "m2", "origin": "user",
+                                          "content": "v4 zebracornreasonixv4", "raw_content": "v4 zebracornreasonixv4"}}),
+        ("message/complete", {"message": {"role": "assistant", "id": "m3", "reasoning_content": "zebracornthinking",
+                                          "tool_calls": [{"id": "c1", "name": "bash",
+                                                          "arguments": json.dumps({"command": "echo hi-reasonixv4"})}]}}),
+        ("message/complete", None),  # payload in the content pool
+        ("message/complete", {"message": {"role": "assistant", "id": "m6", "content": "done zebracornreasonixv4"}}),
+        ("session/title", {"title": "v4 zebracorn title"}),
+    ]
+    out = bytearray()
+
+    def frame(rec):
+        raw = json.dumps(rec).encode()
+        comp = subprocess.run(["zstd", "-q", "-c"], input=raw, capture_output=True).stdout
+        out.extend(b"RX4F" + struct.pack(">II", len(comp), len(raw)) + comp)
+
+    head = {"schemaVersion": 4, "codec": "reasonix.session.linear/v4"}
+    for seq, (kind, body) in enumerate(events, start=1):
+        frame({**head, "recordType": "batch/begin", "commitId": f"c{seq}", "firstSeq": seq, "eventCount": 1})
+        ev = {"id": f"e{seq}", "seq": seq, "kind": kind}
+        if body is None:
+            ev["payloadRef"] = {"digest": digest, "bytes": len(big)}
+        else:
+            ev["payload"] = base64.b64encode(json.dumps(body).encode()).decode()
+        frame({**head, "recordType": "batch/event", "event": ev})
+        frame({**head, "recordType": "batch/end", "commitId": f"c{seq}", "firstSeq": seq, "eventCount": 1, "sha256": ""})
+    (sdir / "events.frames").write_bytes(bytes(out))
+    return str(sdir / "events.frames")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Deep Code (lessweb/deepcode-cli, npm @vegamo/deepcode-cli)
+#   ~/.deepcode/projects/<cwd with / → ->/<sessionId>.jsonl  (+ sessions-index.json)
+#   os.homedir() only; no env override.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def deepcode_roots():
+    return [Path.home() / ".deepcode" / "projects"]
+
+
+def deepcode_list():
+    paths = []
+    for root in deepcode_roots():
+        try:
+            paths += sorted(root.glob("*/*.jsonl")) if root.is_dir() else []
+        except OSError:
+            pass
+    return _file_logs(paths, "deepcode")
+
+
+def _reasonix_deepcode_tool_output(content):
+    """Tool results are a JSON envelope {"ok","name","output"|"error","metadata":{exitCode…}}."""
+    if not isinstance(content, str):
+        return content
+    try:
+        env = json.loads(content)
+    except Exception:
+        return content
+    if not isinstance(env, dict) or not ({"output", "error", "ok"} & set(env)):
+        return content
+    body = env.get("output")
+    if not isinstance(body, str):
+        body = json.dumps(body, ensure_ascii=False) if body not in (None, "") else ""
+    meta = env.get("metadata") if isinstance(env.get("metadata"), dict) else {}
+    code = meta.get("exitCode")
+    head = []
+    if env.get("ok") is False:
+        head.append("error" + (f": {env['error']}" if isinstance(env.get("error"), str) else ""))
+    if code not in (None, 0):
+        head.append(f"exit {code}")
+    return "\n".join(head + [body]).strip()
+
+
+@_reasonix_tolerant
+def deepcode_iter(key):
+    calls = {}
+    for msg in _reasonix_jsonl(key):
+        role = msg.get("role")
+        params = msg.get("messageParams") if isinstance(msg.get("messageParams"), dict) else {}
+        meta = msg.get("meta") if isinstance(msg.get("meta"), dict) else {}
+        if role == "user":
+            prompt = meta.get("userPrompt") if isinstance(meta.get("userPrompt"), dict) else {}
+            text = prompt.get("text") if isinstance(prompt.get("text"), str) else _text_of(msg.get("content"))
+            if text and text.strip():
+                yield "user", text
+        elif role == "assistant":
+            text = _text_of(msg.get("content"))
+            if text.strip():
+                yield "assistant", text.strip()
+            for cid, name, args in _reasonix_openai_calls(params.get("tool_calls")):
+                calls[cid] = _call_label(name, args)
+                cmd = _shell_cmd(name, args)
+                if cmd:
+                    yield "cmd", cmd
+        elif role == "tool":
+            label = calls.get(params.get("tool_call_id"))
+            if not label and isinstance(meta.get("function"), dict):
+                fn = meta["function"]
+                label = _call_label(fn.get("name"), _reasonix_args(fn.get("arguments")))
+            turn = tool_turn(label or "tool", _reasonix_deepcode_tool_output(msg.get("content")))
+            if turn:
+                yield turn
+        # system: prompt, environment, skill bodies, compaction summaries (meta.isSummary)
+
+
+def _reasonix_deepcode_index_entry(key):
+    index = _reasonix_load_json(Path(key).parent / "sessions-index.json") or {}
+    sid = Path(key).stem
+    for entry in index.get("entries") or []:
+        if isinstance(entry, dict) and entry.get("id") == sid:
+            return index, entry
+    return index, {}
+
+
+_reasonix_ROOT_PATH_RE = re.compile(r'"root path":\s*"((?:[^"\\]|\\.)*)"')
+
+
+@_reasonix_safe_str
+def deepcode_project(key):
+    index, _ = _reasonix_deepcode_index_entry(key)
+    if isinstance(index.get("originalPath"), str) and index["originalPath"]:
+        return index["originalPath"]
+    for msg in _reasonix_jsonl(key):
+        if msg.get("role") == "system":
+            m = _reasonix_ROOT_PATH_RE.search(_text_of(msg.get("content")) or "")
+            if m:
+                try:
+                    return json.loads(f'"{m.group(1)}"')
+                except Exception:
+                    return m.group(1)
+        elif msg.get("role") == "user":
+            break
+    return Path(key).parent.name
+
+
+@_reasonix_safe_str
+def deepcode_title(key):
+    _, entry = _reasonix_deepcode_index_entry(key)
+    return str(entry.get("summary") or "").strip()
+
+
+def deepcode_fixture(home, cwd):
+    sid = "6f1c2d3e-4a5b-4c6d-8e7f-001122334455"
+    pdir = Path(home) / ".deepcode" / "projects" / cwd.replace("/", "-")
+    pdir.mkdir(parents=True, exist_ok=True)
+    base = {"sessionId": sid, "contentParams": None, "compacted": False,
+            "createTime": "2026-10-01T00:00:00.000Z", "updateTime": "2026-10-01T00:00:00.000Z"}
+    args = json.dumps({"command": "echo hi-deepcode", "description": "say hi", "sideEffects": ["read-in-cwd"]})
+    rows = [
+        {**base, "id": "s1", "role": "system", "content": "You are a helpful software engineer assistant.",
+         "messageParams": None, "visible": False},
+        {**base, "id": "s2", "role": "system",
+         "content": f'# Local Workspace Environment\n```json\n{{"root path": "{cwd}"}}\n```\nzebracorninjected',
+         "messageParams": None, "visible": False},
+        {**base, "id": "u1", "role": "user", "content": "hello zebracorndeepcode", "messageParams": None,
+         "visible": True, "meta": {"userPrompt": {"text": "hello zebracorndeepcode"}}},
+        {**base, "id": "a1", "role": "assistant", "content": " ", "visible": False,
+         "messageParams": {"tool_calls": [{"id": "call_1", "type": "function",
+                                           "function": {"name": "bash", "arguments": args}}],
+                           "reasoning_content": "zebracornthinking"},
+         "meta": {"asThinking": True}},
+        {**base, "id": "t1", "role": "tool", "visible": True, "messageParams": {"tool_call_id": "call_1"},
+         "content": json.dumps({"ok": True, "name": "bash", "output": "hi zebracorndeepcodetool\n",
+                                "metadata": {"exitCode": 0, "cwd": cwd}}, indent=2),
+         "meta": {"function": {"name": "bash", "arguments": args}}},
+        {**base, "id": "s3", "role": "system", "content": "There are earlier parts of the conversation. zebracorninjected",
+         "messageParams": None, "visible": False, "meta": {"isSummary": True}},
+        {**base, "id": "a2", "role": "assistant", "content": "all done zebracorndeepcode", "visible": True,
+         "messageParams": {"reasoning_content": "zebracornthinking"}},
+    ]
+    path = pdir / f"{sid}.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    (pdir / "sessions-index.json").write_text(json.dumps({
+        "version": 1, "originalPath": cwd,
+        "entries": [{"id": sid, "summary": "hello zebracorndeepcode", "assistantReply": "all done",
+                     "status": "completed", "createTime": base["createTime"], "updateTime": base["updateTime"]}]},
+        indent=2), encoding="utf-8")
+    return str(path)
+
+
+# ── Deep Code (deepcode) ─────────────────────────────────────────────────────
+# navcom parsers for three DeepSeek-first harnesses: Codewhale, Reasonix, Deep Code.
+#
+# The same file is copied into harness/codewhale, harness/reasonix and harness/deepcode.
+
+def _deepcode_load_json(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def _deepcode_jsonl(path):
+    try:
+        handle = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with handle:
+        for line in handle:
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                yield obj
+
+
+def _deepcode_tolerant(gen_fn):
+    """Odd records end a transcript early instead of raising into the indexer."""
+    def wrapper(key):
+        try:
+            yield from gen_fn(key)
+        except Exception:
+            return
+    wrapper.__name__ = gen_fn.__name__
+    return wrapper
+
+
+def _deepcode_safe_str(fn):
+    def wrapper(key):
+        try:
+            return fn(key) or ""
+        except Exception:
+            return ""
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+def _deepcode_args(raw):
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return raw
+    return raw
+
+
+# A text part that is one whole XML-ish element is host-injected context
+# (<turn_meta>, <session_goal>, <workspace>, <session-context>, <system-reminder>, …).
+_deepcode_INJECTED_BLOCK_RE = re.compile(r"^\s*<([A-Za-z][\w-]*)\b[^>]*>.*</\1>\s*$|^\s*<[A-Za-z][\w-]*\b[^>]*/>\s*$", re.S)
+_deepcode_EDGE_BLOCK_RE = re.compile(r"\A\s*<([A-Za-z][\w-]*)\b[^>]*>\n.*?\n</\1>\s*|\s*<([A-Za-z][\w-]*)\b[^>]*>\n.*?\n</\2>\s*\Z", re.S)
+
+
+def _deepcode_strip_injected(text):
+    """Drop whole injected XML blocks wrapped around typed text (leading or trailing)."""
+    if not isinstance(text, str):
+        return ""
+    if _deepcode_INJECTED_BLOCK_RE.match(text):
+        return ""
+    prev = None
+    while prev != text:
+        prev, text = text, _deepcode_EDGE_BLOCK_RE.sub("", text, count=1)
+    return text.strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Codewhale (formerly DeepSeek-TUI) ─ $CODEWHALE_HOME/sessions/<id>.json
+#   legacy ~/.deepseek/sessions (migrated by move, or copied when the move fails)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def codewhale_roots():
+    explicit = _env_path("CODEWHALE_HOME")
+    if explicit:
+        return [explicit / "sessions"]  # an explicit home never falls back to ~/.deepseek
+    return [Path.home() / ".codewhale" / "sessions", Path.home() / ".deepseek" / "sessions"]
+
+
+def codewhale_list():
+    seen, paths = set(), []
+    for root in codewhale_roots():
+        try:
+            entries = sorted(root.glob("*.json")) if root.is_dir() else []
+        except OSError:
+            entries = []
+        for path in entries:
+            # session_boot_owners.json etc. are bookkeeping; checkpoints/ and
+            # .work-graph-import-archive/ hold copies of the same sessions.
+            if path.name in seen or path.name == "session_boot_owners.json":
+                continue
+            seen.add(path.name)
+            paths.append(path)
+    return _file_logs(paths, "codewhale")
+
+
+def _deepcode_codewhale_messages(session):
+    """Every message the session ever held: the append-only journal (all branches,
+    pre-compaction turns included) when present, else the flat messages list."""
+    journal = session.get("journal") if isinstance(session.get("journal"), dict) else {}
+    entries = journal.get("entries") if isinstance(journal.get("entries"), list) else []
+    if entries:
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            kind = entry.get("kind")
+            if kind == "message" and isinstance(entry.get("message"), dict):
+                yield entry["message"]
+            elif kind in ("user", "assistant") and isinstance(entry.get("text"), str):
+                yield {"role": kind, "content": [{"type": "text", "text": entry["text"]}]}
+            # compaction / branch_summary / system: generated context, not typed or said
+        return
+    messages = session.get("messages")
+    for message in messages if isinstance(messages, list) else []:
+        if isinstance(message, dict):
+            yield message
+
+
+@_deepcode_tolerant
+def codewhale_iter(key):
+    session = _deepcode_load_json(key)
+    if not isinstance(session, dict):
+        return
+    calls = {}
+    for message in _deepcode_codewhale_messages(session):
+        role = message.get("role")
+        content = message.get("content")
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        if not isinstance(content, list) or role == "system":
+            continue
+        texts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if kind == "text" and isinstance(block.get("text"), str):
+                text = block["text"]
+                if role == "user":
+                    text = _deepcode_strip_injected(text)
+                elif role == "assistant_interrupted":
+                    text = text.replace(
+                        "[The following assistant output was interrupted before completion and may be incomplete or wrong]\n", "")
+                if text.strip():
+                    texts.append(text)
+            elif kind in ("tool_use", "server_tool_use"):
+                if texts:
+                    yield ("user" if role == "user" else "assistant"), "\n".join(texts)
+                    texts = []
+                args = _deepcode_args(block.get("input"))
+                calls[block.get("id")] = _call_label(block.get("name"), args)
+                cmd = _shell_cmd(block.get("name"), args)
+                if cmd:
+                    yield "cmd", cmd
+            elif kind in ("tool_result", "tool_search_tool_result", "code_execution_tool_result"):
+                output = block.get("content")
+                if (not isinstance(output, str) or not output.strip()) and block.get("content_blocks"):
+                    output = block["content_blocks"]
+                if block.get("is_error"):
+                    output = "error\n" + (output if isinstance(output, str) else _text_of(output))
+                turn = tool_turn(calls.get(block.get("tool_use_id"), "tool"), output)
+                if turn:
+                    yield turn
+            # thinking / image_url: skipped
+        if texts:
+            yield ("user" if role == "user" else "assistant"), "\n".join(texts)
+
+
+def _deepcode_codewhale_meta(key):
+    session = _deepcode_load_json(key)
+    meta = session.get("metadata") if isinstance(session, dict) else None
+    return meta if isinstance(meta, dict) else {}
+
+
+@_deepcode_safe_str
+def codewhale_project(key):
+    return str(_deepcode_codewhale_meta(key).get("workspace") or "")
+
+
+@_deepcode_safe_str
+def codewhale_title(key):
+    return str(_deepcode_codewhale_meta(key).get("title") or "")
+
+
+def codewhale_fixture(home, cwd):
+    sid = "0f0e0d0c-0b0a-4009-8807-060504030201"
+    path = Path(home) / ".codewhale" / "sessions" / f"{sid}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    messages = [
+        {"role": "user", "content": [
+            {"type": "text", "text": "please check zebracorncodewhale"},
+            {"type": "text", "text": f"<turn_meta>\nCurrent workspace: {cwd}\nzebracorninjected\n</turn_meta>"}]},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "zebracornthinking"},
+            {"type": "tool_use", "id": "call_1", "name": "bash", "input": {"command": "echo hi-codewhale"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "call_1", "content": "hi zebracorncodewhaletool"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "done: zebracorncodewhale"}]},
+    ]
+    entries, parent = [], None
+    for i, message in enumerate(messages):
+        entry = {"id": f"e{i}", "kind": "message", "message": message,
+                 "created_at": "2026-10-01T00:00:00Z", "spawn_depth": 0}
+        if parent:
+            entry["parent_id"] = parent
+        entries.append(entry)
+        parent = entry["id"]
+    session = {
+        "schema_version": 1,
+        "metadata": {"id": sid, "title": "please check zebracorncodewhale",
+                     "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z",
+                     "message_count": 4, "total_tokens": 0, "model": "deepseek-flash",
+                     "model_provider": "deepseek", "workspace": cwd, "mode": "agent"},
+        "messages": messages,
+        "journal": {"entries": entries, "leaf_id": parent, "schema_version": 1, "spawn_depth": 0},
+        "leaf_id": parent,
+        "system_prompt": "## Codewhale\nzebracorninjected system prompt",
+    }
+    path.write_text(json.dumps(session, indent=2), encoding="utf-8")
+    return str(path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reasonix ─ state root = $REASONIX_STATE_HOME | $REASONIX_HOME | ~/.reasonix
+#   2.x (Studio, Go):      <state>/[projects/<slug>/]sessions/<stem>.jsonl  (+ <stem>.events.jsonl
+#                          schema 1/3 replace|append records; may hold newer turns than the .jsonl)
+#   1.x 1.38.2–1.38.7:     same names, but <stem>.events.jsonl is a schema 2 DAG log
+#   1.x ≥1.38.8 (npm):     <state>/projects/<slug>/sessions-v4/<id>/events.frames
+#                          (RX4F frames of zstd JSON records; big payloads in ../.content-v1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_deepcode_REASONIX_SIDECARS = (".events.jsonl", ".conflicts.jsonl", ".guardian.jsonl", ".wire.jsonl",
+                      ".adjudication.jsonl", ".execution.jsonl", ".turns.jsonl")
+
+
+def reasonix_roots():
+    state = _env_path("REASONIX_STATE_HOME", "REASONIX_HOME")
+    if state:
+        return [state]
+    roots = [Path.home() / ".reasonix"]
+    # pre-dotdir installs kept state in the OS config dir
+    if sys.platform == "darwin":
+        roots.append(Path.home() / "Library" / "Application Support" / "reasonix")
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        roots.append((Path(xdg).expanduser() if xdg else Path.home() / ".config") / "reasonix")
+    return roots
+
+
+def _deepcode_reasonix_session_dirs(state):
+    """<state>/sessions plus <state>/projects/<slug>/sessions; sessions-v4 sits beside each."""
+    dirs = [state / "sessions"]
+    try:
+        dirs += [d / "sessions" for d in sorted((state / "projects").iterdir()) if d.is_dir()] \
+            if (state / "projects").is_dir() else []
+    except OSError:
+        pass
+    return dirs
+
+
+def reasonix_list():
+    logs = []
+    for state in reasonix_roots():
+        for sessions in _deepcode_reasonix_session_dirs(state):
+            for path in _rglob(sessions, "*.jsonl"):
+                rel = path.relative_to(sessions).parts
+                if any(p.startswith(".") or p.endswith(".ckpt") or p.endswith(".inbox") for p in rel[:-1]):
+                    continue
+                if path.name.endswith(_deepcode_REASONIX_SIDECARS):
+                    continue
+                events = path.with_name(path.name[:-len(".jsonl")] + ".events.jsonl")
+                try:
+                    st = path.stat()
+                    ev = events.stat() if events.exists() else None
+                except OSError:
+                    continue
+                mtime = max(st.st_mtime, ev.st_mtime if ev else 0)
+                logs.append((str(path), mtime, st.st_size + (ev.st_size if ev else 0), "reasonix"))
+            v4 = sessions.parent / "sessions-v4"
+            try:
+                session_dirs = sorted(v4.iterdir()) if v4.is_dir() else []
+            except OSError:
+                session_dirs = []
+            for sdir in session_dirs:
+                frames = sdir / "events.frames"
+                if sdir.name.startswith(".") or not (sdir / "manifest.json").is_file() or not frames.is_file():
+                    continue
+                imported = sessions / f"v4-{sdir.name}.jsonl"  # a 2.x import of this 1.x session
+                try:
+                    if imported.exists() and imported.stat().st_mtime >= frames.stat().st_mtime:
+                        continue
+                except OSError:
+                    pass
+                logs.extend(_file_logs([frames], "reasonix"))
+    return logs
+
+
+def _deepcode_rx4f_records(frames_path):
+    """Decode an RX4F log: 12-byte header (magic, compressed len, raw len; big-endian)
+    then one zstd frame per JSON record. A torn tail is a write in progress."""
+    try:
+        data = Path(frames_path).read_bytes()
+    except OSError:
+        return []
+    chunks, sizes, off = [], [], 0
+    while off + 12 <= len(data) and data[off:off + 4] == b"RX4F":
+        clen, rlen = struct.unpack(">II", data[off + 4:off + 12])
+        if off + 12 + clen > len(data):
+            break
+        chunks.append(data[off + 12:off + 12 + clen])
+        sizes.append(rlen)
+        off += 12 + clen
+    if not chunks:
+        return []
+    # zstd frames concatenate: decode them in one pass with navcom's reader, then split.
+    with tempfile.NamedTemporaryFile(suffix=".zst", delete=False) as tmp:
+        tmp.write(b"".join(chunks))
+    try:
+        raw = read_zstd(tmp.name)
+    finally:
+        os.unlink(tmp.name)
+    records, pos = [], 0
+    for size in sizes:
+        piece = raw[pos:pos + size]
+        pos += size
+        try:
+            records.append(json.loads(piece))
+        except Exception:
+            break
+    return records
+
+
+def _deepcode_reasonix_v4(frames_path):
+    """-> (messages, title). Keeps every message the log ever committed (upserts in
+    place; retracted and history-replaced messages are kept), in first-seen order."""
+    sdir = Path(frames_path).parent
+    manifest = _deepcode_load_json(sdir / "manifest.json") or {}
+    pool = (sdir if manifest.get("contentRoot") == ".content-v1" else sdir.parent) / ".content-v1"
+    order, by_id, title, pending = [], {}, "", []
+
+    def body_of(event):
+        ref = event.get("payloadRef")
+        try:
+            if isinstance(ref, dict) and len(str(ref.get("digest", ""))) == 64:
+                d = ref["digest"]
+                return json.loads((pool / "objects" / d[:2] / d[2:4] / d).read_bytes())
+            if event.get("payload"):
+                return json.loads(base64.b64decode(event["payload"]))
+        except Exception:
+            pass
+        return {}
+
+    def add(message):
+        if not isinstance(message, dict):
+            return
+        mid = message.get("id")
+        if mid and mid in by_id:
+            order[by_id[mid]] = message
+        else:
+            if mid:
+                by_id[mid] = len(order)
+            order.append(message)
+
+    for rec in _deepcode_rx4f_records(frames_path):
+        kind = rec.get("recordType")
+        if kind == "batch/begin":
+            pending = []
+        elif kind == "batch/event" and isinstance(rec.get("event"), dict):
+            pending.append(rec["event"])
+        elif kind == "batch/end":
+            for event in pending:
+                ek = event.get("kind")
+                if ek in ("message/complete", "message/upsert"):
+                    msg = body_of(event).get("message")
+                    if ek == "message/complete" and isinstance(msg, dict) and msg.get("id") in by_id:
+                        continue
+                    add(msg)
+                elif ek in ("history/replace", "legacy/import"):
+                    for msg in body_of(event).get("messages") or []:
+                        if not (isinstance(msg, dict) and msg.get("id") in by_id):
+                            add(msg)
+                elif ek == "session/title":
+                    title = str(body_of(event).get("title") or "").strip() or title
+            pending = []
+    return order, title
+
+
+def _deepcode_reasonix_events_kind(events_path):
+    for rec in _deepcode_jsonl(events_path):
+        return rec.get("schema_version")
+    return None
+
+
+def _deepcode_reasonix_dag(events_path):
+    """1.x schema 2 DAG log: every message node of every head, patches/redactions applied."""
+    order, by_id = [], {}
+    for rec in _deepcode_jsonl(events_path):
+        kind = rec.get("type")
+        if kind == "message" and rec.get("id") and rec["id"] not in by_id:
+            msgs = rec.get("msgs") or []
+            if msgs and isinstance(msgs[0], dict):
+                by_id[rec["id"]] = len(order)
+                order.append(msgs[0])
+        elif kind == "patch" and rec.get("target") in by_id:
+            msgs = rec.get("msgs") or []
+            if msgs and isinstance(msgs[0], dict):
+                order[by_id[rec["target"]]] = msgs[0]
+        elif kind == "redact" and isinstance(rec.get("targets"), dict):
+            for target, msgs in rec["targets"].items():
+                if target in by_id and msgs and isinstance(msgs[0], dict):
+                    order[by_id[target]] = msgs[0]
+    return order
+
+
+def _deepcode_reasonix_replay(events_path):
+    """2.x schema 1/3 log: replace resets, append extends. Messages a later replace
+    dropped (rewinds, compaction) are kept, in first-seen order."""
+    snapshots, cur, records = [], [], 0
+    for rec in _deepcode_jsonl(events_path):
+        msgs = rec.get("messages") if isinstance(rec.get("messages"), list) else []
+        msgs = [m for m in msgs if isinstance(m, dict)]
+        if rec.get("type") == "replace":
+            snapshots.append(cur)
+            cur = msgs
+        elif rec.get("type") == "append":
+            idx = rec.get("message_index")
+            cur = cur[:idx if isinstance(idx, int) else len(cur)] + msgs
+        else:
+            continue
+        records += 1
+    if not records:
+        return None
+    out, seen = [], set()
+    for snap in snapshots + [cur]:
+        counts = {}
+        for msg in snap:
+            sig = json.dumps(msg, sort_keys=True, ensure_ascii=False)
+            counts[sig] = counts.get(sig, 0) + 1
+            if (sig, counts[sig]) not in seen:
+                seen.add((sig, counts[sig]))
+                out.append(msg)
+    return out
+
+
+def _deepcode_reasonix_messages(key):
+    if key.endswith("events.frames"):
+        return _deepcode_reasonix_v4(key)[0]
+    events = key[:-len(".jsonl")] + ".events.jsonl"
+    if os.path.exists(events):
+        schema = _deepcode_reasonix_events_kind(events)
+        msgs = _deepcode_reasonix_dag(events) if schema == 2 else _deepcode_reasonix_replay(events)
+        if msgs:
+            return msgs
+    return list(_deepcode_jsonl(key))
+
+
+def _deepcode_openai_calls(tool_calls):
+    for call in tool_calls if isinstance(tool_calls, list) else []:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") if isinstance(call.get("function"), dict) else call
+        yield call.get("id"), fn.get("name") or call.get("resolved_name"), _deepcode_args(fn.get("arguments"))
+
+
+@_deepcode_tolerant
+def reasonix_iter(key):
+    calls = {}
+    for msg in _deepcode_reasonix_messages(key):
+        role = msg.get("role")
+        if role == "user":
+            if msg.get("host_authored") or msg.get("origin") == "host":
+                continue  # session-context snapshots, steer notes: injected
+            raw = msg.get("raw_content")
+            text = raw if isinstance(raw, str) and raw.strip() else _deepcode_strip_injected(_text_of(msg.get("content")))
+            if text.strip():
+                yield "user", text
+        elif role == "assistant":
+            text = _text_of(msg.get("content"))
+            if text.strip():
+                yield "assistant", text.strip()
+            for cid, name, args in _deepcode_openai_calls(msg.get("tool_calls")):
+                calls[cid] = _call_label(name, args)
+                cmd = _shell_cmd(name, args)
+                if cmd:
+                    yield "cmd", cmd
+        elif role == "tool":
+            output = msg.get("content")
+            if isinstance(output, list):
+                output = _text_of(output)
+            label = calls.get(msg.get("tool_call_id")) or msg.get("name") or "tool"
+            turn = tool_turn(label, output)
+            if turn:
+                yield turn
+
+
+_deepcode_WORKSPACE_RE = re.compile(r'Current workspace: "([^"]+)"')
+
+
+@_deepcode_safe_str
+def reasonix_project(key):
+    for msg in _deepcode_reasonix_messages(key)[:8]:
+        if msg.get("role") in ("user", "system"):
+            m = _deepcode_WORKSPACE_RE.search(_text_of(msg.get("content")) or "")
+            if m:
+                return m.group(1)
+    parts = Path(key).parts
+    if "projects" in parts:
+        i = len(parts) - 1 - parts[::-1].index("projects")
+        if i + 1 < len(parts):
+            return parts[i + 1]  # lossy slug (/ → -), same as navcom does for Claude
+    return ""
+
+
+@_deepcode_safe_str
+def reasonix_title(key):
+    if key.endswith("events.frames"):
+        title = _deepcode_reasonix_v4(key)[1]
+        if title:
+            return title
+        cache = _deepcode_load_json(Path(key).parent.parent / ".query-cache" / Path(key).parent.name / "catalog-metadata.json")
+        return str((cache or {}).get("title") or "").strip()
+    meta = _deepcode_load_json(key + ".meta") or {}
+    return str(meta.get("title") or "").strip()  # 2.x keeps only a preview of the first prompt
+
+
+def reasonix_fixture(home, cwd):
+    slug = cwd.replace("/", "-")
+    sessions = Path(home) / ".reasonix" / "projects" / slug / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    stem = sessions / "20261001-000000.000000000-deepseek-flash"
+    system = {"role": "system", "content": "You are Reasonix, a coding agent. zebracorninjected"}
+    user = {"role": "user",
+            "content": f'<workspace>\nCurrent workspace: "{cwd}".\nzebracorninjected\n</workspace>\n\n'
+                       "run it zebracornreasonix\n\n<execution-policy preset=\"balanced\" version=\"3\">\nverify=targeted\n</execution-policy>",
+            "raw_content": "run it zebracornreasonix", "createdAt": 1790000000000}
+    call = {"role": "assistant", "content": " ", "reasoning_content": "zebracornthinking",
+            "tool_calls": [{"id": "call_1", "name": "bash", "arguments": json.dumps({"command": "echo hi-reasonix"})}]}
+    result = {"role": "tool", "content": "hi zebracornreasonixtool\n", "tool_call_id": "call_1", "name": "bash"}
+    steer = {"role": "user", "content": f'<workspace>\nCurrent workspace: "{cwd}"\n</workspace>\nzebracorninjected steer',
+             "host_authored": True}
+    reply = {"role": "assistant", "content": "done zebracornreasonix"}
+    # checkpoint .jsonl lags the event log: the newest turns exist only in the sidecar
+    with open(f"{stem}.jsonl", "w", encoding="utf-8") as fh:
+        for m in (system, user):
+            fh.write(json.dumps(m) + "\n")
+    with open(f"{stem}.events.jsonl", "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"schema_version": 1, "type": "replace", "revision": 1, "messages": [system, user],
+                             "created_at": "2026-10-01T00:00:00Z"}) + "\n")
+        fh.write(json.dumps({"schema_version": 1, "type": "append", "revision": 2, "base_revision": 1,
+                             "message_index": 2, "messages": [call, result, steer, reply],
+                             "created_at": "2026-10-01T00:00:01Z"}) + "\n")
+    Path(f"{stem}.jsonl.meta").write_text(json.dumps({"id": stem.name, "model": "deepseek/deepseek-flash",
+                                                       "revision": 2, "schema_version": 2, "turns": 1,
+                                                       "preview": "run it zebracornreasonix"}), encoding="utf-8")
+    return f"{stem}.jsonl"
+
+
+def reasonix_v4_fixture(home, cwd):
+    """A 1.x sessions-v4 store (RX4F frames), built with the zstd CLI."""
+    import hashlib
+    import subprocess
+    sid = "0123456789abcdef0123456789abcdef"
+    sdir = Path(home) / ".reasonix" / "projects" / cwd.replace("/", "-") / "sessions-v4" / sid
+    sdir.mkdir(parents=True, exist_ok=True)
+    (sdir / "manifest.json").write_text(json.dumps({
+        "schemaVersion": 4, "codec": "reasonix.session.linear/v4", "storageRevision": 3,
+        "contentRoot": "../.content-v1", "sessionId": sid, "createdAt": "2026-10-01T00:00:00Z",
+        "writerGeneration": 1, "kind": "headless-run"}), encoding="utf-8")
+    big = json.dumps({"message": {"role": "tool", "id": "m5", "content": "hi zebracornreasonixv4tool\n",
+                                  "tool_call_id": "c1", "name": "bash"}}).encode()
+    digest = hashlib.sha256(big).hexdigest()
+    obj = sdir.parent / ".content-v1" / "objects" / digest[:2] / digest[2:4] / digest
+    obj.parent.mkdir(parents=True, exist_ok=True)
+    obj.write_bytes(big)
+    events = [
+        ("message/complete", {"message": {"role": "user", "id": "m1", "origin": "host",
+                                          "content": f'<session-context version="1">\n## Workspace\n\nCurrent workspace: "{cwd}"\nzebracorninjected\n</session-context>'}}),
+        ("message/complete", {"message": {"role": "user", "id": "m2", "origin": "user",
+                                          "content": "v4 zebracornreasonixv4", "raw_content": "v4 zebracornreasonixv4"}}),
+        ("message/complete", {"message": {"role": "assistant", "id": "m3", "reasoning_content": "zebracornthinking",
+                                          "tool_calls": [{"id": "c1", "name": "bash",
+                                                          "arguments": json.dumps({"command": "echo hi-reasonixv4"})}]}}),
+        ("message/complete", None),  # payload in the content pool
+        ("message/complete", {"message": {"role": "assistant", "id": "m6", "content": "done zebracornreasonixv4"}}),
+        ("session/title", {"title": "v4 zebracorn title"}),
+    ]
+    out = bytearray()
+
+    def frame(rec):
+        raw = json.dumps(rec).encode()
+        comp = subprocess.run(["zstd", "-q", "-c"], input=raw, capture_output=True).stdout
+        out.extend(b"RX4F" + struct.pack(">II", len(comp), len(raw)) + comp)
+
+    head = {"schemaVersion": 4, "codec": "reasonix.session.linear/v4"}
+    for seq, (kind, body) in enumerate(events, start=1):
+        frame({**head, "recordType": "batch/begin", "commitId": f"c{seq}", "firstSeq": seq, "eventCount": 1})
+        ev = {"id": f"e{seq}", "seq": seq, "kind": kind}
+        if body is None:
+            ev["payloadRef"] = {"digest": digest, "bytes": len(big)}
+        else:
+            ev["payload"] = base64.b64encode(json.dumps(body).encode()).decode()
+        frame({**head, "recordType": "batch/event", "event": ev})
+        frame({**head, "recordType": "batch/end", "commitId": f"c{seq}", "firstSeq": seq, "eventCount": 1, "sha256": ""})
+    (sdir / "events.frames").write_bytes(bytes(out))
+    return str(sdir / "events.frames")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Deep Code (lessweb/deepcode-cli, npm @vegamo/deepcode-cli)
+#   ~/.deepcode/projects/<cwd with / → ->/<sessionId>.jsonl  (+ sessions-index.json)
+#   os.homedir() only; no env override.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def deepcode_roots():
+    return [Path.home() / ".deepcode" / "projects"]
+
+
+def deepcode_list():
+    paths = []
+    for root in deepcode_roots():
+        try:
+            paths += sorted(root.glob("*/*.jsonl")) if root.is_dir() else []
+        except OSError:
+            pass
+    return _file_logs(paths, "deepcode")
+
+
+def _deepcode_deepcode_tool_output(content):
+    """Tool results are a JSON envelope {"ok","name","output"|"error","metadata":{exitCode…}}."""
+    if not isinstance(content, str):
+        return content
+    try:
+        env = json.loads(content)
+    except Exception:
+        return content
+    if not isinstance(env, dict) or not ({"output", "error", "ok"} & set(env)):
+        return content
+    body = env.get("output")
+    if not isinstance(body, str):
+        body = json.dumps(body, ensure_ascii=False) if body not in (None, "") else ""
+    meta = env.get("metadata") if isinstance(env.get("metadata"), dict) else {}
+    code = meta.get("exitCode")
+    head = []
+    if env.get("ok") is False:
+        head.append("error" + (f": {env['error']}" if isinstance(env.get("error"), str) else ""))
+    if code not in (None, 0):
+        head.append(f"exit {code}")
+    return "\n".join(head + [body]).strip()
+
+
+@_deepcode_tolerant
+def deepcode_iter(key):
+    calls = {}
+    for msg in _deepcode_jsonl(key):
+        role = msg.get("role")
+        params = msg.get("messageParams") if isinstance(msg.get("messageParams"), dict) else {}
+        meta = msg.get("meta") if isinstance(msg.get("meta"), dict) else {}
+        if role == "user":
+            prompt = meta.get("userPrompt") if isinstance(meta.get("userPrompt"), dict) else {}
+            text = prompt.get("text") if isinstance(prompt.get("text"), str) else _text_of(msg.get("content"))
+            if text and text.strip():
+                yield "user", text
+        elif role == "assistant":
+            text = _text_of(msg.get("content"))
+            if text.strip():
+                yield "assistant", text.strip()
+            for cid, name, args in _deepcode_openai_calls(params.get("tool_calls")):
+                calls[cid] = _call_label(name, args)
+                cmd = _shell_cmd(name, args)
+                if cmd:
+                    yield "cmd", cmd
+        elif role == "tool":
+            label = calls.get(params.get("tool_call_id"))
+            if not label and isinstance(meta.get("function"), dict):
+                fn = meta["function"]
+                label = _call_label(fn.get("name"), _deepcode_args(fn.get("arguments")))
+            turn = tool_turn(label or "tool", _deepcode_deepcode_tool_output(msg.get("content")))
+            if turn:
+                yield turn
+        # system: prompt, environment, skill bodies, compaction summaries (meta.isSummary)
+
+
+def _deepcode_deepcode_index_entry(key):
+    index = _deepcode_load_json(Path(key).parent / "sessions-index.json") or {}
+    sid = Path(key).stem
+    for entry in index.get("entries") or []:
+        if isinstance(entry, dict) and entry.get("id") == sid:
+            return index, entry
+    return index, {}
+
+
+_deepcode_ROOT_PATH_RE = re.compile(r'"root path":\s*"((?:[^"\\]|\\.)*)"')
+
+
+@_deepcode_safe_str
+def deepcode_project(key):
+    index, _ = _deepcode_deepcode_index_entry(key)
+    if isinstance(index.get("originalPath"), str) and index["originalPath"]:
+        return index["originalPath"]
+    for msg in _deepcode_jsonl(key):
+        if msg.get("role") == "system":
+            m = _deepcode_ROOT_PATH_RE.search(_text_of(msg.get("content")) or "")
+            if m:
+                try:
+                    return json.loads(f'"{m.group(1)}"')
+                except Exception:
+                    return m.group(1)
+        elif msg.get("role") == "user":
+            break
+    return Path(key).parent.name
+
+
+@_deepcode_safe_str
+def deepcode_title(key):
+    _, entry = _deepcode_deepcode_index_entry(key)
+    return str(entry.get("summary") or "").strip()
+
+
+register_harness('qwen', list_fn=qwen_list, iter_fn=qwen_iter, project_fn=qwen_project,
+                 title_fn=qwen_title, roots_fn=qwen_roots, match=lambda p: '/.qwen/' in p,
+                 aliases=['qwen-code', 'qwencode', 'alibaba'], color='93', archivable=True, label='Qwen Code',
+                 retention_fn=qwen_retention)
+register_harness('kimi', list_fn=kimi_list, iter_fn=kimi_iter, project_fn=kimi_project,
+                 title_fn=kimi_title, roots_fn=kimi_roots, match=lambda p: '/.kimi-code/' in p or '/.kimi/sessions/' in p,
+                 aliases=['kimi-code', 'kimicode', 'moonshot'], color='95', archivable=True, label='Kimi Code')
+register_harness('crush', list_fn=crush_list, iter_fn=crush_iter, project_fn=crush_project,
+                 title_fn=crush_title, roots_fn=crush_roots, match=lambda p: '/.crush/crush.db#' in p or '/crush/crush.db#' in p,
+                 aliases=['charm', 'charmbracelet'], color='35', archivable=False, label='Crush')
+register_harness('copilot', list_fn=copilot_list, iter_fn=copilot_iter, project_fn=copilot_project,
+                 title_fn=copilot_title, roots_fn=copilot_roots, match=lambda p: '/.copilot/' in p,
+                 aliases=['github-copilot', 'gh-copilot', 'copilot-cli'], color='37', archivable=True, label='GitHub Copilot CLI')
+register_harness('cline', list_fn=cline_list, iter_fn=cline_iter, project_fn=cline_project,
+                 title_fn=cline_title, roots_fn=cline_roots, match=lambda p: '/.cline/' in p or 'saoudrizwan.claude-dev' in p,
+                 aliases=['cline-cli'], color='36', archivable=True, label='Cline')
+register_harness('continue', list_fn=continue_list, iter_fn=continue_iter, project_fn=continue_project,
+                 title_fn=continue_title, roots_fn=continue_roots, match=lambda p: '/.continue/sessions/' in p,
+                 aliases=['cn', 'continue-cli'], color='34', archivable=True, label='Continue')
+register_harness('codewhale', list_fn=codewhale_list, iter_fn=codewhale_iter, project_fn=codewhale_project,
+                 title_fn=codewhale_title, roots_fn=codewhale_roots, match=lambda p: '/.codewhale/' in p or '/.deepseek/sessions/' in p,
+                 aliases=['deepseek-tui', 'whale'], color='94', archivable=True, label='Codewhale')
+register_harness('reasonix', list_fn=reasonix_list, iter_fn=reasonix_iter, project_fn=reasonix_project,
+                 title_fn=reasonix_title, roots_fn=reasonix_roots, match=lambda p: '/.reasonix/' in p,
+                 aliases=['deepseek-reasonix'], color='96', archivable=True, label='DeepSeek Reasonix')
+register_harness('deepcode', list_fn=deepcode_list, iter_fn=deepcode_iter, project_fn=deepcode_project,
+                 title_fn=deepcode_title, roots_fn=deepcode_roots, match=lambda p: '/.deepcode/' in p,
+                 aliases=['deep-code', 'deepcode-cli'], color='92', archivable=True, label='Deep Code')
+# <<< registered harnesses
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
@@ -4036,6 +7620,21 @@ def cmd_where(conn, providers):
         if days is not None:
             verdict = "keeps history ~forever" if days >= 3650 else f"DELETES transcripts after {days:g} days"
             safe_print(f"  {name:8s} retention: {verdict} ({how})")
+    for hid, h in EXTRA_HARNESSES.items():
+        if not h.get("retention") or hid not in providers:
+            continue
+        try:
+            spec = h["retention"]()
+        except Exception:
+            continue
+        if not spec or not Path(spec["settings_path"]).parent.is_dir():
+            continue
+        current = spec.get("status")() if spec.get("status") else json_setting(spec["settings_path"], spec["key_path"])
+        if current is None:
+            safe_print(f"  {hid:8s} retention: DELETES after {spec.get('default_days', '?')} days by default "
+                       f"({spec['key_path']} unset in {spec['settings_path']})")
+        else:
+            safe_print(f"  {hid:8s} retention: {spec['key_path']} = {current} ({spec['settings_path']})")
     return 0
 
 
@@ -4072,7 +7671,7 @@ def run(argv=None):
         return 1
 
     auto_install_skills()
-    for fix in (ensure_claude_retention, ensure_gemini_retention):
+    for fix in (ensure_claude_retention, ensure_gemini_retention, ensure_registered_retention):
         try:
             fix()
         except Exception:
