@@ -56,7 +56,7 @@ def load_module(code, name):
 clean_mod = load_module(LOG_CLEAN_QUICK_CODE, "log_clean_quick")
 fts_mod = load_module(LOG_SEARCH_FTS5_CODE, "log_search_fts5")
 
-NAVCOM_VERSION = "0.5.0"
+NAVCOM_VERSION = "0.6.0"
 DEFAULT_LIMIT = 20  # hits per harness (and sessions listed by a bare `navcom`)
 
 # Every harness navcom knows how to read. Order = display order in help/listings.
@@ -316,12 +316,27 @@ def _file_logs(paths, provider):
 
 
 def _rglob(root, pattern):
+    """Path.rglob(pattern) semantics (pattern matched against the trailing path components),
+    via os.walk — about 2.5x faster on big session trees, and every search lists them all."""
+    import fnmatch
     try:
         if not root.is_dir():
             return []
-        return list(root.rglob(pattern))
     except OSError:
         return []
+    parts = pattern.split("/")
+    out = []
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            if not fnmatch.fnmatchcase(name, parts[-1]):
+                continue
+            if len(parts) > 1:
+                tail = Path(dirpath).parts[-(len(parts) - 1):]
+                if len(tail) != len(parts) - 1 or not all(
+                        fnmatch.fnmatchcase(t, p) for t, p in zip(tail, parts[:-1])):
+                    continue
+            out.append(Path(dirpath) / name)
+    return out
 
 
 def _ro_connect(db_path):
@@ -1813,6 +1828,9 @@ _GENERIC_SESSION_DIRS = {"main", "agents", "logs", ".system_generated", "events"
 def session_ref(key):
     """Short, stable handle for a session: the file stem / db session id (or the session's
     folder, for harnesses that name every transcript file the same: dsh, Grok Build)."""
+    if "#" in key and key.rsplit("#", 1)[1].isdigit():
+        # file#N (one aider history file holds many sessions): name it by its project folder
+        return f"{Path(key.rsplit('#', 1)[0]).parent.name}@{key.rsplit('#', 1)[1]}"
     tail = key.split("#", 1)[1] if "#" in key else Path(key).name
     if "#" not in key and _GENERIC_SESSION_FILES.match(tail):
         for parent in Path(key).parents:  # nearest ancestor folder that names the session
@@ -1909,6 +1927,7 @@ def _open_index_rw(index_path):
         "CREATE TABLE IF NOT EXISTS file_meta (file TEXT PRIMARY KEY, provider TEXT, project TEXT, title TEXT)"
     )
     conn.execute("CREATE TABLE IF NOT EXISTS file_parser (file TEXT PRIMARY KEY, ver INTEGER NOT NULL)")
+    conn.execute("CREATE INDEX IF NOT EXISTS turn_loc_rid ON turn_loc(rid)")  # makes max(rid) O(log n)
     conn.commit()
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version < INDEX_SCHEMA_VERSION:
@@ -2015,6 +2034,9 @@ def index_logs(conn, logs, force=False, progress=True, upgrade=True):
 
 
 def _index_logs(conn, logs, force=False, progress=True, upgrade=True):
+    # one query for every file's (mtime, size) instead of one per log: unchanged logs skip instantly
+    known = {} if force else {f: (m, z) for f, m, z in conn.execute("SELECT file, mtime, size FROM file_state")}
+    logs = [log for log in logs if known.get(log[0]) != (log[1], log[2])]
     changed = 0
     total = len(logs)
     announced = False
@@ -2384,14 +2406,98 @@ def _is_query_error(exc):
     return "locked" not in msg and "readonly" not in msg and "disk" not in msg
 
 
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _query_terms(match):
+    """Lower-cased search words from a cooked FTS5 expression (operators and syntax dropped)."""
+    words = re.findall(r"\w+", match.lower(), re.UNICODE)
+    return [w for w in words if w not in ("and", "or", "not", "near", "text")]
+
+
+def make_snippet(text, terms, tokens=32):
+    """FTS-style snippet: the `tokens`-word window with the most prefix matches, matches «marked»."""
+    if not text:
+        return ""
+    words = list(_WORD_RE.finditer(text))
+    if not words:
+        return text[:200]
+    term_tuple = tuple(terms)
+    hits = [i for i, m in enumerate(words) if m.group(0).lower().startswith(term_tuple)] if term_tuple else []
+    if not hits:
+        start = 0
+    else:
+        start, best_count, j = max(0, hits[0] - tokens // 4), 0, 0
+        for i, h in enumerate(hits):  # two pointers: windows starting a little before each hit
+            s0 = max(0, h - tokens // 4)
+            while j < len(hits) and hits[j] < s0 + tokens:
+                j += 1
+            if j - i > best_count:
+                start, best_count = s0, j - i
+    start = max(0, min(start, len(words) - tokens))  # fill the window instead of running short
+    end = min(len(words), start + tokens)
+    hit_set = set(hits)
+    out, pos = [], (0 if start == 0 else words[start].start())
+    for i in range(start, end):
+        m = words[i]
+        out.append(text[pos:m.start()])
+        out.append(f"«{m.group(0)}»" if i in hit_set else m.group(0))
+        pos = m.end()
+    if end == len(words):
+        out.append(text[pos:])
+    snippet = "".join(out).strip()
+    return ("…" if start > 0 else "") + snippet + ("…" if end < len(words) else "")
+
+
 def _search_once(conn, match, providers, keys, per_harness, snippet_tokens, role, include_self, exclude_keys,
                  include_tools=False):
-    """Run one MATCH separately for each harness so every harness gets up to
-    `per_harness` hits (a busy harness can't crowd the others out), then merge by BM25."""
+    """Top `per_harness` hits for EVERY harness (a busy harness can't crowd the others out).
+
+    Two passes instead of one MATCH per harness (30 harnesses × a full match = seconds):
+    (1) stream (rowid, provider, rank) for all matches once, keeping the best few per harness
+    in a heap; (2) fetch snippets for just those rows."""
+    fetch = per_harness * 2 + 8
+    tokens = max(1, min(int(snippet_tokens), SNIPPET_MAX_TOKENS))
+    match_expr = f"text : ({match})"
+    where = "session_fts MATCH ?"
+    params = [match_expr]
+    if providers and set(providers) != set(ALL_PROVIDERS):
+        where += f" AND provider IN ({','.join('?' * len(providers))})"
+        params.extend(providers)
+    if role:
+        where += " AND role=?"
+        params.append(role)
+    elif not include_tools:
+        where += " AND role != 'tool'"
+    clause, key_params = _key_filter_clause(conn, keys)
+    where += clause
+    params.extend(key_params)
+    # one streaming pass over every match; a tiny heap per harness keeps its best `fetch` rows
+    import heapq
+    best = {}
+    for rid, prov, rnk in conn.execute(f"SELECT rowid, provider, rank FROM session_fts WHERE {where}", params):
+        heap = best.setdefault(prov, [])
+        if len(heap) < fetch:
+            heapq.heappush(heap, (-rnk, rid))
+        elif -rnk > heap[0][0]:
+            heapq.heapreplace(heap, (-rnk, rid))
+    rank_of = {rid: -neg for heap in best.values() for neg, rid in heap}
+    ids = list(rank_of)
+    terms = _query_terms(match)
+    rows = []
+    for start in range(0, len(ids), 500):
+        chunk = ids[start:start + 500]
+        # plain rowid lookups (no MATCH, no FTS snippet(): both re-scan every match → seconds)
+        for rid, ts, role, file, msg_index, prov, text in conn.execute(
+            "SELECT rowid, ts, role, file, msg_index, provider, text FROM session_fts "
+            f"WHERE rowid IN ({','.join('?' * len(chunk))})", chunk,
+        ):
+            rows.append((ts, role, file, msg_index, prov, make_snippet(text, terms, tokens), text, rank_of[rid]))
+    by_provider = {}
+    for row in sorted(rows, key=lambda r: r[7]):
+        by_provider.setdefault(row[4], []).append(Hit(*row))
     merged, excluded = [], 0
-    for prov in providers or [None]:
-        raw = run_match(conn, match, per_harness * 3 + 30, [prov] if prov else None, keys, snippet_tokens, role,
-                        include_tools)
+    for raw in by_provider.values():
         kept, skipped = _filter_hits(raw, per_harness, include_self, exclude_keys)
         merged.extend(kept)
         excluded += skipped
@@ -3595,6 +3701,7 @@ import sqlite3  # noqa: E402 (harness parsers)
 import struct  # noqa: E402 (harness parsers)
 import sys  # noqa: E402 (harness parsers)
 import tempfile  # noqa: E402 (harness parsers)
+import time  # noqa: E402 (harness parsers)
 import uuid  # noqa: E402 (harness parsers)
 
 
@@ -7509,6 +7616,1791 @@ def vibe_title(key):
     return title if isinstance(title, str) else ""
 
 
+# ── Aider (aider) ────────────────────────────────────────────────────────────
+# Aider (PyPI aider-chat) ─ <project>/.aider.chat.history.md, one navcom session per
+# "# aider chat started at <ts>" header, keyed "<history file>#<n>" (n = 1-based header ordinal).
+#
+# Markdown written by aider/io.py (verified against aider 0.59 – 0.86.2):
+#   #### <line>␠␠          user input (every line of a multi-line message is prefixed; lines end "  ")
+#   > <line>␠␠             tool_output / tool_error / confirm_ask notes ("Running <cmd>", "Applied edit to x")
+#   <plain markdown>        assistant reply (ai_output: stripped content between blank lines)
+# Shell-command stdout is NOT written to the file (aider only prints it), so `tool` turns are aider's
+# own notes (edits applied, errors, "Added N lines of output to the chat").
+#
+# No global index: files live in each git root / launch dir. Spotlight skips dotfiles, so discovery is a
+# bounded walk of ~ (cached for AIDER_RESCAN_SECONDS in navcom's index dir) plus $AIDER_CHAT_HISTORY_FILE.
+
+_aider_AIDER_HISTORY_NAME = ".aider.chat.history.md"
+_aider_AIDER_SCAN_DEPTH = 5            # ~1s on a dev Mac; finds 141/144 histories (depth 6: 2.3s, 144)
+_aider_AIDER_RESCAN_SECONDS = 3600
+_aider_AIDER_SKIP_DIRS = {"node_modules", "Library", "Applications", "Pictures", "Movies", "Music", "venv",
+                    "__pycache__", "site-packages", "dist", "build", "target"}
+_aider_AIDER_HDR_RE = re.compile(rb"^# aider chat started at (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)[ \t]*\r?$", re.M)
+_aider_AIDER_NOTE_SKIP_RE = re.compile(r"^(Tokens: .* sent|Cost: \$|.*\(Y\)es/\(N\)o.*:|Add the output to the chat\?)", re.I)
+_aider_AIDER_CHAT_CMD_RE = re.compile(r"^/(ask|code|architect|context)\s+(.+)$", re.S)
+_aider_AIDER_SHELL_RE = re.compile(r"^(?:/run|/test|!)\s*(.+)$", re.S)
+
+
+def aider_roots():
+    roots = [Path.home()]
+    explicit = _env_path("AIDER_CHAT_HISTORY_FILE")
+    if explicit:
+        roots.insert(0, explicit)
+    return roots
+
+
+def _aider_aider_walk(root, depth):
+    found = []
+    root = str(root)
+    base = root.rstrip(os.sep).count(os.sep)
+    for folder, dirs, files in os.walk(root):
+        level = folder.count(os.sep) - base
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in _aider_AIDER_SKIP_DIRS] if level < depth else []
+        found.extend(os.path.join(folder, f) for f in files if f.endswith(_aider_AIDER_HISTORY_NAME))
+    return found
+
+
+def _aider_aider_cache_path():
+    return default_index_path().parent / "navcom-aider-paths.json"
+
+
+def _aider_aider_history_files():
+    """Every aider chat history under ~ (bounded walk, cached) plus $AIDER_CHAT_HISTORY_FILE."""
+    home, cache_path, paths = str(Path.home()), _aider_aider_cache_path(), None
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        if cache.get("home") == home and time.time() - cache.get("scanned_at", 0) < _aider_AIDER_RESCAN_SECONDS:
+            paths = cache.get("paths") or []
+    except Exception:
+        pass
+    if paths is None:
+        paths = sorted(_aider_aider_walk(home, _aider_AIDER_SCAN_DEPTH))
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"home": home, "scanned_at": time.time(), "paths": paths}), encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            tmp.replace(cache_path)
+        except OSError:
+            pass
+    explicit = _env_path("AIDER_CHAT_HISTORY_FILE")
+    if explicit and str(explicit) not in paths:
+        paths = [str(explicit)] + list(paths)
+    return [Path(p) for p in paths]
+
+
+def _aider_aider_sections(data):
+    """[(n, start, end, header_ts_or_None)] — n=0 is text before the first header (old/odd files)."""
+    heads = list(_aider_AIDER_HDR_RE.finditer(data))
+    sections = []
+    first = heads[0].start() if heads else len(data)
+    if data[:first].strip():
+        sections.append((0, 0, first, None))
+    for i, m in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(data)
+        sections.append((i + 1, m.start(), end, m.group(1).decode()))
+    return sections
+
+
+def _aider_aider_epoch(ts):
+    try:
+        return time.mktime(time.strptime(ts, "%Y-%m-%d %H:%M:%S"))  # aider writes local time
+    except Exception:
+        return 0.0
+
+
+def aider_list():
+    """One navcom session per `# aider chat started at` header. The per-file split is cached by
+    (mtime, size), so a search re-reads only history files that changed since the last run."""
+    cache_path = _aider_aider_cache_path().with_name("navcom-aider-sections.json")
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        cache = {}
+    logs, fresh, dirty = [], {}, False
+    for path in _aider_aider_history_files():
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        entry = cache.get(str(path))
+        if not entry or entry.get("mtime") != stat.st_mtime or entry.get("size") != stat.st_size:
+            try:
+                data = path.read_bytes()
+            except OSError:
+                continue
+            sections, rows = _aider_aider_sections(data), []
+            for i, (n, start, end, _ts) in enumerate(sections):
+                if b"\n#### " not in data[start:end]:
+                    continue  # aider started and quit without a prompt
+                nxt = sections[i + 1][3] if i + 1 < len(sections) else None
+                mtime = (_aider_aider_epoch(nxt) or stat.st_mtime) if nxt else stat.st_mtime
+                rows.append([f"{path}#{n}", mtime, end - start])
+            entry, dirty = {"mtime": stat.st_mtime, "size": stat.st_size, "rows": rows}, True
+        fresh[str(path)] = entry
+        logs.extend((key, mtime, size, "aider") for key, mtime, size in entry["rows"])
+    if dirty or set(fresh) != set(cache):
+        try:
+            tmp = cache_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(fresh), encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            tmp.replace(cache_path)
+        except OSError:
+            pass
+    return logs
+
+
+def _aider_aider_split_key(key):
+    path, _, n = str(key).rpartition("#")
+    if not path or not n.isdigit():
+        return str(key), None
+    return path, int(n)
+
+
+def _aider_aider_section_text(key):
+    path, n = _aider_aider_split_key(key)
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return ""
+    for num, start, end, _ts in _aider_aider_sections(data):
+        if n is None or num == n:
+            return data[start:end].decode("utf-8", errors="replace")
+    return ""
+
+
+def _aider_aider_blocks(text):
+    """('hdr'|'user'|'note'|'text', [lines]) groups in file order."""
+    blocks = []
+    for line in text.splitlines():
+        if _aider_AIDER_HDR_RE.match(line.encode("utf-8", "replace")):
+            kind, body = "hdr", line
+        elif line.startswith("#### ") and line.endswith("  ") or line.rstrip() == "####":
+            kind, body = "user", line[5:].rstrip()
+        elif (line.startswith("> ") or line.rstrip() == ">") and line.endswith("  ") or line == ">  ":
+            kind, body = "note", line[2:].rstrip()
+        elif line.endswith("  ") and _aider_AIDER_NOTE_SKIP_RE.match(line.strip()):
+            # old aider wrapped confirm prompts: "> Add the output to the chat?\n(Y)es/(n)o/...: n  "
+            kind, body = "note", line[2:].rstrip()
+        else:
+            kind, body = "text", line
+        if blocks and blocks[-1][0] == kind:
+            blocks[-1][1].append(body)
+        else:
+            blocks.append((kind, [body]))
+    return blocks
+
+
+def aider_iter(key):
+    seen_user, last_reply, echo, cmd_label = False, "", None, None
+    for kind, lines in _aider_aider_blocks(_aider_aider_section_text(key)):
+        body = "\n".join(lines).strip()
+        if kind == "hdr" or not body:
+            continue
+        if kind == "user":
+            seen_user = True
+            if body == "<blank>":
+                continue
+            if echo is not None and body == echo:
+                echo = None
+                continue  # /ask X is re-logged as "#### X"
+            echo = None
+            if "# Announcement lines from when this session of aider was launched:" in body:
+                continue  # /help builds a docs-stuffed prompt and logs it as user input
+            if last_reply and " ".join(body.split()) == " ".join(last_reply.split()):
+                continue  # architect mode hands its plan to the editor coder as a "user" message
+            yield "user", body
+            cmd_label = None
+            m = _aider_AIDER_CHAT_CMD_RE.match(body)
+            if m:
+                echo = m.group(2).strip()
+            m = _aider_AIDER_SHELL_RE.match(body)
+            if m and m.group(1).strip():
+                cmd = m.group(1).strip()
+                yield "cmd", cmd
+                cmd_label = _call_label("Bash", {"command": cmd})
+        elif kind == "text":
+            if seen_user:
+                last_reply = body
+                yield "assistant", body
+        elif kind == "note":
+            if not seen_user:
+                continue  # launch banner: argv, version, model, repo-map
+            notes = []
+
+            def flush():
+                turn = tool_turn(cmd_label or "aider", "\n".join(notes))
+                notes.clear()
+                return turn
+            for line in lines:
+                line = line.strip()
+                if line.startswith("Running ") and len(line) > 8:
+                    if notes:
+                        turn = flush()
+                        if turn:
+                            yield turn
+                    cmd = line[8:].strip()
+                    yield "cmd", cmd
+                    cmd_label = _call_label("Bash", {"command": cmd})
+                elif line.startswith(("Run shell command", "Run shell commands")):
+                    # the commands echoed just before this prompt are a proposal from the reply, not output
+                    proposed = {ln.strip() for ln in last_reply.splitlines()}
+                    while notes and notes[-1] in proposed:
+                        notes.pop()
+                elif line and not _aider_AIDER_NOTE_SKIP_RE.match(line):
+                    notes.append(line)
+            # the command echoed before "Run shell command?" is a proposal, not output
+            if notes:
+                turn = flush()
+                if turn:
+                    yield turn
+
+
+def aider_project(key):
+    path, _ = _aider_aider_split_key(key)
+    return str(Path(path).parent)
+
+
+def aider_title(key):
+    return ""  # aider stores no titles
+
+
+# ── Antigravity CLI (agy) ────────────────────────────────────────────────────
+# Antigravity CLI (`agy`, Google, closed-source Go; verified on agy 1.2.14)
+# ─ ~/.gemini/antigravity-cli/brain/<conversation id>/.system_generated/logs/transcript_full.jsonl
+#
+# The primary store is SQLite-per-conversation (conversations/<id>.db, protobuf step blobs); agy also
+# writes a readable JSONL "trajectory log" per conversation (documented in its own built-in skill):
+#   transcript.jsonl       compact; long fields cut, listed in "truncated_fields"; tool_call args re-encoded
+#   transcript_full.jsonl  untruncated  ← we index this one
+#   chunks/transcript_full/NNNNNNNN.jsonl  the same steps in chunks (merged by step_index as a safety net)
+# One JSON object per step: {step_index, source: USER_EXPLICIT|USER_IMPLICIT|MODEL|SYSTEM,
+# type: USER_INPUT|PLANNER_RESPONSE|GENERIC|RUN_COMMAND|VIEW_FILE|ERROR_MESSAGE|..., status: DONE|ERROR,
+# created_at, content, thinking, tool_calls[{name, args}], media, truncated_fields}.
+# Tool results are the steps that follow a PLANNER_RESPONSE, in call order (no call id is logged).
+# Title/workspace live in <app data dir>/conversation_summaries.db (table conversation_summaries).
+# The Antigravity IDE (app data dir "antigravity") uses the same layout; older IDE builds only kept
+# encrypted .pb conversations, which are not readable.
+
+_agy_AGY_APP_DIRS = ("antigravity-cli", "antigravity")
+_agy_AGY_SKIP_TYPES = {"SYSTEM_MESSAGE", "EPHEMERAL_MESSAGE", "CONVERSATION_HISTORY", "CHECKPOINT", "KNOWLEDGE_ARTIFACTS",
+                   "KI_INSERTION", "DIRECTORY_RULES", "MEMORY", "RETRIEVE_MEMORY", "SUGGESTED_RESPONSES",
+                   "BRAIN_UPDATE", "PLAN_INPUT", "TASK_BOUNDARY", "DUMMY", "UNSPECIFIED", "FINISH"}
+_agy_AGY_REQUEST_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.S)
+_agy_AGY_TAG_BLOCK_RE = re.compile(r"<([A-Z][A-Z0-9_]+)>.*?</\1>", re.S)
+_agy_AGY_SHELL_TOOLS = ("run_command", "shell_exec", "send_command_input")
+
+
+def agy_gemini_dir():
+    return Path.home() / ".gemini"  # agy has a --gemini_dir flag but no env override
+
+
+def agy_roots():
+    return [agy_gemini_dir() / app / "brain" for app in _agy_AGY_APP_DIRS]
+
+
+def _agy_agy_logs_dir(key):
+    return Path(key).parent
+
+
+def agy_list():
+    logs = []
+    for root in agy_roots():
+        if not root.is_dir():
+            continue
+        for conv in root.iterdir():
+            logs_dir = conv / ".system_generated" / "logs"
+            files = [p for p in (logs_dir / "transcript_full.jsonl", logs_dir / "transcript.jsonl") if p.is_file()]
+            files += sorted((logs_dir / "chunks" / "transcript_full").glob("*.jsonl")) if logs_dir.is_dir() else []
+            if not files:
+                continue
+            try:
+                stats = [p.stat() for p in files]
+            except OSError:
+                continue
+            if not any(s.st_size for s in stats):
+                continue
+            logs.append((str(logs_dir / "transcript_full.jsonl"), max(s.st_mtime for s in stats),
+                         sum(s.st_size for s in stats), "agy"))
+    return logs
+
+
+def _agy_agy_steps(key):
+    """Steps by step_index: chunks first, then the full log, then the compact log only for gaps."""
+    logs_dir = _agy_agy_logs_dir(key)
+    sources = sorted((logs_dir / "chunks" / "transcript_full").glob("*.jsonl")) + [logs_dir / "transcript_full.jsonl"]
+    steps = {}
+    for path, overwrite in [(p, True) for p in sources] + [(logs_dir / "transcript.jsonl", False)]:
+        try:
+            handle = open(path, "r", encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with handle:
+            for line in handle:
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(obj, dict) and isinstance(obj.get("step_index"), int):
+                    if overwrite or obj["step_index"] not in steps:
+                        steps[obj["step_index"]] = obj
+    return [steps[i] for i in sorted(steps)]
+
+
+def _agy_agy_user_text(content):
+    if not isinstance(content, str):
+        return ""
+    found = _agy_AGY_REQUEST_RE.findall(content)
+    if found:
+        return "\n".join(t for t in found if t.strip()).strip()
+    return _agy_AGY_TAG_BLOCK_RE.sub("", content).strip()  # ADDITIONAL_METADATA, USER_SETTINGS_CHANGE, ...
+
+
+def _agy_agy_args(args):
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:
+            return {"command": args}
+    if not isinstance(args, dict):
+        return {}
+    out = {}
+    for k, v in args.items():  # the compact log re-encodes every value as a JSON string
+        if isinstance(v, str) and v[:1] in ('"', "{", "[") and v[-1:] in ('"', "}", "]"):
+            try:
+                v = json.loads(v)
+            except Exception:
+                pass
+        out[k] = v
+    return out
+
+
+def _agy_agy_shell(name, args):
+    if (name or "").lower() not in _agy_AGY_SHELL_TOOLS:
+        return None
+    for field in ("CommandLine", "commandLine", "command", "Command", "cmd", "Input"):
+        value = args.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _agy_agy_label(name, args):
+    cmd = _agy_agy_shell(name, args)
+    if cmd:
+        return f"{name}: {cmd[:160]}"
+    for field in ("AbsolutePath", "TargetFile", "File", "Path", "SearchPath", "Query", "Url", "DirectoryPath"):
+        value = args.get(field)
+        if isinstance(value, str) and value.strip():
+            return f"{name}: {value.strip()[:160]}"
+    return _call_label(name, args)
+
+
+def agy_iter(key):
+    pending, last_error = [], None
+    for step in _agy_agy_steps(key):
+        kind, source = step.get("type") or "", step.get("source") or ""
+        content = step.get("content")
+        if kind == "USER_INPUT":
+            if source == "USER_EXPLICIT":
+                text = _agy_agy_user_text(content)
+                if text:
+                    yield "user", text
+            continue
+        if kind == "PLANNER_RESPONSE":
+            if isinstance(content, str) and content.strip():
+                yield "assistant", content.strip()  # "thinking" is never read
+            calls = step.get("tool_calls")
+            if isinstance(calls, str):
+                try:
+                    calls = json.loads(calls)
+                except Exception:
+                    calls = []
+            for call in calls if isinstance(calls, list) else []:
+                if not isinstance(call, dict):
+                    continue
+                args = _agy_agy_args(call.get("args") or call.get("arguments"))
+                pending.append(_agy_agy_label(call.get("name"), args))
+                cmd = _agy_agy_shell(call.get("name"), args)
+                if cmd:
+                    yield "cmd", cmd
+            continue
+        if kind in _agy_AGY_SKIP_TYPES or source == "USER_IMPLICIT":
+            continue
+        is_error = step.get("status") == "ERROR" or kind == "ERROR_MESSAGE"
+        if pending:
+            label = pending.pop(0)
+        elif is_error:
+            label = "error"
+        else:
+            continue  # system-sourced chatter with no originating call
+        output = content if isinstance(content, str) else _text_of(content) if content else ""
+        error = step.get("error") if isinstance(step.get("error"), str) else ""
+        if is_error or error:
+            # retried API failures arrive as "API error (attempt N): ..." — keep one per streak
+            norm = re.sub(r"\(attempt \d+\)", "", error)
+            if label == "error" and norm == last_error:
+                continue
+            last_error = norm if label == "error" else None
+            output = "\n".join(t for t in ("error", error, output) if t)
+        turn = tool_turn(label, output)
+        if turn:
+            yield turn
+
+
+def _agy_agy_summary(key):
+    logs_dir = _agy_agy_logs_dir(key)
+    conv_id = logs_dir.parent.parent.name
+    app_dir = logs_dir.parent.parent.parent.parent
+    db = app_dir / "conversation_summaries.db"
+    if db.is_file():
+        try:
+            conn = _ro_connect(db)
+            try:
+                row = conn.execute("SELECT title, preview, workspace_uris FROM conversation_summaries "
+                                   "WHERE conversation_id = ?", (conv_id,)).fetchone()
+            finally:
+                conn.close()
+            if row:
+                return {"title": row[0] or row[1] or "", "uris": row[2] or "[]"}
+        except Exception:
+            pass
+    try:  # fallback: <app dir>/cache/conversation_metadata.json
+        meta = json.loads((app_dir / "cache" / "conversation_metadata.json").read_text(encoding="utf-8"))
+        summary = ((meta.get("conversations") or {}).get(conv_id) or {}).get("summary") or {}
+        return {"title": summary.get("Title") or summary.get("Preview") or "",
+                "uris": json.dumps(summary.get("WorkspaceURIs") or [])}
+    except Exception:
+        return {}
+
+
+def agy_project(key):
+    from urllib.parse import unquote, urlparse
+    try:
+        uris = json.loads(_agy_agy_summary(key).get("uris") or "[]")
+    except Exception:
+        uris = []
+    for uri in uris if isinstance(uris, list) else []:
+        if isinstance(uri, str) and uri.startswith("file://"):
+            return unquote(urlparse(uri).path)
+    for step in _agy_agy_steps(key):  # fallback: the Cwd of the first command
+        for call in step.get("tool_calls") or [] if isinstance(step.get("tool_calls"), list) else []:
+            cwd = _agy_agy_args((call or {}).get("args")).get("Cwd")
+            if isinstance(cwd, str) and cwd.startswith("/"):
+                return cwd
+    return ""
+
+
+def agy_title(key):
+    return (_agy_agy_summary(key).get("title") or "").strip()
+
+
+# ── Factory Droid (droid) ────────────────────────────────────────────────────
+# Factory Droid CLI ─ $FACTORY_HOME_OVERRIDE|~ /.factory/sessions/<-cwd-slug>/<uuid>.jsonl
+#
+# Line 1 is {"type":"session_start", id, title, cwd, owner, version:2, ...}; then
+# {"type":"message", id, parentId, timestamp, seq, message:{role, content[...]}} where content is
+# Anthropic-style blocks: text | thinking | redacted_thinking | image | document |
+# tool_use{id,name,input} | tool_result{tool_use_id,content,is_error}. Tool results ride in
+# role:"user" messages. Injected context: message ids starting "context-" (the per-session
+# <system-reminder> tool catalog / env block) or "__internal__system-reminder__", visibility
+# "llm_only" / hiddenFromUserViews, role "system", hook messages. Other line types
+# (agent_turn_outcome, todo_state, compaction_state, ...) carry no typed text.
+# The shell tool is "Execute" {command, summary, riskLevel}.
+
+_droid_DROID_INJECTED_IDS = ("context-", "__internal__system-reminder__")
+_droid_DROID_REMINDER_RE = re.compile(r"<(system-reminder|system-notification)>[\s\S]*?</\1>", re.I)
+
+
+def droid_roots():
+    home = _env_path("FACTORY_HOME_OVERRIDE") or Path.home()
+    return [home / ".factory" / "sessions"]
+
+
+def droid_list():
+    paths = []
+    for root in droid_roots():
+        if root.is_dir():
+            paths.extend(root.glob("*.jsonl"))       # flat / legacy layout
+            paths.extend(root.glob("*/*.jsonl"))     # <cwd-slug>/<uuid>.jsonl
+    return _file_logs(sorted(set(paths)), "droid")
+
+
+def _droid_droid_lines(key):
+    try:
+        handle = open(key, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with handle:
+        for line in handle:
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                yield obj
+
+
+def _droid_droid_header(key):
+    for obj in _droid_droid_lines(key):
+        return obj if obj.get("type") == "session_start" else {}
+    return {}
+
+
+def _droid_droid_injected(obj, msg):
+    if str(obj.get("id") or "").startswith(_droid_DROID_INJECTED_IDS):
+        return True
+    if msg.get("role") == "system" or msg.get("hookEventName"):
+        return True
+    return msg.get("visibility") == "llm_only" or msg.get("hiddenFromUserViews") is True
+
+
+def droid_iter(key):
+    calls = {}
+    for obj in _droid_droid_lines(key):
+        if obj.get("type") != "message":
+            continue
+        msg = obj.get("message") or {}
+        role, content = msg.get("role"), msg.get("content")
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        if not isinstance(content, list):
+            continue
+        injected = _droid_droid_injected(obj, msg)
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if kind == "text" and not injected and role in ("user", "assistant"):
+                text = block.get("text") or ""
+                if role == "user":
+                    text = _droid_DROID_REMINDER_RE.sub("", text).strip()
+                if text.strip():
+                    yield role, text
+            elif kind == "tool_use":
+                args = block.get("input")
+                calls[block.get("id")] = _call_label(block.get("name"), args)
+                cmd = _shell_cmd(block.get("name"), args)
+                if cmd is None and block.get("name") == "Execute" and isinstance(args, dict):
+                    cmd = args.get("command")
+                if cmd:
+                    yield "cmd", cmd
+            elif kind == "tool_result":
+                output = block.get("content")
+                if block.get("is_error") or block.get("isError"):
+                    output = "error\n" + (_text_of(output) if isinstance(output, list) else str(output or ""))
+                turn = tool_turn(calls.get(block.get("tool_use_id") or block.get("toolUseId"), "tool"), output)
+                if turn:
+                    yield turn
+
+
+def droid_project(key):
+    cwd = _droid_droid_header(key).get("cwd")
+    return cwd if isinstance(cwd, str) else ""
+
+
+def droid_title(key):
+    title = _droid_droid_header(key).get("title")
+    return title if isinstance(title, str) else ""
+
+
+# ── Cursor CLI (cursor) ──────────────────────────────────────────────────────
+# Cursor CLI (cursor-agent / `agent`) — two on-disk forms of the same chat.
+#
+# 1. Primary store (full fidelity, incl. tool outputs):
+#    $CURSOR_CONFIG_DIR | $XDG_CONFIG_HOME/cursor | ~/.cursor  /chats/<md5(cwd)>/<agentId>/store.db
+#    (and .../acp-sessions/<id>/store.db for `agent acp`).
+#    SQLite: meta(key,value) where key "0" = hex(JSON{agentId, latestRootBlobId, name, createdAt,
+#    mode, lastUsedModel, ...}); blobs(id TEXT hex sha256, data BLOB). The root blob is a protobuf
+#    ConversationStateStructure: field 1 root_prompt_messages_json (repeated 32-byte blob ids),
+#    field 9 previous_workspace_uris, field 13 summary_archives (blob ids of SummaryArchive protos,
+#    whose field 1 = summarized_messages blob ids). Each message blob is JSON of a Vercel AI SDK
+#    message {role: system|user|assistant|tool, content: str | [text|reasoning|redacted-reasoning|
+#    image|file|tool-call{toolCallId,toolName,args}|tool-result{toolCallId,toolName,result}]}.
+#    User text wraps the typed prompt in <user_query>, with injected <user_info>, <rules>,
+#    <system_reminder>, ... blocks around it.
+# 2. Readable transcript (no tool outputs; thinking is merged into the assistant text block):
+#    $CURSOR_DATA_DIR | ~/.cursor  /projects/<slug(cwd)>/agent-transcripts/<id>/<id>.jsonl
+#    lines {"role":"user"|"assistant","message":{"content":[{"type":"text"},{"type":"tool_use",
+#    "name","input"}]}} plus {"type":"turn_ended"} / {"type":"metadata"}; subagents under
+#    <parent>/subagents/<id>.jsonl; legacy flat <id>.jsonl / <id>.txt ("user:" / "assistant:" blocks,
+#    "[Thinking]", "[Tool call] Name" + indented "key: value", "[Tool result] Name").
+#
+# A session with a store.db is listed once, as "<store.db>#<agentId>"; transcripts are listed only
+# for ids without a store (e.g. written by the Cursor IDE, or a store that was removed).
+
+# Tags Cursor's own transcript writer strips from user text as injected context.
+_cursor_CURSOR_INJECTED_TAGS = (
+    "user_info", "project_layout", "rules", "always_applied_workspace_rules", "agent_requestable_workspace_rules",
+    "user_rules", "agent_skills", "available_skills", "cloud_instructions", "cloud_task_instructions",
+    "open_and_recently_viewed_files", "system_reminder", "system-reminder", "instructions_update",
+    "mcp_instructions", "mcp_file_system", "mcp_file_system_servers", "git_status", "agent_transcripts",
+    "cursor_rules_context", "attached_files", "system_notification", "task_notification", "agent_notification",
+    "timestamp")
+_cursor_CURSOR_TAG_RE = re.compile(r"<(%s)(?:\s[^>]*)?>[\s\S]*?</\1>" % "|".join(re.escape(t) for t in _cursor_CURSOR_INJECTED_TAGS),
+                            re.I)
+_cursor_CURSOR_QUERY_RE = re.compile(r"<user_query>([\s\S]*?)</user_query>")
+_cursor_CURSOR_THINK_RE = re.compile(r"<(think|thinking)>[\s\S]*?</\1>", re.I)
+_cursor_CURSOR_WS_RE = re.compile(r"Workspace Path:\s*(/[^\n<]+)")
+
+
+def _cursor_cursor_config_dir():
+    explicit = _cursor_env_path_nonblank("CURSOR_CONFIG_DIR")
+    if explicit:
+        return explicit
+    xdg = _cursor_env_path_nonblank("XDG_CONFIG_HOME")
+    return xdg / "cursor" if xdg else Path.home() / ".cursor"
+
+
+def _cursor_cursor_data_dir():
+    return _cursor_env_path_nonblank("CURSOR_DATA_DIR") or Path.home() / ".cursor"
+
+
+def _cursor_env_path_nonblank(name):
+    value = (os.environ.get(name) or "").strip()
+    return Path(value).expanduser() if value else None
+
+
+def cursor_roots():
+    config = _cursor_cursor_config_dir()
+    return [config / "chats", config / "acp-sessions", _cursor_cursor_data_dir() / "projects"]
+
+
+def _cursor_cursor_stores():
+    chats, acp, _ = cursor_roots()
+    stores = []
+    for pattern_root, pattern in ((chats, "*/*/store.db"), (acp, "*/store.db")):
+        try:
+            if pattern_root.is_dir():
+                stores.extend(pattern_root.glob(pattern))
+        except OSError:
+            pass
+    return stores
+
+
+def _cursor_cursor_transcripts():
+    """agent id -> transcript path (.jsonl preferred over .txt)."""
+    root = cursor_roots()[2]
+    found = {}
+    try:
+        project_dirs = [p for p in root.iterdir() if p.is_dir()] if root.is_dir() else []
+    except OSError:
+        project_dirs = []
+    for project in project_dirs:
+        base = project / "agent-transcripts"
+        if not base.is_dir():
+            continue
+        for pattern in ("*.txt", "*.jsonl", "*/*.txt", "*/*.jsonl", "*/subagents/*.txt", "*/subagents/*.jsonl"):
+            for path in base.glob(pattern):
+                if path.suffix == ".jsonl" or path.stem not in found:
+                    found[path.stem] = path
+    return found
+
+
+def cursor_list():
+    logs, store_ids = [], set()
+    for db in _cursor_cursor_stores():
+        agent_id = db.parent.name
+        store_ids.add(agent_id)
+        size, mtime = 0, 0.0
+        for part in (db, Path(str(db) + "-wal")):
+            try:
+                st = part.stat()
+            except OSError:
+                continue
+            size += st.st_size
+            mtime = max(mtime, st.st_mtime)
+        if mtime:
+            logs.append((f"{db}#{agent_id}", mtime, size, "cursor"))
+    rest = [p for stem, p in _cursor_cursor_transcripts().items() if stem not in store_ids]
+    return logs + _file_logs(sorted(rest), "cursor")
+
+
+# ── store.db ────────────────────────────────────────────────────────────────
+
+def _cursor_pb_fields(data):
+    """Minimal protobuf reader: [(field_number, wire_type, value)]; raises on malformed input."""
+    out, i, n = [], 0, len(data)
+
+    def varint(pos):
+        shift = result = 0
+        while True:
+            if pos >= n:
+                raise ValueError("truncated varint")
+            b = data[pos]
+            pos += 1
+            result |= (b & 0x7F) << shift
+            if not b & 0x80:
+                return result, pos
+            shift += 7
+
+    while i < n:
+        key, i = varint(i)
+        field, wire = key >> 3, key & 7
+        if wire == 0:
+            value, i = varint(i)
+        elif wire == 1:
+            value, i = data[i:i + 8], i + 8
+        elif wire == 2:
+            length, i = varint(i)
+            value, i = data[i:i + length], i + length
+        elif wire == 5:
+            value, i = data[i:i + 4], i + 4
+        else:
+            raise ValueError(f"wire type {wire}")
+        if i > n:
+            raise ValueError("truncated field")
+        out.append((field, wire, value))
+    return out
+
+
+def _cursor_cursor_meta(con):
+    try:
+        row = con.execute("SELECT value FROM meta WHERE key='0'").fetchone()
+        raw = row[0] if row else ""
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        try:
+            return json.loads(bytes.fromhex(raw.strip()).decode("utf-8", "replace"))
+        except ValueError:
+            return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def _cursor_cursor_blob(con, blob_id):
+    if isinstance(blob_id, (bytes, bytearray)):
+        blob_id = bytes(blob_id).hex()
+    try:
+        row = con.execute("SELECT data FROM blobs WHERE id=?", (blob_id,)).fetchone()
+    except sqlite3.Error:
+        return None
+    return bytes(row[0]) if row and row[0] is not None else None
+
+
+def _cursor_cursor_root(con):
+    meta = _cursor_cursor_meta(con)
+    root_id = meta.get("latestRootBlobId")
+    if isinstance(root_id, dict) and isinstance(root_id.get("hex"), str):
+        root_id = root_id["hex"]
+    if isinstance(root_id, list):
+        root_id = bytes(root_id).hex()
+    data = _cursor_cursor_blob(con, root_id) if isinstance(root_id, str) and root_id else None
+    try:
+        return meta, (_cursor_pb_fields(data) if data else [])
+    except ValueError:
+        return meta, []
+
+
+def _cursor_cursor_store_messages(key):
+    db = key.split("#", 1)[0]
+    try:
+        con = _ro_connect(db)
+    except sqlite3.Error:
+        return {}, [], []
+    try:
+        meta, root = _cursor_cursor_root(con)
+        ids = []
+        for field, wire, value in root:
+            if field == 13 and wire == 2:  # summary_archives → SummaryArchive.summarized_messages
+                archive = _cursor_cursor_blob(con, value) if len(value) == 32 else value
+                try:
+                    ids.extend(v for f, w, v in _cursor_pb_fields(archive or b"") if f == 1 and w == 2)
+                except ValueError:
+                    pass
+        ids.extend(v for f, w, v in root if f == 1 and w == 2)
+        messages = []
+        for blob_id in ids:
+            data = _cursor_cursor_blob(con, blob_id) if len(blob_id) == 32 else blob_id
+            try:
+                msg = json.loads((data or b"").decode("utf-8", "replace"))
+            except Exception:
+                continue
+            if isinstance(msg, dict):
+                messages.append(msg)
+        workspaces = []
+        for f, w, v in root:
+            if f == 9 and w == 2:
+                try:
+                    workspaces.append(v.decode("utf-8"))
+                except UnicodeDecodeError:
+                    pass
+        return meta, messages, workspaces
+    except sqlite3.Error:
+        return {}, [], []
+    finally:
+        con.close()
+
+
+def _cursor_cursor_user_text(text):
+    queries = _cursor_CURSOR_QUERY_RE.findall(text or "")
+    if queries:
+        return "\n".join(q.strip() for q in queries if q.strip())
+    return _cursor_CURSOR_TAG_RE.sub("", text or "").strip()
+
+
+def _cursor_cursor_result_output(part):
+    for field in ("result", "output", "content", "experimental_content"):
+        value = part.get(field)
+        if value is None:
+            continue
+        if isinstance(value, dict) and value.get("type") in ("text", "json", "error-text", "error-json", "content") \
+                and "value" in value:
+            value = value["value"]
+        if isinstance(value, dict):
+            texts = [str(value[k]) for k in ("stdout", "output", "stderr", "error", "text", "content")
+                     if isinstance(value.get(k), (str, int, float)) and str(value[k]).strip()]
+            if texts:
+                return "\n".join(texts)
+        return value
+    return None
+
+
+def _cursor_cursor_args(args):
+    if isinstance(args, str):
+        try:
+            return json.loads(args)
+        except Exception:
+            return args
+    return args
+
+
+def _cursor_cursor_store_turns(messages):
+    calls = {}
+    for msg in messages:
+        role, content = msg.get("role"), msg.get("content")
+        if role == "system" or ((msg.get("providerOptions") or {}).get("cursor") or {}).get("isSummary"):
+            continue
+        parts = [{"type": "text", "text": content}] if isinstance(content, str) else content
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type")
+            if kind == "text" and role == "user":
+                text = _cursor_cursor_user_text(part.get("text"))
+                if text:
+                    yield "user", text
+            elif kind == "text" and role == "assistant":
+                text = _cursor_CURSOR_THINK_RE.sub("", part.get("text") or "").strip()
+                if text:
+                    yield "assistant", text
+            elif kind == "tool-call":
+                args = _cursor_cursor_args(part.get("args", part.get("input")))
+                calls[part.get("toolCallId")] = _call_label(part.get("toolName"), args)
+                cmd = _shell_cmd(part.get("toolName"), args)
+                if cmd:
+                    yield "cmd", cmd
+            elif kind == "tool-result":
+                label = calls.get(part.get("toolCallId")) or part.get("toolName") or "tool"
+                output = _cursor_cursor_result_output(part)
+                if part.get("isError") and isinstance(output, str):
+                    output = "error\n" + output
+                turn = tool_turn(label, output)
+                if turn:
+                    yield turn
+
+
+# ── agent-transcripts ───────────────────────────────────────────────────────
+
+def _cursor_cursor_jsonl_turns(path):
+    try:
+        handle = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with handle:
+        for line in handle:
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            role = obj.get("role") if isinstance(obj, dict) else None
+            if role not in ("user", "assistant"):
+                continue
+            content = (obj.get("message") or {}).get("content")
+            parts = [{"type": "text", "text": content}] if isinstance(content, str) else content
+            for part in parts if isinstance(parts, list) else []:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    text = part.get("text") or ""
+                    text = _cursor_cursor_user_text(text) if role == "user" else _cursor_CURSOR_THINK_RE.sub("", text).strip()
+                    if text:
+                        yield role, text
+                elif part.get("type") == "tool_use":
+                    cmd = _shell_cmd(part.get("name"), _cursor_cursor_args(part.get("input")))
+                    if cmd:
+                        yield "cmd", cmd
+
+
+def _cursor_cursor_txt_args(lines):
+    args = {}
+    for line in lines:
+        key, sep, value = line.strip().partition(": ")
+        if not sep:
+            key, sep, value = line.strip().partition("=")
+        if sep and key:
+            args[key.strip()] = value.strip()
+    return args
+
+
+def _cursor_cursor_txt_turns(path):
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").split("\n")
+    except OSError:
+        return
+    role, buf, i = None, [], 0
+
+    def flush():
+        text = "\n".join(buf).strip()
+        if role == "user":
+            text = _cursor_cursor_user_text(text)
+        return (role, text) if role and text else None
+
+    while i < len(lines):
+        line = lines[i]
+        bare = line.rstrip()
+        if bare in ("user:", "assistant:"):
+            turn = flush()
+            if turn:
+                yield turn
+            role, buf, i = bare[:-1], [], i + 1
+            continue
+        marker = line.strip()
+        if marker.startswith(("[Thinking]", "[Tool call] ", "[Tool result]")) and not line[:1].isspace():
+            turn = flush()
+            if turn:
+                yield turn
+            buf, i = [], i + 1
+            body = []
+            while i < len(lines) and (not lines[i].strip() or lines[i][:1] in (" ", "\t")):
+                body.append(lines[i])
+                i += 1
+            if marker.startswith("[Tool call] "):
+                cmd = _shell_cmd(marker[len("[Tool call] "):].strip(), _cursor_cursor_txt_args(body))
+                if cmd:
+                    yield "cmd", cmd
+            elif marker.startswith("[Tool result]") and any(b.strip() for b in body):
+                turn = tool_turn(marker[len("[Tool result]"):].strip() or "tool", "\n".join(body))
+                if turn:
+                    yield turn
+            continue
+        buf.append(line)
+        i += 1
+    turn = flush()
+    if turn:
+        yield turn
+
+
+def cursor_iter(key):
+    if "#" in key:
+        _, messages, _ = _cursor_cursor_store_messages(key)
+        turns = list(_cursor_cursor_store_turns(messages))
+        if turns:
+            yield from turns
+            return
+        transcript = _cursor_cursor_transcripts().get(key.rsplit("#", 1)[1])
+        if not transcript:
+            return
+        key = str(transcript)
+    if key.endswith(".txt"):
+        yield from _cursor_cursor_txt_turns(key)
+    else:
+        yield from _cursor_cursor_jsonl_turns(key)
+
+
+def _cursor_cursor_slug_project(path):
+    parts = Path(path).parts
+    if "agent-transcripts" in parts:
+        slug = parts[parts.index("agent-transcripts") - 1]
+        decoded = decode_encoded_dir("-" + slug)
+        return decoded if decoded.startswith("/") and Path(decoded).is_dir() else ""
+    return ""
+
+
+def cursor_project(key):
+    if "#" in key:
+        _, messages, workspaces = _cursor_cursor_store_messages(key)
+        for uri in workspaces:
+            if uri.startswith("file://"):
+                from urllib.parse import unquote
+                return unquote(uri[len("file://"):])
+            if uri.startswith("/"):
+                return uri
+        for msg in messages[:3]:
+            text = msg.get("content") if isinstance(msg.get("content"), str) else _text_of(msg.get("content"))
+            m = _cursor_CURSOR_WS_RE.search(text or "")
+            if m:
+                return m.group(1).strip()
+        db = Path(key.split("#", 1)[0])
+        if db.parent.parent.parent.name == "acp-sessions" or db.parent.parent.name == "acp-sessions":
+            try:
+                return json.loads((db.parent / "meta.json").read_text()).get("cwd") or ""
+            except Exception:
+                pass
+        transcript = _cursor_cursor_transcripts().get(key.rsplit("#", 1)[1])
+        if transcript:
+            return _cursor_cursor_slug_project(transcript)
+        # chats/<md5(cwd)>: confirm a candidate cwd from any transcript project folder
+        digest = db.parent.parent.name
+        for path in _cursor_cursor_transcripts().values():
+            cand = _cursor_cursor_slug_project(path)
+            if cand and hashlib.md5(cand.encode()).hexdigest() == digest:
+                return cand
+        return ""
+    return _cursor_cursor_slug_project(key)
+
+
+def cursor_title(key):
+    if "#" not in key:
+        return ""
+    try:
+        con = _ro_connect(key.split("#", 1)[0])
+        try:
+            name = _cursor_cursor_meta(con).get("name")
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return ""
+    return name if isinstance(name, str) else ""
+
+
+# ── fixture ─────────────────────────────────────────────────────────────────
+
+def _cursor_pb_varint(value):
+    out = bytearray()
+    while True:
+        b = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def _cursor_pb_bytes(field, payload):
+    return _cursor_pb_varint((field << 3) | 2) + _cursor_pb_varint(len(payload)) + payload
+
+
+# ── Kiro CLI (kiro) ──────────────────────────────────────────────────────────
+# Kiro CLI (AWS) parser for navcom.
+#
+# Three storage generations, all handled:
+#
+#   V2 (default engine in kiro-cli 2.27):
+#     $KIRO_HOME (default ~/.kiro)/sessions/cli/<uuid>.jsonl   + <uuid>.json sidecar
+#     lines: {"kind": Prompt|AssistantMessage|ToolResults|Compaction|ResetTo|CancelledPrompt|Clear,
+#             "data": {"content": [{"kind": text|toolUse|toolResult|image|thinking, "data": ...}]}}
+#     sidecar: {session_id, cwd, title|null, created_at, updated_at, session_created_reason, session_state}
+#   KAS ("V3" Kiro Agent Server, opt-in):
+#     $KIRO_HOME/sessions[/<workspace>]/sess_<uuid>/messages.jsonl + session.json
+#     lines: {"timestamp", "payload": {"type": user|assistant|tool_call|tool_result|..., ...}}
+#   V1 (legacy chat-cli / Amazon Q lineage): SQLite data.sqlite3 table conversations_v2
+#     macOS ~/Library/Application Support/kiro-cli/data.sqlite3, Linux $XDG_DATA_HOME/kiro-cli/data.sqlite3
+#     value JSON: {conversation_id, history: [{user{content{Prompt{prompt}|ToolUseResults{...}|CancelledToolUses{...}},
+#                  additional_context, env_context}, assistant{Response{content}|ToolUse{content, tool_uses}}}]}
+
+_kiro_KIRO_SHELL_TOOLS = ("shell", "execute_bash", "execute_cmd", "executeBash", "bash")
+
+
+def kiro_home():
+    return _env_path("KIRO_HOME") or Path.home() / ".kiro"
+
+
+def kiro_db_paths():
+    if sys.platform == "darwin":
+        base = [Path.home() / "Library" / "Application Support" / "kiro-cli"]
+    else:
+        base = []
+    base.append(_xdg_data_home() / "kiro-cli")
+    return [b / "data.sqlite3" for b in base]
+
+
+def kiro_roots():
+    return [kiro_home() / "sessions"] + kiro_db_paths()
+
+
+def _kiro_kiro_db_logs(db):
+    logs = []
+    try:
+        conn = _ro_connect(db)
+        try:
+            rows = conn.execute("SELECT conversation_id, MAX(updated_at), length(value) FROM conversations_v2 "
+                                "GROUP BY conversation_id").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return logs
+    for conv_id, updated, size in rows:
+        logs.append((f"{db}#{conv_id}", _epoch_seconds(updated), int(size or 0), "kiro"))
+    return logs
+
+
+def kiro_list():
+    root = kiro_home() / "sessions"
+    files = [p for p in (list(root.glob("cli/*.jsonl")) + list(root.glob("*.jsonl"))) if p.is_file()]
+    files += list(root.glob("sess_*/messages.jsonl")) + list(root.glob("*/sess_*/messages.jsonl"))
+    logs = [log for log in _file_logs(files, "kiro") if log[2] > 0]  # failed first turns leave 0-byte logs
+    for db in kiro_db_paths():
+        if db.is_file():
+            logs.extend(_kiro_kiro_db_logs(db))
+    return logs
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def _kiro_kiro_result_text(content):
+    """Tool result content: str | [{"kind":"text"|"json","data"}] | [{"Text"}|{"Json"}] | dict."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(t for t in (_kiro_kiro_result_text(c) for c in content) if t)
+    if isinstance(content, dict):
+        if "kind" in content and "data" in content:
+            return _kiro_kiro_result_text(content["data"])
+        for key in ("Text", "text", "Json", "json"):
+            if key in content:
+                return _kiro_kiro_result_text(content[key])
+        parts = [str(content[k]) for k in ("stdout", "stderr", "output", "content")
+                 if isinstance(content.get(k), (str, int, float)) and str(content[k]).strip()]
+        if parts:
+            code = content.get("exit_status", content.get("exitCode"))
+            prefix = f"exit {code}\n" if code not in (None, 0, "0") else ""
+            return prefix + "\n".join(parts)
+        return json.dumps(content, ensure_ascii=False)[:20000]
+    return str(content)
+
+
+def _kiro_kiro_call(calls, call_id, name, args):
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:
+            pass
+    calls[call_id] = _call_label(name, args)
+    cmd = None
+    if (name or "") in _kiro_KIRO_SHELL_TOOLS and isinstance(args, dict):
+        cmd = args.get("command") or args.get("cmd")
+        cmd = cmd.strip() if isinstance(cmd, str) else None
+    return cmd or _shell_cmd(name, args)
+
+
+def _kiro_kiro_result_turn(calls, call_id, content, status=None):
+    output = _kiro_kiro_result_text(content)
+    if str(status or "").lower() in ("error", "failed"):
+        output = "error\n" + output
+    return tool_turn(calls.get(call_id, "tool"), output)
+
+
+def _kiro_kiro_blocks(data):
+    content = (data or {}).get("content") if isinstance(data, dict) else None
+    return content if isinstance(content, list) else []
+
+
+# ── V2 JSONL ─────────────────────────────────────────────────────────────────
+
+def _kiro_iter_kiro_v2(handle):
+    calls = {}
+    for line in handle:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        kind, data = obj.get("kind"), obj.get("data") or {}
+        if kind == "Prompt":
+            text = "\n\n".join(b["data"].strip() for b in _kiro_kiro_blocks(data)
+                               if isinstance(b, dict) and b.get("kind") == "text"
+                               and isinstance(b.get("data"), str) and b["data"].strip())
+            if text:
+                yield "user", text
+        elif kind == "AssistantMessage":
+            texts = []
+            for block in _kiro_kiro_blocks(data):
+                if not isinstance(block, dict):
+                    continue
+                if block.get("kind") == "text" and isinstance(block.get("data"), str):
+                    texts.append(block["data"])
+                elif block.get("kind") == "toolUse" and isinstance(block.get("data"), dict):
+                    if texts:
+                        yield "assistant", "\n".join(texts)
+                        texts = []
+                    tu = block["data"]
+                    cmd = _kiro_kiro_call(calls, tu.get("toolUseId"), tu.get("name"), tu.get("input"))
+                    if cmd:
+                        yield "cmd", cmd
+            if "".join(texts).strip():
+                yield "assistant", "\n".join(texts)
+        elif kind == "ToolResults":
+            for block in _kiro_kiro_blocks(data):
+                if isinstance(block, dict) and block.get("kind") == "toolResult" and isinstance(block.get("data"), dict):
+                    tr = block["data"]
+                    turn = _kiro_kiro_result_turn(calls, tr.get("toolUseId"), tr.get("content"), tr.get("status"))
+                    if turn:
+                        yield turn
+        # Compaction (generated summary), ResetTo, CancelledPrompt, Clear: not typed text
+
+
+# ── KAS messages.jsonl ───────────────────────────────────────────────────────
+
+def _kiro_iter_kiro_kas(handle):
+    calls = {}
+    for line in handle:
+        try:
+            payload = (json.loads(line) or {}).get("payload") or {}
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        typ = payload.get("type")
+        content = payload.get("content")
+        if typ in ("user", "assistant"):
+            text = content if isinstance(content, str) else _text_of(content)
+            if text and text.strip():
+                yield typ, text.strip()
+        elif typ == "tool_call":
+            cmd = _kiro_kiro_call(calls, payload.get("toolCallId"), payload.get("toolName"), payload.get("args"))
+            if cmd:
+                yield "cmd", cmd
+        elif typ == "tool_result":
+            turn = _kiro_kiro_result_turn(calls, payload.get("toolCallId"), content, payload.get("status"))
+            if turn:
+                yield turn
+
+
+# ── V1 SQLite ────────────────────────────────────────────────────────────────
+
+def _kiro_kiro_db_row(key):
+    db, _, conv_id = key.rpartition("#")
+    try:
+        conn = _ro_connect(db)
+        try:
+            return conn.execute("SELECT key, value FROM conversations_v2 WHERE conversation_id = ? "
+                                "ORDER BY updated_at DESC LIMIT 1", (conv_id,)).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def _kiro_iter_kiro_db(key):
+    row = _kiro_kiro_db_row(key)
+    if not row:
+        return
+    try:
+        conv = json.loads(row[1])
+    except Exception:
+        return
+    calls = {}
+    for entry in conv.get("history") or []:
+        if not isinstance(entry, dict):
+            continue
+        user = entry.get("user") or {}
+        content = user.get("content") or {}
+        # user.additional_context / env_context are injected by the CLI: skipped
+        if isinstance(content, dict):
+            for variant in ("Prompt", "CancelledToolUses"):
+                prompt = (content.get(variant) or {}).get("prompt") if isinstance(content.get(variant), dict) else None
+                if isinstance(prompt, str) and prompt.strip():
+                    yield "user", prompt.strip()
+            for variant in ("ToolUseResults", "CancelledToolUses"):
+                block = content.get(variant)
+                for res in (block or {}).get("tool_use_results") or [] if isinstance(block, dict) else []:
+                    if isinstance(res, dict):
+                        turn = _kiro_kiro_result_turn(calls, res.get("tool_use_id"), res.get("content"), res.get("status"))
+                        if turn:
+                            yield turn
+        assistant = entry.get("assistant") or {}
+        for variant in ("Response", "ToolUse"):
+            msg = assistant.get(variant)
+            if not isinstance(msg, dict):
+                continue
+            if isinstance(msg.get("content"), str) and msg["content"].strip():
+                yield "assistant", msg["content"]
+            for tu in msg.get("tool_uses") or []:
+                if isinstance(tu, dict):
+                    cmd = _kiro_kiro_call(calls, tu.get("id"), tu.get("name"), tu.get("args"))
+                    if cmd:
+                        yield "cmd", cmd
+
+
+def kiro_iter(key):
+    if "#" in key and not key.endswith(".jsonl"):
+        yield from _kiro_iter_kiro_db(key)
+        return
+    try:
+        handle = open(key, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with handle:
+        if Path(key).name == "messages.jsonl":
+            yield from _kiro_iter_kiro_kas(handle)
+        else:
+            yield from _kiro_iter_kiro_v2(handle)
+
+
+def _kiro_kiro_sidecar(key):
+    path = Path(key)
+    side = path.parent / "session.json" if path.name == "messages.jsonl" else path.with_suffix(".json")
+    try:
+        data = json.loads(side.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def kiro_project(key):
+    if "#" in key and not key.endswith(".jsonl"):
+        row = _kiro_kiro_db_row(key)
+        return row[0] if row and isinstance(row[0], str) else ""
+    side = _kiro_kiro_sidecar(key)
+    if isinstance(side.get("cwd"), str):
+        return side["cwd"]
+    paths = side.get("workspacePaths")
+    return paths[0] if isinstance(paths, list) and paths and isinstance(paths[0], str) else ""
+
+
+def kiro_title(key):
+    if "#" in key and not key.endswith(".jsonl"):
+        return ""
+    title = _kiro_kiro_sidecar(key).get("title")
+    return title.strip() if isinstance(title, str) else ""
+
+
+# ── fixture ──────────────────────────────────────────────────────────────────
+
+
+# ── Amp (amp) ────────────────────────────────────────────────────────────────
+# Amp (ampcode.com, npm @ampcode/cli, formerly @sourcegraph/amp) parser for navcom.
+#
+# Local thread cache: $XDG_DATA_HOME/amp/threads/T-<uuid>.json (default ~/.local/share/amp, also on macOS;
+# the CLI honours XDG_DATA_HOME on darwin too). The server (ampcode.com) is the source of truth; the
+# local file is one JSON document per thread:
+#   {v, id, created(ms), title?, env{initial{trees[{displayName, uri:file://...}]}}, meta{traces},
+#    messages[{role: user|assistant|info, messageId, content[...], meta{sentAt}, usage, state}]}
+#   user content:      {type:text,text} | {type:tool_result, toolUseID, run{status, result|error}}
+#   assistant content: {type:text,text} | {type:thinking,thinking} | {type:tool_use, id, name, input}
+#   role "info" (ThreadInfoMessage) is injected by Amp, not typed.
+
+_amp_AMP_SHELL_TOOLS = ("Bash", "shell_command", "async_shell_command")
+
+
+def amp_roots():
+    return [_xdg_data_home() / "amp" / "threads"]
+
+
+def amp_list():
+    files = []
+    for root in amp_roots():
+        if root.is_dir():
+            files.extend(p for p in root.glob("T-*.json") if p.is_file())
+    return _file_logs(files, "amp")
+
+
+def _amp_amp_load(key):
+    try:
+        data = json.loads(Path(key).read_text(encoding="utf-8", errors="replace"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _amp_amp_result_text(result):
+    """Mirror of agentsview serializeAmpResult: Bash {output,exitCode}, Read {content}, Edit {diff}, lists."""
+    if result is None:
+        return ""
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        for key in ("output", "content", "diff"):
+            if key in result:
+                text = _amp_amp_result_text(result[key])
+                if text:
+                    code = result.get("exitCode")
+                    return (f"exit {code}\n" if key == "output" and code not in (None, 0) else "") + text
+        if "success" in result:
+            return "success" if result["success"] else "failed"
+        if any(k in result for k in ("output", "content", "diff")):
+            return ""
+        return json.dumps(result, ensure_ascii=False)[:20000]
+    if isinstance(result, list):
+        if result and all(isinstance(i, str) for i in result):
+            return "\n".join(result)
+        if result and isinstance(result[0], dict) and result[0].get("type") == "image":
+            return ""
+        return json.dumps(result, ensure_ascii=False)[:20000] if result else ""
+    return json.dumps(result)
+
+
+def amp_iter(key):
+    calls = {}
+    for msg in _amp_amp_load(key).get("messages") or []:
+        if not isinstance(msg, dict) or msg.get("role") not in ("user", "assistant"):
+            continue  # "info" messages are Amp-injected
+        role, content = msg["role"], msg.get("content")
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        texts = []
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if kind == "text" and isinstance(block.get("text"), str):
+                texts.append(block["text"])
+                continue
+            if kind not in ("tool_use", "tool_result"):
+                continue  # thinking, redacted_thinking, image
+            if texts and "".join(texts).strip():
+                yield role, "\n".join(texts)
+            texts = []
+            if kind == "tool_use":
+                name, args = block.get("name"), block.get("input")
+                calls[block.get("id")] = _call_label(name, args)
+                cmd = None
+                if name in _amp_AMP_SHELL_TOOLS and isinstance(args, dict):
+                    cmd = args.get("cmd") or args.get("command")
+                cmd = cmd.strip() if isinstance(cmd, str) else _shell_cmd(name, args)
+                if cmd:
+                    yield "cmd", cmd
+            else:
+                call_id = block.get("toolUseID") or block.get("tool_use_id")
+                run = block.get("run") if isinstance(block.get("run"), dict) else {}
+                if run:
+                    status = run.get("status")
+                    output = _amp_amp_result_text(run.get("result"))
+                    if status == "error" and not output:
+                        output = (run.get("error") or {}).get("message") or "[unknown error]"
+                    if status == "error" or (isinstance(run.get("result"), dict) and run["result"].get("success") is False):
+                        output = "error\n" + output
+                    elif status == "cancelled" and not output:
+                        output = "[cancelled]"
+                else:
+                    output = block.get("content")
+                turn = tool_turn(calls.get(call_id, "tool"), output)
+                if turn:
+                    yield turn
+        if texts and "".join(texts).strip():
+            yield role, "\n".join(texts)
+
+
+def amp_project(key):
+    trees = ((_amp_amp_load(key).get("env") or {}).get("initial") or {}).get("trees") or []
+    for tree in trees:
+        uri = tree.get("uri") if isinstance(tree, dict) else None
+        if isinstance(uri, str) and uri.startswith("file://"):
+            return unquote(urlparse(uri).path)
+    return ""
+
+
+def amp_title(key):
+    title = _amp_amp_load(key).get("title")
+    return title.strip() if isinstance(title, str) else ""
+
+
+# ── Augment Auggie (auggie) ──────────────────────────────────────────────────
+# Augment Code CLI `auggie` (npm @augmentcode/auggie) — one JSON file per session.
+#
+# Store: <augmentCacheDir>/sessions/<conversationId>.json, augmentCacheDir = ~/.augment (only override is the
+# --augment-cache-dir flag; no env var). Siblings `<id>-backup<N>.json` (pre-rewind backups) and
+# `<id>.json.<ms>.tmp` (atomic-write temp) are not sessions.
+#
+# File (SessionManager.saveSession in augment.mjs 0.36.0):
+#   {sessionId, created, modified, title?, customTitle?, workspaceId?, parentConversationId?,
+#    agentState{userGuidelines, workspaceGuidelines, modelId, userEmail, agentPersonaId},
+#    chatHistory: [{exchange{request_message, response_text, request_id, request_nodes[], response_nodes[]},
+#                   completed, sequenceId, finishedAt, isHistorySummary, source}]}
+#   request_nodes  type 0 text_node{content} | 1 tool_result_node{tool_use_id, content, is_error, content_nodes}
+#                  | 2 image | 4 ide_state_node{workspace_folders[{repository_root, folder_root}], current_terminal}
+#                  | 10 history_summary_node (compaction)
+#   response_nodes type 0 {content} text | 5 tool_use{tool_use_id, tool_name, input_json} | 8 thinking | ...
+#   Shell tool: tool_name "launch-process", input {command, wait, max_wait_seconds, cwd}.
+#
+# Mapping: request_message -> user (exchanges that are history summaries are injected, skipped);
+# tool_result_node -> tool (results for the previous exchange's tool_use); response_text -> assistant;
+# tool_use launch-process -> cmd. agentState guidelines = injected rules, never indexed.
+
+_auggie_AUGGIE_NOT_SESSION = re.compile(r"-backup\d+\.json$")
+_auggie_AUGGIE_SHELL_TOOLS = ("launch-process",)
+
+
+def auggie_roots():
+    return [Path.home() / ".augment" / "sessions"]
+
+
+def auggie_list():
+    paths = []
+    for root in auggie_roots():
+        try:
+            paths += [p for p in root.glob("*.json") if not _auggie_AUGGIE_NOT_SESSION.search(p.name)]
+        except OSError:
+            pass
+    return [(k, m, s, "auggie") for k, m, s, _ in _file_logs(paths, "auggie")]
+
+
+def _auggie_auggie_load(key):
+    try:
+        data = json.loads(Path(key).read_text(encoding="utf-8", errors="replace"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _auggie_auggie_args(raw):
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return raw
+    return raw
+
+
+def _auggie_auggie_result_text(node):
+    content = node.get("content")
+    if not (isinstance(content, str) and content.strip()):
+        content = "\n".join(n.get("text_content") or "" for n in node.get("content_nodes") or []
+                            if isinstance(n, dict) and n.get("text_content"))
+    if node.get("is_error"):
+        content = "error\n" + (content or "")
+    return content
+
+
+def _auggie_is_summary(entry, exchange):
+    if entry.get("isHistorySummary"):
+        return True
+    return any(isinstance(n, dict) and (n.get("type") == 10 or n.get("history_summary_node"))
+               for n in exchange.get("request_nodes") or [])
+
+
+def auggie_iter(key):
+    calls = {}
+    for entry in _auggie_auggie_load(key).get("chatHistory") or []:
+        if not isinstance(entry, dict):
+            continue
+        ex = entry.get("exchange") or {}
+        summary = _auggie_is_summary(entry, ex)
+        user = ex.get("request_message")
+        if isinstance(user, str) and user.strip() and not summary:
+            yield "user", user
+        for node in ex.get("request_nodes") or []:
+            result = node.get("tool_result_node") if isinstance(node, dict) else None
+            if isinstance(result, dict):
+                turn = tool_turn(calls.get(result.get("tool_use_id"), "tool"), _auggie_auggie_result_text(result))
+                if turn:
+                    yield turn
+        if summary:
+            continue
+        nodes = [n for n in ex.get("response_nodes") or [] if isinstance(n, dict)]
+        text = ex.get("response_text")
+        if not (isinstance(text, str) and text.strip()):
+            text = "".join(n.get("content") or "" for n in nodes if n.get("type") == 0 and isinstance(n.get("content"), str))
+        if text and text.strip():
+            yield "assistant", text
+        for node in nodes:
+            use = node.get("tool_use")
+            if not isinstance(use, dict):
+                continue
+            name, args = use.get("tool_name"), _auggie_auggie_args(use.get("input_json"))
+            calls[use.get("tool_use_id")] = _call_label(name, args)
+            cmd = _shell_cmd(name, args)
+            if not cmd and name in _auggie_AUGGIE_SHELL_TOOLS and isinstance(args, dict):
+                cmd = (args.get("command") or "").strip() or None
+            if cmd:
+                yield "cmd", cmd
+
+
+def auggie_project(key):
+    """Same rule as auggie's own j1t(): first ide_state_node workspace folder, else the terminal cwd."""
+    terminal = ""
+    for entry in _auggie_auggie_load(key).get("chatHistory") or []:
+        for node in ((entry or {}).get("exchange") or {}).get("request_nodes") or []:
+            state = node.get("ide_state_node") if isinstance(node, dict) else None
+            if not isinstance(state, dict):
+                continue
+            for folder in state.get("workspace_folders") or []:
+                root = (folder or {}).get("repository_root") or (folder or {}).get("folder_root")
+                if root:
+                    return root
+            terminal = terminal or ((state.get("current_terminal") or {}).get("current_working_directory") or "")
+    return terminal
+
+
+def auggie_title(key):
+    data = _auggie_auggie_load(key)
+    return data.get("customTitle") or data.get("title") or ""
+
+
+# ── grok-dev (community Grok CLI) (grokdev) ──────────────────────────────────
+# grok-dev (community superagent-ai/grok-cli, npm `grok-dev`) — SQLite store ~/.grok/grok.db.
+#
+# Shares ~/.grok with xAI's official Grok Build CLI (~/.grok/sessions/*/updates.jsonl), but this is a
+# different file. Path is hard-coded: os.homedir()/.grok/grok.db (dist/storage/db.js) — no env override.
+#
+# Schema (dist/storage/migrations.js, user_version 3):
+#   workspaces(id, scope_key, canonical_path, git_root, display_name, last_seen_at)
+#   sessions(id, workspace_id, title, recap_text, recap_model, recap_updated_at, model, mode,
+#            cwd_at_start, cwd_last, status, created_at, updated_at)
+#   messages(session_id, seq, role, message_json, created_at)   -- message_json = Vercel AI SDK ModelMessage
+#   tool_calls / tool_results / usage_events / compactions        -- denormalised copies; not needed
+#
+# message_json roles:
+#   user      {"content": str | [{type:"text",text} | {type:"image",...}]}        -> user
+#   assistant {"content": str | [{type:"text"} | {type:"reasoning"} | {type:"tool-call",toolCallId,toolName,input}]}
+#   tool      {"content": [{type:"tool-result",toolCallId,toolName,output:{type:"json"|"text"|"error-text",value}}]}
+#   system    background-task notifications + compaction summaries                 -> skipped (injected)
+
+def grokdev_db_path():
+    return Path.home() / ".grok" / "grok.db"
+
+
+def grokdev_roots():
+    return [grokdev_db_path()]
+
+
+def grokdev_list():
+    db = grokdev_db_path()
+    if not db.is_file():
+        return []
+    try:
+        conn = _ro_connect(db)
+        rows = conn.execute("""
+            SELECT s.id, s.updated_at, COUNT(m.seq), MAX(m.created_at)
+            FROM sessions s LEFT JOIN messages m ON m.session_id = s.id
+            GROUP BY s.id HAVING COUNT(m.seq) > 0""").fetchall()
+        conn.close()
+    except Exception:
+        return []
+    return [(f"{db}#{sid}", max(_epoch_seconds(updated), _epoch_seconds(last)), int(count), "grokdev")
+            for sid, updated, count, last in rows]
+
+
+def _grokdev_split_key(key):
+    db, _, sid = str(key).rpartition("#")
+    return db, sid
+
+
+def _grokdev_grokdev_output(output):
+    """ToolResultOutput -> text: {type:json, value:{success, output, error}} | {type:text|error-text, value}."""
+    if not isinstance(output, dict):
+        return output
+    kind, value = output.get("type"), output.get("value")
+    if kind == "json" and isinstance(value, dict):
+        if "success" in value or "output" in value or "error" in value:
+            text = value.get("output")
+            if not isinstance(text, str):
+                text = json.dumps(text, ensure_ascii=False) if text not in (None, "") else ""
+            if value.get("error"):
+                text = f"error\n{value['error']}\n{text}".rstrip()
+            return text
+        return json.dumps(value, ensure_ascii=False)[:20000]
+    if kind == "error-text":
+        return f"error\n{value}"
+    if kind in ("text", "content"):
+        return value if isinstance(value, str) else _text_of(value)
+    return value if isinstance(value, (str, list)) else json.dumps(output, ensure_ascii=False)[:20000]
+
+
+def grokdev_iter(key):
+    db, sid = _grokdev_split_key(key)
+    try:
+        conn = _ro_connect(db)
+        rows = conn.execute("SELECT role, message_json FROM messages WHERE session_id = ? ORDER BY seq",
+                            (sid,)).fetchall()
+        conn.close()
+    except Exception:
+        return
+    calls = {}
+    for role, raw in rows:
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            continue
+        content = msg.get("content")
+        if role == "user":
+            text = _text_of(content)
+            if text and text.strip():
+                yield "user", text
+        elif role == "assistant":
+            if isinstance(content, str):
+                if content.strip():
+                    yield "assistant", content
+                continue
+            for part in content or []:
+                if not isinstance(part, dict):
+                    continue
+                kind = part.get("type")
+                if kind == "text" and (part.get("text") or "").strip():
+                    yield "assistant", part["text"]
+                elif kind == "tool-call":
+                    args = part.get("input")
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args) if args.strip() else {}
+                        except Exception:
+                            pass
+                    calls[part.get("toolCallId")] = _call_label(part.get("toolName"), args)
+                    cmd = _shell_cmd(part.get("toolName"), args)
+                    if cmd:
+                        yield "cmd", cmd
+        elif role == "tool":
+            for part in content or []:
+                if isinstance(part, dict) and part.get("type") == "tool-result":
+                    label = calls.get(part.get("toolCallId")) or part.get("toolName") or "tool"
+                    turn = tool_turn(label, _grokdev_grokdev_output(part.get("output")))
+                    if turn:
+                        yield turn
+        # role == "system": background notifications / compaction summaries — injected, skipped
+
+
+def _grokdev_grokdev_session(key):
+    db, sid = _grokdev_split_key(key)
+    try:
+        conn = _ro_connect(db)
+        row = conn.execute("""SELECT s.title, s.cwd_at_start, s.cwd_last, w.canonical_path
+                              FROM sessions s LEFT JOIN workspaces w ON w.id = s.workspace_id
+                              WHERE s.id = ?""", (sid,)).fetchone()
+        conn.close()
+        return row or (None, None, None, None)
+    except Exception:
+        return (None, None, None, None)
+
+
+def grokdev_project(key):
+    title, start, last, workspace = _grokdev_grokdev_session(key)
+    return start or last or workspace or ""
+
+
+def grokdev_title(key):
+    return _grokdev_grokdev_session(key)[0] or ""
+
+
+_grokdev_SCHEMA = """
+CREATE TABLE IF NOT EXISTS workspaces (id TEXT PRIMARY KEY, scope_key TEXT NOT NULL UNIQUE,
+  canonical_path TEXT NOT NULL, git_root TEXT, display_name TEXT NOT NULL, last_seen_at TEXT NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE, title TEXT, recap_text TEXT,
+  recap_model TEXT, recap_updated_at TEXT, model TEXT NOT NULL, mode TEXT NOT NULL, cwd_at_start TEXT NOT NULL,
+  cwd_last TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS messages (session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL, role TEXT NOT NULL, message_json TEXT NOT NULL, created_at TEXT NOT NULL,
+  PRIMARY KEY (session_id, seq)) STRICT;
+CREATE TABLE IF NOT EXISTS tool_calls (id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, message_seq INTEGER NOT NULL,
+  tool_call_id TEXT NOT NULL, tool_name TEXT NOT NULL, args_json TEXT NOT NULL, status TEXT NOT NULL,
+  started_at TEXT NOT NULL, completed_at TEXT, UNIQUE(session_id, tool_call_id)) STRICT;
+CREATE TABLE IF NOT EXISTS tool_results (id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tool_call_row_id INTEGER NOT NULL REFERENCES tool_calls(id) ON DELETE CASCADE, output_kind TEXT NOT NULL,
+  output_json TEXT NOT NULL, success INTEGER NOT NULL, created_at TEXT NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS compactions (id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, first_kept_seq INTEGER NOT NULL,
+  summary TEXT NOT NULL, tokens_before INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL) STRICT;
+"""
+
+
 register_harness('qwen', list_fn=qwen_list, iter_fn=qwen_iter, project_fn=qwen_project,
                  title_fn=qwen_title, roots_fn=qwen_roots, match=lambda p: '/.qwen/' in p,
                  aliases=['qwen-code', 'qwencode', 'alibaba'], color='93', archivable=True, label='Qwen Code',
@@ -7547,6 +9439,30 @@ register_harness('openhands', list_fn=openhands_list, iter_fn=openhands_iter, pr
 register_harness('vibe', list_fn=vibe_list, iter_fn=vibe_iter, project_fn=vibe_project,
                  title_fn=vibe_title, roots_fn=vibe_roots, match=lambda p: '/.vibe/' in p,
                  aliases=['mistral', 'mistral-vibe'], color='91', archivable=True, label='Mistral Vibe')
+register_harness('aider', list_fn=aider_list, iter_fn=aider_iter, project_fn=aider_project,
+                 title_fn=aider_title, roots_fn=aider_roots, match=lambda p: '.aider.chat.history.md' in p,
+                 aliases=['aider-chat'], color='92', archivable=True, label='Aider')
+register_harness('agy', list_fn=agy_list, iter_fn=agy_iter, project_fn=agy_project,
+                 title_fn=agy_title, roots_fn=agy_roots, match=lambda p: '/antigravity' in p,
+                 aliases=['antigravity', 'google-antigravity'], color='94', archivable=True, label='Antigravity CLI')
+register_harness('droid', list_fn=droid_list, iter_fn=droid_iter, project_fn=droid_project,
+                 title_fn=droid_title, roots_fn=droid_roots, match=lambda p: '/.factory/' in p,
+                 aliases=['factory', 'factory-droid'], color='33', archivable=True, label='Factory Droid')
+register_harness('cursor', list_fn=cursor_list, iter_fn=cursor_iter, project_fn=cursor_project,
+                 title_fn=cursor_title, roots_fn=cursor_roots, match=lambda p: '/.cursor/' in p,
+                 aliases=['cursor-agent', 'cursor-cli'], color='97', archivable=True, label='Cursor CLI')
+register_harness('kiro', list_fn=kiro_list, iter_fn=kiro_iter, project_fn=kiro_project,
+                 title_fn=kiro_title, roots_fn=kiro_roots, match=lambda p: '/.kiro/' in p or 'kiro-cli/data.sqlite3#' in p,
+                 aliases=['kiro-cli', 'amazon-q', 'q-cli'], color='33', archivable=True, label='Kiro CLI')
+register_harness('amp', list_fn=amp_list, iter_fn=amp_iter, project_fn=amp_project,
+                 title_fn=amp_title, roots_fn=amp_roots, match=lambda p: '/amp/threads/' in p,
+                 aliases=['sourcegraph-amp', 'ampcode'], color='35', archivable=True, label='Amp')
+register_harness('auggie', list_fn=auggie_list, iter_fn=auggie_iter, project_fn=auggie_project,
+                 title_fn=auggie_title, roots_fn=auggie_roots, match=lambda p: '/.augment/' in p,
+                 aliases=['augment', 'augment-code'], color='36', archivable=True, label='Augment Auggie')
+register_harness('grokdev', list_fn=grokdev_list, iter_fn=grokdev_iter, project_fn=grokdev_project,
+                 title_fn=grokdev_title, roots_fn=grokdev_roots, match=lambda p: '/.grok/grok.db#' in p,
+                 aliases=['grok-cli', 'grok-dev', 'superagent-grok'], color='37', archivable=False, label='grok-dev (community Grok CLI)')
 # <<< registered harnesses
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -8068,14 +9984,22 @@ def print_context(conn, groups, window, max_chars):
 _REF_CACHE = {}
 
 
+def _ref_like(ref):
+    """SQL LIKE pattern that finds the index keys a ref could name."""
+    clean = ref.replace("%", "").replace("_", "\\_")
+    if "@" in clean and clean.rsplit("@", 1)[1].isdigit():
+        folder, n = clean.rsplit("@", 1)
+        return f"%/{folder}/%#{n}"
+    return f"%{clean}%"
+
+
 def display_ref(conn, key, provider=None):
     """The ref to print for a session: its short ref, prefixed with the harness when that
     short ref also names another indexed session (omo imports pi sessions under the same id)."""
     ref = short_ref(key)
     if ref not in _REF_CACHE:
-        like = "%" + ref.replace("%", "").replace("_", "\\_") + "%"
-        others = {f for (f,) in conn.execute("SELECT file FROM file_state WHERE file LIKE ? ESCAPE '\\'", (like,))
-                  if short_ref(f) == ref}
+        others = {f for (f,) in conn.execute("SELECT file FROM file_state WHERE file LIKE ? ESCAPE '\\'",
+                                             (_ref_like(ref),)) if short_ref(f) == ref}
         _REF_CACHE[ref] = len(others | {key}) > 1
     if _REF_CACHE[ref]:
         return f"{provider or detect_provider_from_path(key)}:{ref}"
@@ -8092,11 +10016,11 @@ def resolve_ref(conn, ref, providers=None):
         providers, ref, strict = [prefix.lower()], rest, True
     if conn.execute("SELECT 1 FROM file_state WHERE file=?", (ref,)).fetchone():
         return ref, []
-    like = "%" + ref.replace("%", "").replace("_", "\\_") + "%"
     rows = conn.execute(
-        "SELECT file, mtime FROM file_state WHERE file LIKE ? ESCAPE '\\' ORDER BY mtime DESC", (like,)
+        "SELECT file, mtime FROM file_state WHERE file LIKE ? ESCAPE '\\' ORDER BY mtime DESC", (_ref_like(ref),)
     ).fetchall()
-    matches = [
+    exact = [r for r in rows if session_ref(r[0]) == ref or short_ref(r[0]) == ref]
+    matches = exact or [
         r for r in rows
         if session_ref(r[0]).startswith(ref) or session_ref(r[0]).endswith(ref)
         or Path(r[0].split("#")[-1]).stem.startswith(ref)

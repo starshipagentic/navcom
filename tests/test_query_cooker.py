@@ -58,3 +58,12 @@ def test_fuzz_never_produces_a_syntax_error(navcom, fts):
             expr = cook(q)
             if expr:
                 matches(fts, expr)  # raises on syntax error
+
+
+def test_make_snippet(navcom):
+    assert navcom.make_snippet("/goal ship the zebracorn release", ["zebracorn"]) == "/goal ship the «zebracorn» release"
+    long = " ".join(f"w{i}" for i in range(200)) + " needle " + " ".join(f"v{i}" for i in range(200))
+    snip = navcom.make_snippet(long, ["needle"], tokens=10)
+    assert "«needle»" in snip and snip.startswith("…") and snip.endswith("…")
+    tail = navcom.make_snippet(" ".join(f"w{i}" for i in range(50)) + " needle!", ["needle"], tokens=10)
+    assert tail.endswith("«needle»!") and tail.count(" ") >= 8              # window filled backwards

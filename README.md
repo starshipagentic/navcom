@@ -1,6 +1,6 @@
 # navcom
 
-Super-fast search over your past AI coding sessions, from one command, across 22 harnesses.
+Super-fast search over your past AI coding sessions, from one command, across 30 harnesses.
 
 navcom indexes the transcripts your coding agents already write to disk (SQLite FTS5, incremental) and
 answers "where did we talk about X?" in well under a second. It's built to be called by LLM agents
@@ -30,6 +30,18 @@ from their shell tool, and by you.
 | Hermes Agent | `$HERMES_HOME/state.db` (+ `profiles/*/state.db`) |
 | OpenHands CLI | `~/.openhands/conversations/<id>/events/*.json` |
 | Mistral Vibe | `~/.vibe/logs/session/session_*/messages.jsonl` |
+| Aider | every `.aider.chat.history.md` under `~` (one session per "aider chat started" header; refs `project@N`) |
+| Antigravity CLI (`agy`) | `~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript_full.jsonl` |
+| Factory Droid | `~/.factory/sessions/<cwd>/<id>.jsonl` |
+| grok-dev (community Grok CLI) | `~/.grok/grok.db` |
+| Cursor CLI ¹ | `~/.cursor/chats/<md5(cwd)>/<id>/store.db` (+ `projects/*/agent-transcripts/`) |
+| Kiro CLI ¹ | `~/.kiro/sessions/cli/*.jsonl` (+ KAS `sess_*`, legacy `conversations_v2`) |
+| Amp ¹ | `$XDG_DATA_HOME/amp/threads/T-*.json` |
+| Augment Auggie ¹ | `~/.augment/sessions/*.json` |
+
+¹ These need a vendor account to run, so they were built from the vendor's shipped code and tested
+with format-faithful fixtures. Every other harness above was proven against sessions it actually
+wrote.
 
 Run `navcom --where` to see what it found on your machine.
 
