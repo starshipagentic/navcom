@@ -162,6 +162,9 @@ navcom --resume 7ec78a59 --with claude      # fresh Claude in that folder, prime
 navcom --resume 7ec78a59 --with codex --tab # …or Codex, Gemini, Copilot, opencode, pi, … in a new tab
 ```
 
+Every one of the 30 harnesses works. The 17 that take an opening prompt on their command line start
+already primed. The rest (Kimi, Crush, goose, Hermes, Aider, Amp, …) start plainly: navcom prints the start
+command plus the prompt to paste, and when it launches them for you it puts the prompt on your clipboard.
 Without `--with`, `--resume` on a session that can't be reopened asks which agent to use. In
 `navcom --menu`, `r` on such a session (or `n` on any session) opens a REVIVE picker. A raw
 `--open` of a long session can run to hundreds of KB; the recap is about 8k tokens. In a live test, a

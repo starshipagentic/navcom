@@ -135,3 +135,24 @@ def test_copy_on_a_dead_session_copies_the_revive_line(navcom, indexed, monkeypa
     key = _codex_key(indexed)
     navcom._resume_action(indexed, None, "c", key=key, provider="codex")
     assert "claude " in copied[-1] and "navcom --recap" in copied[-1]
+
+
+def test_every_harness_can_be_revived(navcom, indexed):
+    key = _codex_key(indexed)
+    assert set(navcom.REVIVE_AGENTS) >= set(navcom.ALL_PROVIDERS) - {"opencode-legacy", "goose-legacy", "gemini-jsonl"}
+    for harness in navcom.REVIVE_AGENTS:
+        plan = navcom.revive_plan(indexed, key, harness, "codex")
+        text = navcom.revive_text(plan)
+        assert "navcom --recap " in text, harness
+        assert bool(plan["paste"]) == (harness not in navcom.FRESH_START), harness
+
+
+def test_paste_agents_get_the_prompt_on_the_clipboard_when_started(navcom, indexed, monkeypatch, capsys):
+    copied = []
+    monkeypatch.setattr(navcom, "copy_to_clipboard", lambda text: copied.append(text) or True)
+    monkeypatch.setattr(navcom.shutil, "which", lambda exe: "/usr/bin/" + exe)
+    monkeypatch.setattr(navcom.os, "execvp", lambda exe, argv: None)
+    monkeypatch.setattr(navcom.os, "chdir", lambda path: None)
+    plan = navcom.revive_plan(indexed, _codex_key(indexed), "kimi", "codex")
+    navcom.resume_here(plan)
+    assert copied == [plan["paste"]] and "paste it once it starts" in capsys.readouterr().err

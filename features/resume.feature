@@ -116,8 +116,17 @@ Feature: Get back into a past conversation yourself
     And the output contains "gemini -i "
     And the output contains "navcom --recap "
 
-  Scenario: An agent navcom can't start with a prompt is a clear error
+  Scenario: An agent navcom doesn't know is a clear error that lists every one it does
     When I run: navcom zebracorn --codex
-    And I run --resume on the first "codex" session with: --with aider
+    And I run --resume on the first "codex" session with: --with notepad
     Then it fails with exit code 2
     And the output contains "Pick one of: claude, codex"
+    And the output contains "aider"
+
+  Scenario: Agents that can't take an opening prompt get a start command plus the prompt to paste
+    When I run: navcom zebracorn --codex
+    And I run --resume on the first "codex" session with: --with kimi --print
+    Then it succeeds
+    And the output contains "&& kimi"
+    And the output contains "# then paste this into kimi:"
+    And the output contains "run `navcom --recap "

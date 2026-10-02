@@ -57,7 +57,7 @@ def load_module(code, name):
 clean_mod = load_module(LOG_CLEAN_QUICK_CODE, "log_clean_quick")
 fts_mod = load_module(LOG_SEARCH_FTS5_CODE, "log_search_fts5")
 
-NAVCOM_VERSION = "0.9.0"
+NAVCOM_VERSION = "0.9.1"
 DEFAULT_LIMIT = 20  # hits per harness (and sessions listed by a bare `navcom`)
 
 # Every harness navcom knows how to read. Order = display order in help/listings.
@@ -8533,7 +8533,8 @@ def _resume_action(conn, plan, k, term=None, key=None, provider=None, focus=None
             options = fresh_harnesses(provider)
             if not options:
                 return "· no agent here can start with a prompt"
-            text = revive_plan(conn, key, options[0], provider, focus)["line"]
+            rp = revive_plan(conn, key, options[0], provider, focus)
+            text = rp.get("paste") or rp["line"]
         else:
             text = plan["line"] if not plan["gone"] else f"navcom --resume {short_ref(plan['key'])}"
         return "✓ copied: " + _trim_snippet(text, 120) if copy_to_clipboard(text) else "· no clipboard here — " + text
@@ -8558,7 +8559,7 @@ def _menu_revive(term, conn, key, provider, focus=None):
     """Pick the agent that picks this session back up: a fresh session primed with navcom --recap."""
     options = fresh_harnesses(provider)
     if not options:
-        return "· none of the agents navcom can start with a prompt is installed here"
+        return "· none of the agents navcom knows how to start is installed here"
     ref = display_ref(conn, key, provider)
     plans = {}
     sel, flash = 0, ""
@@ -8575,10 +8576,15 @@ def _menu_revive(term, conn, key, provider, focus=None):
                 _line([], w)]
         for n, name in enumerate(options):
             on = n == sel
-            label = f"{name}" + ("   — same harness" if name == provider else "")
+            tags = [t for t in ("same harness" if name == provider else "",
+                                "start it, then paste the prompt" if name not in FRESH_START else "") if t]
+            label = name + ("   — " + ", ".join(tags) if tags else "")
             body.append(_line([("  ▶ " if on else "    ", "orange_hot", None),
-                               (f" {label:<40}", "ink" if on else "cream", "amber" if on else None)], w))
-        body += [_line([], w), _line([("  " + _trim_snippet(plan["line"], w * 3), "grey_lt", None)], w)]
+                               (f" {label:<52}", "ink" if on else "cream", "amber" if on else None)], w))
+        body += [_line([], w), _line([("  start: ", "orange_hot", None), (_trim_snippet(plan["line"], w - 12), "cream", None)], w)]
+        if plan.get("paste"):
+            body.append(_line([("  paste: ", "orange_hot", None), (_trim_snippet(plan["paste"], w - 12), "cream", None)], w))
+            body.append(_line([("  (enter / t start it and put the prompt on your clipboard — just paste it in)", "grey_lt", None)], w))
         span = (flash, "green" if flash.startswith("✓") else "amber", None) if flash else \
             [(f"{h} · fresh session + navcom --recap", "cream", None), ("   ", None, None), (" enter ", "ink", "amber"),
              (" here ", "amber", None), (" t ", "ink", "amber"), (" tab ", "amber", None), (" c ", "ink", "amber"),
@@ -8603,8 +8609,9 @@ def _menu_revive(term, conn, key, provider, focus=None):
             ok, message = resume_in_new_tab(plan)
             return ("✓ " if ok else "· ") + message
         elif k == "c":
-            flash = ("✓ copied: " + _trim_snippet(plan["line"], 100)) if copy_to_clipboard(plan["line"]) \
-                else "· no clipboard here"
+            text = plan.get("paste") or plan["line"]  # paste-type: the prompt is the part you can't type yourself
+            what = "the prompt (start it with the line above)" if plan.get("paste") else _trim_snippet(plan["line"], 100)
+            flash = ("✓ copied " + what) if copy_to_clipboard(text) else "· no clipboard here"
 
 
 def _menu_search(term, conn, query):
@@ -8980,7 +8987,9 @@ GET BACK INTO A CONVERSATION (every search ends with the copy-paste command for 
   navcom --resume 7ec78a59 --tab    … in a new tab: cmux, tmux, iTerm2, WezTerm, kitty, Terminal.app
   navcom --resume 7ec78a59 --print  just print `cd <folder> && <harness> resume <id>` (pipes/agents get this)
   navcom --resume 7ec78a59 --with claude    too old to reopen (or another agent)? a FRESH claude session in
-                                    that folder, primed to run navcom --recap 7ec78a59 first
+                                    that folder, primed to run navcom --recap 7ec78a59 first. Every harness
+                                    works: ones with no prompt flag (kimi, crush, goose, aider, …) start plain
+                                    and the prompt goes on your clipboard to paste in
   navcom --recap 7ec78a59           the context pack itself (~30k chars; --max-chars 60000 for more)
   navcom --restore 7ec78a59         put a deleted transcript back from navcom's archive, so
                                     `claude --resume` works again   (--restore all: every one)
@@ -9120,7 +9129,8 @@ def build_parser():
                         "--resume REF --print just print the command (also what pipes and agents get)")
     o.add_argument("--with", dest="with_harness", metavar="HARNESS", type=str.lower,
                    help="With --resume: start a FRESH session of HARNESS in that folder, primed to reload the old one\n"
-                        "via navcom --recap (any session, any harness: revive a Codex thread in Claude).")
+                        "via navcom --recap (any session, any of the 30 harnesses: revive a Codex thread in Claude).\n"
+                        "Harnesses without a prompt flag start plain; the prompt goes on your clipboard to paste.")
     o.add_argument("--recap", "--catchup", "--catch-up", "--rehydrate", "--handoff", dest="recap_ref", metavar="REF",
                    help="A context pack to pick an old session back up: every user message, where it stopped,\n"
                         "commands run, files changed, how to dig deeper (~16k chars, --max-chars to change).")
@@ -9735,6 +9745,11 @@ def resume_here(plan):
             return 1
         os.chdir(plan["cwd"])
     sys.stderr.write(f"navcom ▸ {plan['line']}\n")
+    if plan.get("paste"):
+        copied = copy_to_clipboard(plan["paste"])
+        sys.stderr.write(f"navcom ▸ {plan['provider']} can't take a prompt on its command line — "
+                         + ("it's on your clipboard: paste it" if copied else "paste this") + " once it starts:\n"
+                         + f"\n{plan['paste']}\n\n")
     sys.stderr.flush()
     try:
         os.execvp(exe, plan["argv"])
@@ -9750,6 +9765,15 @@ def _tab_title(plan):
 def resume_in_new_tab(plan):
     """Open the resume command in a new tab of the terminal you're in. → (ok, message)."""
     import subprocess
+    pasted = bool(plan.get("paste")) and copy_to_clipboard(plan["paste"])
+    if plan.get("paste"):
+        ok, message = _open_tab(plan, subprocess)
+        return ok, message + (f" — the prompt is on your clipboard, paste it into {plan['provider']}" if pasted
+                              else f" — then paste this into {plan['provider']}: {plan['paste']}")
+    return _open_tab(plan, subprocess)
+
+
+def _open_tab(plan, subprocess):
     cwd = plan["cwd"] if plan["cwd"] and os.path.isdir(plan["cwd"]) else str(Path.home())
     shell = os.environ.get("SHELL") or "/bin/sh"
     keep_open = [shell, "-lic", f"{shlex.join(plan['argv'])}; exec {shlex.quote(shell)} -l"]
@@ -9839,8 +9863,8 @@ def cmd_resume(conn, args, providers):
     dead = not plan or (plan["gone"] and not plan["archived"])
     if args.with_harness or dead:
         harness = args.with_harness
-        if harness and harness not in FRESH_START:
-            safe_print(f"navcom: can't start {harness!r} with a prompt. Pick one of: {', '.join(FRESH_START)}")
+        if harness and harness not in REVIVE_AGENTS:
+            safe_print(f"navcom: navcom doesn't know how to start {harness!r}. Pick one of: {', '.join(REVIVE_AGENTS)}")
             return 2
         why = (f"navcom: {prov} can't reopen this session ({'it deleted the transcript' if plan else 'no resume-by-id'})."
                if dead else "")
@@ -9862,7 +9886,7 @@ def cmd_resume(conn, args, providers):
         if plan["gone"]:
             sys.stderr.write(f"navcom: {plan['provider']} deleted this session — `navcom --resume {short_ref(key)}` "
                              "restores it from the archive first (or: navcom --restore REF)\n")
-        safe_print(plan["line"])  # scripts, agents, `| pbcopy`: just the command
+        safe_print(revive_text(plan) if plan.get("revive") else plan["line"])  # scripts, agents, `| pbcopy`
         return 0
     if plan["gone"]:
         ok, message = ensure_resumable(conn, plan)
@@ -10016,16 +10040,46 @@ FRESH_START = {
 }
 
 
+# Agents that can't take an opening prompt on the command line: start them plainly, then paste the
+# prompt (navcom puts it on the clipboard). Any agent that can run a shell command can load a recap.
+PASTE_START = {
+    "kimi": ["kimi"],
+    "crush": ["crush"],
+    "goose": ["goose", "session"],
+    "dsh": ["dsh"],
+    "hermes": ["hermes"],
+    "cline": ["cline", "--tui"],
+    "reasonix": ["reasonix"],
+    "deepcode": ["deepcode"],
+    "aider": ["aider"],
+    "agy": ["agy"],
+    "kiro": ["kiro-cli", "chat"],
+    "amp": ["amp"],
+    "grokdev": ["grok"],
+}
+REVIVE_AGENTS = list(FRESH_START) + [h for h in PASTE_START if h not in FRESH_START]
+
+
+def _start_argv(harness, prompt):
+    return FRESH_START[harness](prompt) if harness in FRESH_START else list(PASTE_START[harness])
+
+
 def fresh_harnesses(original=None):
-    """Harnesses installed here that can start primed, the session's own first, then by how much you use them."""
+    """Agents installed here that can pick a session back up: the session's own first, then the ones that take
+    an opening prompt, then paste-the-prompt ones — each group by how much you use it."""
     usage = collections.Counter()
     try:
-        for _key, _mtime, _size, prov in list_logs(list(FRESH_START)):
+        for _key, _mtime, _size, prov in list_logs(REVIVE_AGENTS):
             usage[prov] += 1
     except Exception:
         pass
-    installed = [h for h in FRESH_START if shutil.which(FRESH_START[h]("x")[0]) or os.path.exists(FRESH_START[h]("x")[0])]
-    installed.sort(key=lambda h: (h != original, -usage[h], list(FRESH_START).index(h)))
+
+    def present(h):
+        exe = _start_argv(h, "x")[0]
+        return bool(shutil.which(exe) or (exe.startswith("/") and os.path.exists(exe)))
+
+    installed = [h for h in REVIVE_AGENTS if present(h)]
+    installed.sort(key=lambda h: (h != original, h not in FRESH_START, -usage[h], REVIVE_AGENTS.index(h)))
     return installed
 
 
@@ -10052,25 +10106,34 @@ def revive_plan(conn, key, harness, provider=None, focus=None):
     note = ""
     if cwd and not os.path.isdir(cwd):
         note, cwd = f"its folder {cwd} is gone — starting in the current folder", ""
-    argv = FRESH_START[harness](revive_prompt(conn, key, provider, focus))
+    prompt = revive_prompt(conn, key, provider, focus)
+    argv = _start_argv(harness, prompt)
     shown = [_shell_path(argv[0]) if argv[0].startswith("/") else argv[0]] + argv[1:]
-    line = " ".join([shown[0], shlex.join(shown[1:])])
+    line = " ".join([shown[0], shlex.join(shown[1:])]) if len(shown) > 1 else shown[0]
     if cwd:
         line = f"cd {_shell_path(cwd)} && {line}"
+    paste = "" if harness in FRESH_START else prompt  # agent can't take it on the command line: paste it in
     return {"cwd": cwd, "argv": argv, "line": line, "exact": False, "note": note, "provider": harness,
-            "key": key, "gone": False, "archived": False, "revive": True}
+            "key": key, "gone": False, "archived": False, "revive": True, "paste": paste}
+
+
+def revive_text(plan):
+    """What to show / copy for a revive plan: one line, or start-then-paste for agents without a prompt flag."""
+    if not plan.get("paste"):
+        return plan["line"]
+    return f"{plan['line']}\n# then paste this into {plan['provider']}:\n{plan['paste']}"
 
 
 def _pick_harness_cli(conn, key, provider, why):
     """Plain-terminal picker: which agent should pick this session back up?"""
     options = fresh_harnesses(provider)
     if not options:
-        safe_print("navcom: none of the agents navcom can start with a prompt is installed here "
-                   f"({', '.join(FRESH_START)}).")
+        safe_print(f"navcom: none of the agents navcom knows how to start is installed here ({', '.join(REVIVE_AGENTS)}).")
         return None
     sys.stderr.write(f"{why}\nStart a fresh agent that reloads it with `navcom --recap {short_ref(key)}`:\n")
     for n, h in enumerate(options, 1):
-        sys.stderr.write(f"  {n}) {h}{'   (same harness)' if h == provider else ''}\n")
+        tags = [t for t in ("same harness" if h == provider else "", "" if h in FRESH_START else "you paste the prompt") if t]
+        sys.stderr.write(f"  {n}) {h}{'   (' + ', '.join(tags) + ')' if tags else ''}\n")
     sys.stderr.write(f"pick [1]: ")
     sys.stderr.flush()
     try:
