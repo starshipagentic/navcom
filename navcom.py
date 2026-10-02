@@ -57,7 +57,7 @@ def load_module(code, name):
 clean_mod = load_module(LOG_CLEAN_QUICK_CODE, "log_clean_quick")
 fts_mod = load_module(LOG_SEARCH_FTS5_CODE, "log_search_fts5")
 
-NAVCOM_VERSION = "0.8.0"
+NAVCOM_VERSION = "0.9.0"
 DEFAULT_LIMIT = 20  # hits per harness (and sessions listed by a bare `navcom`)
 
 # Every harness navcom knows how to read. Order = display order in help/listings.
@@ -816,7 +816,7 @@ TOOL_HEAD_CHARS = 3000
 TOOL_TAIL_CHARS = 1000
 _DATA_URI_RE = re.compile(r"data:[\w/+.-]+;base64,[A-Za-z0-9+/=\s]{200,}")
 _BLOB_RE = re.compile(r"[A-Za-z0-9+/=]{600,}")
-_NAVCOM_OUTPUT_MARKERS = ("→ read around a hit: navcom --open", "navcom: no session matches", "No hits. (query:",
+_NAVCOM_OUTPUT_MARKERS = ("→ read around a hit: navcom --open", "navcom --recap · ", "navcom: no session matches", "No hits. (query:",
                           "usage: navcom [words")
 # a command that IS a navcom call (optionally after cd/env), not one that merely mentions navcom
 _NAVCOM_LEADING_RE = re.compile(r"^\s*(?:cd\s+\S+\s*(?:&&|;)\s*)?(?:\w+=\S+\s+)*(?:\S*/)?navcom(?:\.py)?(?:\s|$)")
@@ -3075,10 +3075,16 @@ the matching turns (`#533 user: …«match»…`).
 ```bash
 navcom topic words here          # 1. find  (no flag, no quotes needed)
 navcom --open <ref>:<turn>       # 2. read the turns around one hit, full text
+navcom --recap <ref>             # 3. picking an old session back up? load its whole story (~8k tokens)
 ```
 
 Step 1 prints a ready-to-run `--open` line. Do not grep the raw JSONL. `--open` is faster and
 still works for sessions the harness has since deleted.
+
+**Continuing old work** ("pick up that thread about X", "where were we on Y", or a prompt that says
+`run navcom --recap <ref>`): find the session, then run `navcom --recap <ref>`. It prints every user
+message, where it stopped, the commands run and files changed, sized for your context. A whole-session
+`--open` can be hundreds of KB. Then drill into specific turns with `--open <ref>:<turn>`.
 
 ## Queries: type them as-is
 
@@ -3119,6 +3125,7 @@ navcom --open 7ec78a59 --user    # every user turn in that session
 navcom deploy --context          # expand every hit in place
 navcom deploy --json             # structured: sessions[] with ref, date, project, hits[]
 navcom --resume 7ec78a59 --print # user wants to reopen it themselves? hand them this cd + resume command
+navcom --resume 7ec78a59 --with claude --print  # too old to reopen? a fresh agent primed with its recap
 navcom --restore 7ec78a59        # transcript deleted by its harness? put it back, then resume it
 ```
 
@@ -8493,34 +8500,43 @@ class _ResumeNow(Exception):
         self.plan = plan
 
 
-RESUME_KEYS = "r resume here · t new tab · c copy"
+RESUME_KEYS = "r resume here · t new tab · c copy · n fresh agent"
 
 
 def _resume_span(plan, flash=""):
     """The RESUME line's text span for a session (or why it can't be reopened)."""
     if flash:
         return (flash, "green" if flash.startswith("✓") else "amber", None)
-    if not plan:
-        return ("this harness can't reopen past sessions — read it here instead", "grey_lt", None)
-    if plan["gone"] and not plan["archived"]:
-        return (f"{plan['provider']} deleted this transcript before navcom archived it — read-only", "grey_lt", None)
+    if not plan or (plan["gone"] and not plan["archived"]):
+        why = "this harness can't reopen it" if not plan else f"{plan['provider']} deleted it"
+        return [(f"{why} — start a fresh agent that reloads it with navcom --recap", "cream", None), ("   ", None, None),
+                (" r ", "ink", "amber"), (" pick agent ", "amber", None), (" c ", "ink", "amber"), (" copy", "amber", None)]
     keys = [("   ", None, None), (" r ", "ink", "amber"), (" here ", "amber", None), (" t ", "ink", "amber"),
-            (" tab ", "amber", None), (" c ", "ink", "amber"), (" copy", "amber", None)]
+            (" tab ", "amber", None), (" c ", "ink", "amber"), (" copy ", "amber", None), (" n ", "ink", "amber"),
+            (" fresh", "amber", None)]
     if plan["gone"]:
         return [(f"navcom --resume {short_ref(plan['key'])}   (restores {plan['provider']}'s deleted file first)", "cream", None)] + keys
     return [(plan["line"], "cream", None)] + keys
 
 
-def _resume_action(conn, plan, k):
-    """Handle r / t / c on a session. Returns a one-line status; 'r' leaves the TUI via _ResumeNow."""
-    if not plan:
-        return "· this harness can't reopen past sessions"
+def _resume_action(conn, plan, k, term=None, key=None, provider=None, focus=None):
+    """Handle r / t / c / n on a session. Returns a one-line status; launching here leaves the TUI via _ResumeNow."""
+    dead = not plan or (plan["gone"] and not plan["archived"])
+    if k == "n" or (dead and k in ("r", "t")):
+        if term is None or key is None:
+            return "· no session selected"
+        return _menu_revive(term, conn, key, provider, focus)
     if k == "c":
-        if plan["gone"] and not plan["archived"]:
-            text = f"navcom --open {short_ref(plan['key'])}"  # can't be reopened; reading it is what's left
+        if dead:
+            if key is None:
+                return "· nothing to copy"
+            options = fresh_harnesses(provider)
+            if not options:
+                return "· no agent here can start with a prompt"
+            text = revive_plan(conn, key, options[0], provider, focus)["line"]
         else:
             text = plan["line"] if not plan["gone"] else f"navcom --resume {short_ref(plan['key'])}"
-        return "✓ copied: " + text if copy_to_clipboard(text) else "· no clipboard here — " + text
+        return "✓ copied: " + _trim_snippet(text, 120) if copy_to_clipboard(text) else "· no clipboard here — " + text
     if plan["gone"]:
         ok, message = ensure_resumable(conn, plan)
         conn.commit()
@@ -8536,6 +8552,59 @@ def _resume_action(conn, plan, k):
     if plan["cwd"] and not os.path.isdir(plan["cwd"]):
         return f"· its folder {plan['cwd']} no longer exists"
     raise _ResumeNow(plan)
+
+
+def _menu_revive(term, conn, key, provider, focus=None):
+    """Pick the agent that picks this session back up: a fresh session primed with navcom --recap."""
+    options = fresh_harnesses(provider)
+    if not options:
+        return "· none of the agents navcom can start with a prompt is installed here"
+    ref = display_ref(conn, key, provider)
+    plans = {}
+    sel, flash = 0, ""
+    while True:
+        w, hgt = term.size()
+        h = options[sel]
+        if h not in plans:
+            plans[h] = revive_plan(conn, key, h, provider, focus)
+        plan = plans[h]
+        body = [_line([("  A fresh agent starts in the session's folder and first runs ", "grey_lt", None),
+                       (f"navcom --recap {ref}", "yellow", None)], w),
+                _line([("  (every user message, where it stopped, commands run, files changed), then tells you where it left off.",
+                        "grey_lt", None)], w),
+                _line([], w)]
+        for n, name in enumerate(options):
+            on = n == sel
+            label = f"{name}" + ("   — same harness" if name == provider else "")
+            body.append(_line([("  ▶ " if on else "    ", "orange_hot", None),
+                               (f" {label:<40}", "ink" if on else "cream", "amber" if on else None)], w))
+        body += [_line([], w), _line([("  " + _trim_snippet(plan["line"], w * 3), "grey_lt", None)], w)]
+        span = (flash, "green" if flash.startswith("✓") else "amber", None) if flash else \
+            [(f"{h} · fresh session + navcom --recap", "cream", None), ("   ", None, None), (" enter ", "ink", "amber"),
+             (" here ", "amber", None), (" t ", "ink", "amber"), (" tab ", "amber", None), (" c ", "ink", "amber"),
+             (" copy", "amber", None)]
+        term.draw(_screen(f"REVIVE ▸ {ref}", body, w, hgt, "↑↓ pick agent · enter start here · t new tab · c copy · esc back",
+                          f"navcom --resume {ref}{':' + str(focus) if focus else ''} --with {h}", resume=span))
+        flash = ""
+        k = term.key()
+        if k in ("esc", "q", "left"):
+            return ""
+        if k in ("up", "k"):
+            sel = (sel - 1) % len(options)
+        elif k in ("down", "j"):
+            sel = (sel + 1) % len(options)
+        elif k in ("enter", "r"):
+            exe = plan["argv"][0]
+            if not (shutil.which(exe) or os.path.exists(exe)):
+                flash = f"· {exe} isn't installed here"
+                continue
+            raise _ResumeNow(plan)
+        elif k == "t":
+            ok, message = resume_in_new_tab(plan)
+            return ("✓ " if ok else "· ") + message
+        elif k == "c":
+            flash = ("✓ copied: " + _trim_snippet(plan["line"], 100)) if copy_to_clipboard(plan["line"]) \
+                else "· no clipboard here"
 
 
 def _menu_search(term, conn, query):
@@ -8602,8 +8671,8 @@ def _menu_search(term, conn, query):
                           resume=_resume_span(plan, flash) if cur else None))
         flash = ""
         k = term.key()
-        if k in ("r", "t", "c") and cur:
-            flash = _resume_action(conn, plan, k)
+        if k in ("r", "t", "c", "n") and cur:
+            flash = _resume_action(conn, plan, k, term, cur[0]["key"], cur[0]["provider"], cur[1].msg_index)
             continue
         if k in ("esc", "q", "left"):
             return
@@ -8645,8 +8714,8 @@ def _menu_view(term, conn, key, provider, focus=None):
                           f"↑↓ scroll · pgup/pgdn page · {RESUME_KEYS} · esc back", cli, resume=_resume_span(plan, flash)))
         flash = ""
         k = term.key()
-        if k in ("r", "t", "c"):
-            flash = _resume_action(conn, plan, k)
+        if k in ("r", "t", "c", "n"):
+            flash = _resume_action(conn, plan, k, term, key, provider, focus)
             continue
         if k in ("esc", "q", "left"):
             return
@@ -8691,8 +8760,8 @@ def _menu_list(term, conn, title, entries, cli, on_enter=None, resumable=False):
                           resume=_resume_span(plan, flash) if resumable else None))
         flash = ""
         k = term.key()
-        if resumable and payload and k in ("r", "t", "c"):
-            flash = _resume_action(conn, plan, k)
+        if resumable and payload and k in ("r", "t", "c", "n"):
+            flash = _resume_action(conn, plan, k, term, payload[0], payload[1])
             continue
         if k in ("esc", "q", "left"):
             return
@@ -8716,7 +8785,9 @@ LEARN_PAGES = [
     ("GET BACK IN", "On any search hit or open session:   r  resume here   ·   t  new tab   ·   c  copy the command\n"
                     "The RESUME line shows exactly what runs: cd <its folder> && <harness> resume <id>.\n"
                     "From the shell: navcom --resume <ref>  (--tab for a new tab, --print to just print it).\n"
-                    "A transcript its harness deleted is restored from navcom's archive first."),
+                    "A transcript its harness deleted is restored from navcom's archive first.\n"
+                    "Too old to reopen (or want another agent)? n = fresh agent: pick claude, codex, gemini, …\n"
+                    "and it starts in that folder by running navcom --recap <ref>: the whole story, sized for an LLM."),
     ("QUERIES", "Type anything — punctuation is safe: 10.10.1.223  don't  PR #76  main()  cerbos-wave-2\n"
                 "words      all must be in one turn, prefix-matched (auth → authentication)\n"
                 "a OR b     either one · a, b, c = any of them · NOT x excludes · \"exact phrase\"\n"
@@ -8855,7 +8926,9 @@ SQLite FTS5 + BM25, ~0.2s.  `navcom --where` shows which ones are on this machin
 THE RECIPE (agents: this is all you need)
   1. navcom <words>                 find: hits grouped by session → date, harness, project, ref, #turn
   2. navcom --open <ref>:<turn>     read the turns around one hit, full text
-  3. navcom --resume <ref>          (humans) get back into it: cd to its folder + reopen it in its harness
+  3. navcom --recap <ref>           picking old work back up? the session's whole story, sized for your
+                                    context: every user message, where it stopped, commands, files changed
+  navcom --resume <ref>             (humans) get back into it: cd to its folder + reopen it in its harness
   Don't grep raw session logs, don't strip punctuation, don't bother with --compact (it's the default).
   navcom --skill                    print navcom's SKILL.md skill card (already auto-installed for
                                     every harness here: Claude, Codex, Gemini, Copilot, pi, omo, opencode,
@@ -8906,13 +8979,16 @@ GET BACK INTO A CONVERSATION (every search ends with the copy-paste command for 
                                     here (claude --resume, codex resume, opencode --session, pi --session…)
   navcom --resume 7ec78a59 --tab    … in a new tab: cmux, tmux, iTerm2, WezTerm, kitty, Terminal.app
   navcom --resume 7ec78a59 --print  just print `cd <folder> && <harness> resume <id>` (pipes/agents get this)
+  navcom --resume 7ec78a59 --with claude    too old to reopen (or another agent)? a FRESH claude session in
+                                    that folder, primed to run navcom --recap 7ec78a59 first
+  navcom --recap 7ec78a59           the context pack itself (~30k chars; --max-chars 60000 for more)
   navcom --restore 7ec78a59         put a deleted transcript back from navcom's archive, so
                                     `claude --resume` works again   (--restore all: every one)
 
 OUTPUT
   default    plain text grouped by session, matches marked «like this»; colour only on a terminal
   --json     {"query","note","sessions":[{"ref","key","provider","date","project","title","resume",
-              "hits":[{"msg_index","role","snippet"}]}]}
+              "recap","hits":[{"msg_index","role","snippet"}]}]}
   --newest   sessions newest-first instead of best-match-first
   --max-chars N    snippet/turn length (0 = everything)
 
@@ -9042,6 +9118,12 @@ def build_parser():
                         "(claude --resume, codex resume, …), right here in this terminal.\n"
                         "--resume REF --tab   in a new tab instead (cmux, tmux, iTerm2, WezTerm, kitty, Terminal)\n"
                         "--resume REF --print just print the command (also what pipes and agents get)")
+    o.add_argument("--with", dest="with_harness", metavar="HARNESS", type=str.lower,
+                   help="With --resume: start a FRESH session of HARNESS in that folder, primed to reload the old one\n"
+                        "via navcom --recap (any session, any harness: revive a Codex thread in Claude).")
+    o.add_argument("--recap", "--catchup", "--catch-up", "--rehydrate", "--handoff", dest="recap_ref", metavar="REF",
+                   help="A context pack to pick an old session back up: every user message, where it stopped,\n"
+                        "commands run, files changed, how to dig deeper (~16k chars, --max-chars to change).")
     o.add_argument("--tab", "--new-tab", action="store_true", help=argparse.SUPPRESS)
     o.add_argument("--print", "--print-only", dest="print_only", action="store_true", help=argparse.SUPPRESS)
     o.add_argument("--context", "--full", "--expand", "--verbose", action="store_true",
@@ -9342,6 +9424,7 @@ def print_compact(conn, groups, max_chars, total_hits, cooked, note):
         first = groups[0]
         safe_print(STYLE.dim(
             f"→ read around a hit: navcom --open {display_ref(conn, first['key'], first['provider'])}:{first['hits'][0].msg_index}"
+            f"   · whole story: navcom --recap {display_ref(conn, first['key'], first['provider'])}"
             "   · expand all: add --context"
         ))
         hint = resume_hint(conn, groups)
@@ -9350,17 +9433,20 @@ def print_compact(conn, groups, max_chars, total_hits, cooked, note):
 
 
 def resume_hint(conn, groups):
-    """Footer line: the copy-paste command that reopens the best still-resumable session."""
-    for g in groups[:5]:
-        try:
-            plan = resume_plan(conn, g["key"], g["provider"])
-        except Exception:
-            plan = None
-        if plan and (not plan["gone"] or plan["archived"]):
-            ref = display_ref(conn, g["key"], g["provider"])
-            line = plan["line"] if not plan["gone"] else f"navcom --resume {ref}"
-            return f"→ get back into [{groups.index(g) + 1}] yourself: {line}   · any session: navcom --resume <ref> (--tab: new tab)"
-    return ""
+    """Footer line for the top session: the copy-paste command that reopens it, or — when its harness can't —
+    how to revive it in a fresh agent primed with its recap."""
+    g = groups[0]
+    try:
+        plan = resume_plan(conn, g["key"], g["provider"])
+    except Exception:
+        plan = None
+    ref = display_ref(conn, g["key"], g["provider"])
+    if plan and (not plan["gone"] or plan["archived"]):
+        line = plan["line"] if not plan["gone"] else f"navcom --resume {ref}"
+        return f"→ get back into [1] yourself: {line}   · any session: navcom --resume <ref> (--tab: new tab)"
+    why = f"{g['provider']} deleted it" if plan else f"{g['provider']} can't reopen sessions"
+    return (f"→ [1] can't be reopened ({why}) — revive it in a fresh agent: navcom --resume {ref} --with claude"
+            f"   (any agent: --with codex, gemini, …)")
 
 
 def print_json(conn, groups, cooked, note):
@@ -9375,6 +9461,7 @@ def print_json(conn, groups, cooked, note):
             "project": project,
             "title": title,
             "resume": _resume_json(conn, g["key"], g["provider"]),
+            "recap": f"navcom --recap {display_ref(conn, g['key'], g['provider'])}",
             "hits": [
                 {"msg_index": h.msg_index, "role": h.role, "snippet": re.sub(r"\s+", " ", h.snip or "").strip()}
                 for h in g["hits"]
@@ -9744,16 +9831,30 @@ def cmd_resume(conn, args, providers):
     if not key:
         safe_print(f"navcom: no session matches ref {ref!r}. Refs are printed in search results (e.g. 'ref 395e14b4').")
         return 1
+    prov = _key_provider(conn, key)
+    focus = re.search(r"[:#](\d+)$", args.resume_ref.strip())
+    focus = int(focus.group(1)) if focus else None
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
     plan = resume_plan(conn, key)
-    if not plan:
-        prov = _key_provider(conn, key)
-        safe_print(f"navcom: {prov} has no way to reopen a past session from the command line. "
-                   f"Read it instead: navcom --open {display_ref(conn, key, prov)}")
-        return 1
-    if plan["gone"] and not plan["archived"]:
-        _ok, message = ensure_resumable(conn, plan)
-        safe_print(f"navcom: {message}")
-        return 1
+    dead = not plan or (plan["gone"] and not plan["archived"])
+    if args.with_harness or dead:
+        harness = args.with_harness
+        if harness and harness not in FRESH_START:
+            safe_print(f"navcom: can't start {harness!r} with a prompt. Pick one of: {', '.join(FRESH_START)}")
+            return 2
+        why = (f"navcom: {prov} can't reopen this session ({'it deleted the transcript' if plan else 'no resume-by-id'})."
+               if dead else "")
+        if not harness:
+            if interactive and not args.print_only:
+                harness = _pick_harness_cli(conn, key, prov, why)
+                if not harness:
+                    return 1
+            else:
+                options = fresh_harnesses(prov)
+                harness = options[0] if options else ("claude" if "claude" in FRESH_START else next(iter(FRESH_START)))
+                sys.stderr.write(f"{why} A fresh {harness} session that reloads it "
+                                 f"(or --with <harness>; context only: navcom --recap {short_ref(key)}):\n")
+        plan = revive_plan(conn, key, harness, prov, focus)
     if plan["note"]:
         sys.stderr.write(f"navcom: {plan['note']}\n")
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
@@ -9775,6 +9876,215 @@ def cmd_resume(conn, args, providers):
         return 0 if ok else 1
     conn.close()
     return resume_here(plan)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Recap + revive: reload an old session's context into a fresh agent (any harness)
+# ─────────────────────────────────────────────────────────────────────────────
+
+RECAP_BUDGET = 30000  # chars (~8k tokens): enough to pick the work back up, a fraction of the raw transcript
+_CHANGE_TOOLS = re.compile(r"^\[(?:Write|Edit|MultiEdit|NotebookEdit|write_file|edit_file|replace|create_file|"
+                           r"str_replace\w*|apply_diff|write_to_file|insert_content|search_replace|patch|edit|write)"
+                           r": ([^\]\n]+)\]", re.I)
+_PATCH_FILES = re.compile(r"^\*\*\* (?:Update|Add) File: (.+)$", re.M)
+
+
+def _one_line(text, limit):
+    text = re.sub(r"\s+", " ", strip_ansi(text or "")).strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def session_recap(conn, key, provider=None, budget=RECAP_BUDGET):
+    """A context pack for an LLM picking an old session back up: what was asked, where it stopped,
+    commands run, files changed, and how to dig deeper. Never the whole transcript."""
+    provider = provider or _key_provider(conn, key)
+    last = max_msg_index(conn, key)
+    rows = fetch_window_rows(conn, key, [(1, last)])
+    project, title = session_meta(conn, key, provider)
+    ref = display_ref(conn, key, provider)
+    plan = resume_plan(conn, key, provider)
+    out = [f"navcom --recap · {provider} · {session_date(conn, key)} · {pretty_project(project) or '-'} · ref {ref} · {last} turns",
+           f"title: {_one_line(title, 200) or '-'}"]
+    if plan and not plan["gone"]:
+        out.append(f"reopen it: {plan['line']}")
+    else:
+        out.append(f"reopen it: not possible ({provider} deleted the transcript) — this recap is navcom's copy")
+    talk = [(i, role, text) for i, role, text in rows if role in ("user", "assistant")]
+    users = [(i, text) for i, role, text in talk if role == "user"]
+    cmds = [(i, text) for i, role, text in rows if role == "cmd"]
+    changed = collections.Counter()
+    root = (plan or {}).get("cwd") or ""
+
+    def short_path(path):
+        path = path.strip()
+        if root and path.startswith(root + "/"):
+            return path[len(root) + 1:]
+        return pretty_project(path) or path
+
+    for _i, role, text in rows:
+        if role != "tool":
+            continue
+        head = text.split("\n", 1)[0]
+        match = _CHANGE_TOOLS.match(head)
+        if match:
+            changed[short_path(match.group(1))] += 1
+        for path in _PATCH_FILES.findall(text[:20000]):
+            changed[short_path(path)] += 1
+
+    # 1. every user message (the intent and the decisions), oldest first
+    share = budget * 45 // 100
+    lines = [f"#{i} {_one_line(t, 2000 if n == 0 else 700)}" for n, (i, t) in enumerate(users)]  # #1 is the goal
+    keep = lines
+    if sum(len(l) for l in lines) > share:
+        head, tail, used = lines[:3], [], sum(len(l) for l in lines[:3])
+        for line in reversed(lines[3:]):
+            if used + len(line) > share:
+                break
+            tail.insert(0, line)
+            used += len(line)
+        skipped = len(lines) - len(head) - len(tail)
+        keep = head + [f"… {skipped} more — all of them: navcom --open {ref} --user"] + tail
+    out += ["", f"## What the user asked ({len(users)} messages, oldest first)"] + keep
+
+    # 2. where it stopped: the last turns of the conversation, fuller
+    share = budget * 35 // 100
+    stop, used = [], 0
+    for i, role, text in reversed(talk[-14:]):
+        line = f"#{i} {role}: {_one_line(text, 1500)}"
+        if stop and used + len(line) > share:
+            break
+        stop.insert(0, line)
+        used += len(line)
+    out += ["", f"## Where it stopped (last {len(stop)} turns)"] + stop
+
+    # 3. commands run (most recent distinct ones)
+    seen, recent = set(), []
+    for i, text in reversed(cmds):
+        first = _one_line(text, 120)
+        if first in seen:
+            continue
+        seen.add(first)
+        recent.insert(0, f"#{i} {first}")
+        if len(recent) >= 25:
+            break
+    if recent:
+        out += ["", f"## Commands run (last {len(recent)} distinct of {len(cmds)})"] + recent
+    if changed:
+        files = [f"{path}" + (f" (×{n})" if n > 1 else "") for path, n in changed.most_common(40)]
+        out += ["", f"## Files changed ({len(changed)})"] + files
+
+    out += ["", "## Dig deeper",
+            f"navcom --open {ref}:<n>          any turn above, with its neighbours",
+            f"navcom --open {ref} --user       every user message in full",
+            f"navcom <words> --file {ref}      search inside this session"]
+    return "\n".join(out)
+
+
+def cmd_recap(conn, args, providers):
+    ref = args.recap_ref.strip()
+    if not Path(ref).exists():
+        ref = re.sub(r"[:#]\d+(-\d+)?$", "", ref)
+    key, _others = resolve_ref(conn, ref, providers)
+    if not key:
+        safe_print(f"navcom: no session matches ref {ref!r}. Refs are printed in search results (e.g. 'ref 395e14b4').")
+        return 1
+    budget = args.max_chars if args.max_chars else RECAP_BUDGET
+    safe_print(session_recap(conn, key, budget=budget))
+    return 0
+
+
+# Start a NEW interactive session with an opening prompt: harness → argv(prompt).
+# Only harnesses whose interactive-with-prompt syntax is confirmed from their --help.
+FRESH_START = {
+    "claude": lambda p: ["claude", p],
+    "codex": lambda p: ["codex", p],
+    "gemini": lambda p: ["gemini", "-i", p],
+    "qwen": lambda p: ["qwen", "-i", p],
+    "opencode": lambda p: ["opencode", "--prompt", p],
+    "kilo": lambda p: ["kilo", "--prompt", p],
+    "pi": lambda p: ["pi", p],
+    "omo": lambda p: ["omo", p],
+    "grok": lambda p: [_grok_build_bin(), p],
+    "copilot": lambda p: ["copilot", "-i", p],
+    "cursor": lambda p: ["cursor-agent", p],
+    "droid": lambda p: ["droid", p],
+    "auggie": lambda p: ["auggie", p],
+    "codewhale": lambda p: ["codewhale", p],
+    "continue": lambda p: ["cn", p],
+    "vibe": lambda p: ["vibe", p],
+    "openhands": lambda p: ["openhands", "-t", p],
+}
+
+
+def fresh_harnesses(original=None):
+    """Harnesses installed here that can start primed, the session's own first, then by how much you use them."""
+    usage = collections.Counter()
+    try:
+        for _key, _mtime, _size, prov in list_logs(list(FRESH_START)):
+            usage[prov] += 1
+    except Exception:
+        pass
+    installed = [h for h in FRESH_START if shutil.which(FRESH_START[h]("x")[0]) or os.path.exists(FRESH_START[h]("x")[0])]
+    installed.sort(key=lambda h: (h != original, -usage[h], list(FRESH_START).index(h)))
+    return installed
+
+
+def revive_prompt(conn, key, provider, focus=None):
+    ref = display_ref(conn, key, provider)
+    _project, title = session_meta(conn, key, provider)
+    title = _one_line(title, 100).replace('"', "’").replace("'", "’")  # no shell quote-escaping in the line
+    where = f" and `navcom --open {ref}:{focus}` for the part I was looking at" if focus else ""
+    return (f"We are picking up an earlier {provider} session from {session_date(conn, key)} in this folder"
+            + (f' ("{title}")' if title else "")
+            + f". Before anything else, run `navcom --recap {ref}` to load what was asked, done and decided{where}. "
+              "Then tell me in a few lines where it left off and what the next step was.")
+
+
+def revive_plan(conn, key, harness, provider=None, focus=None):
+    """A plan (same shape as resume_plan) that starts a fresh `harness` session primed with the recap."""
+    provider = provider or _key_provider(conn, key)
+    base = resume_plan(conn, key, provider) or {}
+    cwd = base.get("cwd") or ""
+    if not cwd:
+        project, _t = session_meta(conn, key, provider)
+        project = decode_encoded_dir(project) if project.startswith("-") else project
+        cwd = project if project.startswith("/") else ""
+    note = ""
+    if cwd and not os.path.isdir(cwd):
+        note, cwd = f"its folder {cwd} is gone — starting in the current folder", ""
+    argv = FRESH_START[harness](revive_prompt(conn, key, provider, focus))
+    shown = [_shell_path(argv[0]) if argv[0].startswith("/") else argv[0]] + argv[1:]
+    line = " ".join([shown[0], shlex.join(shown[1:])])
+    if cwd:
+        line = f"cd {_shell_path(cwd)} && {line}"
+    return {"cwd": cwd, "argv": argv, "line": line, "exact": False, "note": note, "provider": harness,
+            "key": key, "gone": False, "archived": False, "revive": True}
+
+
+def _pick_harness_cli(conn, key, provider, why):
+    """Plain-terminal picker: which agent should pick this session back up?"""
+    options = fresh_harnesses(provider)
+    if not options:
+        safe_print("navcom: none of the agents navcom can start with a prompt is installed here "
+                   f"({', '.join(FRESH_START)}).")
+        return None
+    sys.stderr.write(f"{why}\nStart a fresh agent that reloads it with `navcom --recap {short_ref(key)}`:\n")
+    for n, h in enumerate(options, 1):
+        sys.stderr.write(f"  {n}) {h}{'   (same harness)' if h == provider else ''}\n")
+    sys.stderr.write(f"pick [1]: ")
+    sys.stderr.flush()
+    try:
+        answer = input().strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if answer in ("q", "n", "no", "quit"):
+        return None
+    if not answer:
+        return options[0]
+    if answer.isdigit() and 1 <= int(answer) <= len(options):
+        return options[int(answer) - 1]
+    return answer if answer in options else None
+
 
 
 def cmd_open(conn, args, providers):
@@ -9809,8 +10119,10 @@ def cmd_open(conn, args, providers):
         safe_print(STYLE.dim(f"resume: {plan['line']}"))
     elif plan and plan["archived"]:
         safe_print(STYLE.dim(f"resume: navcom --resume {display_ref(conn, key, prov)}   ({prov} deleted it; navcom restores it from its archive)"))
-    elif plan:
-        safe_print(STYLE.dim(f"resume: not possible — {prov} deleted this transcript before navcom archived it (the text below is navcom's copy)"))
+    else:
+        why = f"{prov} deleted this transcript before navcom archived it" if plan else f"{prov} can't reopen sessions by id"
+        safe_print(STYLE.dim(f"resume: not possible — {why}. Revive it: navcom --resume {display_ref(conn, key, prov)} --with <agent>"))
+    safe_print(STYLE.dim(f"recap:  navcom --recap {display_ref(conn, key, prov)}   (the whole story, sized for an LLM)"))
     if others:
         safe_print(STYLE.warn(f"note: {len(others)} other session(s) also match {ref!r}; showing the most recent"))
     safe_print("")
@@ -10020,6 +10332,11 @@ def run(argv=None):
         index_logs(conn, logs)
         conn.commit()
         return cmd_resume(conn, args, providers)
+
+    if args.recap_ref:
+        index_logs(conn, logs)
+        conn.commit()
+        return cmd_recap(conn, args, providers)
 
     if args.open_ref:
         index_logs(conn, logs)

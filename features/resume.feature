@@ -78,13 +78,15 @@ Feature: Get back into a past conversation yourself
     Then it succeeds
     And the output contains "codex resume"
 
-  Scenario: A session its harness deleted and navcom never archived is read-only
+  @critical
+  Scenario: A session too old to reopen gets a fresh agent primed to reload it
     When I run: navcom zebracorn --codex
     And the "codex" transcript is deleted
     And I resume the first "codex" session from the last search
-    Then it fails
-    And the output contains "can't reopen it"
-    And the output contains "navcom --open"
+    Then it succeeds
+    And stderr mentions "can't reopen this session"
+    And the output contains "cd "
+    And the output contains "run `navcom --recap "
 
   Scenario: A deleted Claude session is restored from navcom's archive on resume
     When I run: navcom zebracorn --claude
@@ -92,3 +94,30 @@ Feature: Get back into a past conversation yourself
     And I resume the first "claude" session from the last search
     Then it succeeds
     And stderr mentions "restores it from the archive first"
+
+  @critical
+  Scenario: navcom --recap gives an LLM the whole story, sized for its context
+    When I run: navcom zebracorn --codex
+    And I recap the first "codex" session
+    Then it succeeds
+    And the output contains "## What the user asked"
+    And the output contains "## Where it stopped"
+    And the output contains "## Commands run"
+    And the output contains "## Dig deeper"
+
+  Scenario: Search results point at the recap
+    When I run: navcom zebracorn --codex
+    Then the output contains "whole story: navcom --recap "
+
+  Scenario: Revive any session in another agent
+    When I run: navcom zebracorn --codex
+    And I run --resume on the first "codex" session with: --with gemini --print
+    Then it succeeds
+    And the output contains "gemini -i "
+    And the output contains "navcom --recap "
+
+  Scenario: An agent navcom can't start with a prompt is a clear error
+    When I run: navcom zebracorn --codex
+    And I run --resume on the first "codex" session with: --with aider
+    Then it fails with exit code 2
+    And the output contains "Pick one of: claude, codex"

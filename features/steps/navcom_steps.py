@@ -406,3 +406,13 @@ def step_fails(context):
 @then('stderr mentions "{text}"')
 def step_stderr(context, text):
     assert text in context.err, f"expected {text!r} in stderr:\n{context.err}"
+
+
+@when('I recap the first "{harness}" session')
+def step_recap(context, harness):
+    _run(context, ["--recap", _first_ref(context, harness)])
+
+
+@when('I run --resume on the first "{harness}" session with: {flags}')
+def step_resume_with(context, harness, flags):
+    _run(context, ["--resume", _first_ref(context, harness)] + shlex.split(flags))

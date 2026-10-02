@@ -105,6 +105,7 @@ example for every option. The test suite runs every example in it.
 navcom drizzle migration            # every harness; compact hits grouped by session
 navcom --open 395e14b4:73           # read the turns around hit #73 of that session
 navcom --resume 395e14b4            # get back into it: cd to its folder + reopen it in its harness
+navcom --recap 395e14b4             # its whole story, sized for an LLM (picking old work back up)
 navcom drizzle --context            # expand every hit with the turns around it
 navcom --sessions                   # your most recent sessions, with titles
 navcom --menu                       # the retro dashboard: retention, history, search, learn
@@ -146,8 +147,27 @@ Each harness gets its own command (`claude --resume <uuid>`, `codex resume <uuid
 `goose session --resume --session-id …`, and so on for all 30). Continue and Aider can't reopen a
 session by id, so navcom gives their closest command (`cn --fork <id>`, `aider --restore-chat-history`)
 and says what it does. If the harness already deleted the transcript, navcom restores it from its
-archive first. If it was deleted before navcom archived it, navcom says so; you can still read it
-with `--open`.
+archive first.
+
+### Too old to reopen? Revive it with its context
+
+A session its harness deleted, one from a harness that can't resume, or one you'd rather continue in
+another agent can still be picked back up. navcom starts a **fresh** agent of your choice in that
+folder and primes it with one instruction: run `navcom --recap <ref>` first.
+
+```bash
+navcom --recap 7ec78a59                     # the context pack: every user message, where it stopped,
+                                            # commands run, files changed, how to dig deeper (~30k chars)
+navcom --resume 7ec78a59 --with claude      # fresh Claude in that folder, primed with the recap
+navcom --resume 7ec78a59 --with codex --tab # …or Codex, Gemini, Copilot, opencode, pi, … in a new tab
+```
+
+Without `--with`, `--resume` on a session that can't be reopened asks which agent to use. In
+`navcom --menu`, `r` on such a session (or `n` on any session) opens a REVIVE picker. A raw
+`--open` of a long session can run to hundreds of KB; the recap is about 8k tokens. In a live test, a
+fresh Claude given only the revive prompt rebuilt a five-month-old Codex review in three turns: what was
+checked, the two leftovers it flagged, and what was next. Search results also point at it:
+`whole story: navcom --recap <ref>`.
 
 ### Queries never break
 

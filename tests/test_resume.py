@@ -22,10 +22,10 @@ def test_resume_line_keeps_screens_exact_width(navcom, tmp_path):
         assert any("RESUME ▸ cd " in ANSI.sub("", r) for r in rows)
 
 
-def test_resume_span_explains_sessions_that_cannot_reopen(navcom, tmp_path):
-    assert "read-only" in navcom._resume_span(plan_for(tmp_path, gone=True))[0]
+def test_resume_span_offers_a_fresh_agent_when_it_cannot_reopen(navcom, tmp_path):
+    assert "fresh agent" in navcom._resume_span(plan_for(tmp_path, gone=True))[0][0]
     assert "navcom --resume" in navcom._resume_span(plan_for(tmp_path, gone=True, archived=True))[0][0]
-    assert "can't reopen" in navcom._resume_span(None)[0]
+    assert "can't reopen it" in navcom._resume_span(None)[0][0]
 
 
 def test_copy_key_copies_the_command(navcom, tmp_path, monkeypatch):
@@ -33,8 +33,6 @@ def test_copy_key_copies_the_command(navcom, tmp_path, monkeypatch):
     monkeypatch.setattr(navcom, "copy_to_clipboard", lambda text: copied.append(text) or True)
     msg = navcom._resume_action(None, plan_for(tmp_path), "c")
     assert msg.startswith("✓ copied") and copied == [plan_for(tmp_path)["line"]]
-    navcom._resume_action(None, plan_for(tmp_path, gone=True), "c")
-    assert copied[-1].startswith("navcom --open ")  # unrecoverable: reading it is what's left
 
 
 def test_resume_key_leaves_the_tui(navcom, tmp_path, monkeypatch):
@@ -91,3 +89,49 @@ def test_index_repair_unwraps_gemini_part_reprs(navcom, tmp_path):
     assert got[:3] == ["Drizzle ORM migration\nsecond line", "a\nb", "capped repr with no closing quote"]
     assert got[3] == rows[3]
 
+
+
+@pytest.fixture
+def indexed(navcom, tmp_path, monkeypatch):
+    import fake_home
+    from pathlib import Path
+    home = tmp_path / "home"
+    fake_home.build(home)
+    for k, v in fake_home.env_for(home).items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    conn = navcom.open_index(tmp_path / "idx.sqlite")
+    navcom.index_logs(conn, navcom.list_logs(navcom.ALL_PROVIDERS), progress=False)
+    return conn
+
+
+def _codex_key(conn):
+    return next(f for (f,) in conn.execute("SELECT file FROM file_state") if "rollout-" in f)
+
+
+def test_recap_is_a_compact_context_pack(navcom, indexed):
+    key = _codex_key(indexed)
+    text = navcom.session_recap(indexed, key)
+    for section in ("navcom --recap · codex", "reopen it: cd ", "## What the user asked", "## Where it stopped",
+                    "## Commands run", "## Dig deeper", "navcom --open "):
+        assert section in text, section
+    assert len(navcom.session_recap(indexed, key, budget=2000)) < 6000
+
+
+def test_revive_starts_a_fresh_agent_primed_with_the_recap(navcom, indexed, tmp_path, monkeypatch):
+    key = _codex_key(indexed)
+    plan = navcom.revive_plan(indexed, key, "claude", "codex", focus=4)
+    assert plan["argv"][0] == "claude" and plan["line"].startswith("cd ")
+    prompt = plan["argv"][1]
+    assert "navcom --recap " in prompt and ":4`" in prompt and "'" not in prompt
+    for harness in navcom.FRESH_START:  # every primed start puts the prompt on its command line
+        assert navcom.revive_plan(indexed, key, harness, "codex", focus=4)["argv"][-1] == prompt
+
+
+def test_copy_on_a_dead_session_copies_the_revive_line(navcom, indexed, monkeypatch):
+    copied = []
+    monkeypatch.setattr(navcom, "copy_to_clipboard", lambda text: copied.append(text) or True)
+    monkeypatch.setattr(navcom, "fresh_harnesses", lambda original=None: ["claude"])
+    key = _codex_key(indexed)
+    navcom._resume_action(indexed, None, "c", key=key, provider="codex")
+    assert "claude " in copied[-1] and "navcom --recap" in copied[-1]

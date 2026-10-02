@@ -15,10 +15,16 @@ the matching turns (`#533 user: …«match»…`).
 ```bash
 navcom topic words here          # 1. find  (no flag, no quotes needed)
 navcom --open <ref>:<turn>       # 2. read the turns around one hit, full text
+navcom --recap <ref>             # 3. picking an old session back up? load its whole story (~8k tokens)
 ```
 
 Step 1 prints a ready-to-run `--open` line. Do not grep the raw JSONL. `--open` is faster and
 still works for sessions the harness has since deleted.
+
+**Continuing old work** ("pick up that thread about X", "where were we on Y", or a prompt that says
+`run navcom --recap <ref>`): find the session, then run `navcom --recap <ref>`. It prints every user
+message, where it stopped, the commands run and files changed, sized for your context. A whole-session
+`--open` can be hundreds of KB. Then drill into specific turns with `--open <ref>:<turn>`.
 
 ## Queries: type them as-is
 
@@ -59,6 +65,7 @@ navcom --open 7ec78a59 --user    # every user turn in that session
 navcom deploy --context          # expand every hit in place
 navcom deploy --json             # structured: sessions[] with ref, date, project, hits[]
 navcom --resume 7ec78a59 --print # user wants to reopen it themselves? hand them this cd + resume command
+navcom --resume 7ec78a59 --with claude --print  # too old to reopen? a fresh agent primed with its recap
 navcom --restore 7ec78a59        # transcript deleted by its harness? put it back, then resume it
 ```
 
