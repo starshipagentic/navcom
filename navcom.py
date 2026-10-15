@@ -15,6 +15,7 @@ This file embeds full copies of log_clean_quick + log_search_fts5 for function r
 
 import argparse
 import collections
+import contextlib
 import io
 import json
 import shlex
@@ -57,7 +58,7 @@ def load_module(code, name):
 clean_mod = load_module(LOG_CLEAN_QUICK_CODE, "log_clean_quick")
 fts_mod = load_module(LOG_SEARCH_FTS5_CODE, "log_search_fts5")
 
-NAVCOM_VERSION = "0.9.1"
+NAVCOM_VERSION = "0.10.0"
 DEFAULT_LIMIT = 20  # hits per harness (and sessions listed by a bare `navcom`)
 
 # Every harness navcom knows how to read. Order = display order in help/listings.
@@ -1916,6 +1917,14 @@ def _open_index_rw(index_path):
     # we'd rather search the slightly stale index (reads never block under WAL)
     conn = sqlite3.connect(str(index_path), timeout=3)
     try:
+        return _initialize_index(conn)
+    except BaseException:
+        conn.close()
+        raise
+
+
+def _initialize_index(conn):
+    try:
         conn.execute("PRAGMA journal_mode=WAL")
     except sqlite3.OperationalError:
         pass
@@ -2007,7 +2016,6 @@ def index_log(conn, log, force=False):
     if incremental:
         offset, msg_index = row[2], row[3] or 0
     else:
-        _delete_key(conn, key)
         offset, msg_index = 0, 0
     try:
         text_chunk = None
@@ -2015,6 +2023,8 @@ def index_log(conn, log, force=False):
             text_chunk, offset = _read_complete_lines(key, offset)
         else:
             offset = size
+        if not incremental:
+            _delete_key(conn, key)
         for role, text in iter_clean_turns(key, provider, text_chunk):
             msg_index += 1
             cur = conn.execute(
@@ -2053,7 +2063,10 @@ def index_logs(conn, logs, force=False, progress=True, upgrade=True):
         except sqlite3.Error:
             pass
         sys.stderr.write(f"[navcom] index not refreshed ({exc}); results may miss the newest turns\n")
-        INDEX_READ_ONLY = True  # don't wait on the lock again for cache writes this run
+        # Contention is temporary: a long-lived menu must be able to refresh
+        # again after the other writer finishes.
+        if not any(word in str(exc).lower() for word in ('locked', 'busy')):
+            INDEX_READ_ONLY = True
         return 0
 
 
@@ -2065,7 +2078,15 @@ def _index_logs(conn, logs, force=False, progress=True, upgrade=True):
     total = len(logs)
     announced = False
     for i, log in enumerate(logs, 1):
-        if index_log(conn, log, force=force):
+        try:
+            updated = index_log(conn, log, force=force)
+            # Release the writer between sessions, not after 200 potentially
+            # slow parses. Each session remains an atomic index update.
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        if updated:
             changed += 1
             if changed % 200 == 0:
                 conn.commit()
@@ -2100,7 +2121,12 @@ def upgrade_stale_parses(conn, logs, budget=UPGRADE_BUDGET_SECONDS):
                 break
             if "#" not in log[0] and log[2] > left * UPGRADE_BYTES_PER_SECOND:
                 continue  # too big for this call's budget; it upgrades on its next change or --reindex
-        index_log(conn, log, force=True)
+        try:
+            index_log(conn, log, force=True)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         done += 1
     conn.commit()
     return done
@@ -2126,13 +2152,22 @@ def session_meta(conn, key, provider=None):
         title = (meaty or texts or [""])[0][:160]
     if not INDEX_READ_ONLY or conn.execute(
             "SELECT 1 FROM sqlite_temp_master WHERE name='file_meta'").fetchone():
+        owns_transaction = not conn.in_transaction
+        busy_timeout = conn.execute('PRAGMA busy_timeout').fetchone()[0]
         try:
+            conn.execute('PRAGMA busy_timeout=0')  # optional cache writes never stall readers
             conn.execute(
                 "INSERT OR REPLACE INTO file_meta (file, provider, project, title) VALUES (?, ?, ?, ?)",
                 (key, provider, project, title),
             )
+            if owns_transaction:
+                conn.commit()
         except sqlite3.OperationalError:
+            if owns_transaction:
+                conn.rollback()
             pass  # index busy elsewhere; metadata is a cache, skip
+        finally:
+            conn.execute(f'PRAGMA busy_timeout={busy_timeout}')
     return project, title
 
 
@@ -3135,7 +3170,7 @@ navcom --restore 7ec78a59        # transcript deleted by its harness? put it bac
 - `--solo` / `--summary` hand the hits to another LLM CLI, so they're slow (≤150s). Usually
   better to read the hits and summarize them yourself.
 - `navcom --help` is the full manual. `navcom --where` shows which harness logs exist.
-- Humans: `navcom --menu` is a full-screen retro dashboard (retention, history, search). Agents should use
+- Humans: `navcom --tui` is a full-screen retro terminal dashboard; `navcom --menu` opens a local browser dashboard (retention, history, search). Agents should use
   the plain commands above.
 - `navcom --skill` prints this card; `navcom --skill install` (re)installs it for every harness here.
 
@@ -3144,6 +3179,8 @@ navcom --restore 7ec78a59        # transcript deleted by its harness? put it bac
 Report what navcom found (session ref, date, harness, project, turn numbers and quoted snippets)
 separately from what you verified live now, and flag anything memory-derived as possibly stale.
 """
+
+SKILL_MD += '\n## Atlas: discover and understand collections\n\n```bash\nnavcom atlas                       # commands and grouping guide\nnavcom atlas list research         # defined and suggested research families\nnavcom atlas list projects         # full project paths and collection IDs\nnavcom atlas help districts        # how folder districts differ from ancestry\nnavcom atlas search listener --json # structured discovery for agents\nnavcom atlas refresh               # incremental evidence cache, existing index only\n```\n\nUse `navcom atlas explore <collection>` to see branches, then\n`navcom atlas search <words> --within <collection>` to stay in that entire\ncollection across pages. `--children` expands child tasks; otherwise child-only\nhits identify the parent and matching child. `navcom atlas show <ref>` and\n`navcom atlas tree <ref>` explain context and actual ancestry without launching.\nResults print exact next commands; `--json` keeps diagnostics on stderr.\nSuggested families and version mentions are evidence, not implementation proof.\nRead the reported freshness; `atlas refresh` uses indexed user/assistant turns,\nnever starts a model, and does not replace `navcom --maintain` for new raw logs.\n\n`navcom --help` is the overview. Use `navcom help search|read|resume|atlas|maintenance|all`\nand `navcom atlas <command> --help` for focused help.\n'
 
 
 def _home_dir(env, default):
@@ -3789,6 +3826,8 @@ def cmd_maintain(conn, force=False):
     files, raw = archive_logs(conn, logs, budget=None)
     safe_print(f"{stamp} navcom {NAVCOM_VERSION} maintain: {len(logs)} sessions seen, {changed} indexed, "
                f"{upgraded} re-parsed, {files} archived ({raw / 1e6:.1f} MB) in {time.monotonic() - start:.0f}s")
+    from navcom_discovery import refresh
+    refresh(conn)
     return 0
 
 
@@ -8244,17 +8283,20 @@ def splash_frame(width):
              _stripe(width, "orange", "orange_dk"),
              _band(width, MENU_TAGLINE, "cream", "orange_dk"),
              _stripe(width, "orange_dk", "red_deep"), _stripe(width, "red_deep", "black"),
-             _band(width, f"navcom {NAVCOM_VERSION} · press any key", "grey_lt", "black")]
+             _band(width, f"navcom {NAVCOM_VERSION} · preparing mission control", "grey_lt", "black")]
     return rows
 
 
 # ── dashboard data ───────────────────────────────────────────────────────────
 
-def dashboard_stats(conn):
-    """Everything the dashboard shows, computed from the index + disk in well under a second."""
+def dashboard_stats(conn, progress=None):
+    """Build a fresh dashboard snapshot; report stages around potentially slow work."""
     import time
+    report = progress or (lambda stage, label: None)
     now = time.time()
+    report(2, "Discovering conversations")
     logs = list_logs(ALL_PROVIDERS)
+    report(3, "Reading indexed history")
     on_disk = {l[0] for l in logs}
     per_harness = collections.Counter(l[3] for l in logs)
     rows = conn.execute("SELECT file, mtime FROM file_state").fetchall()
@@ -8266,10 +8308,12 @@ def dashboard_stats(conn):
         if 0 <= age < 30:
             days[29 - age] += 1
     turns = conn.execute("SELECT count(*) FROM turn_loc").fetchone()[0]
+    report(4, "Counting indexed tool messages")
     try:
         tool_rows = conn.execute("SELECT count(*) FROM session_fts WHERE role='tool'").fetchone()[0]
     except sqlite3.Error:
         tool_rows = 0
+    report(5, "Checking retention settings")
     claude_logs = [l for l in logs if l[3] == "claude"]
     claude_old_kept = sum(1 for l in claude_logs if now - l[1] > 30 * 86400)
     retention = []
@@ -8291,12 +8335,14 @@ def dashboard_stats(conn):
         kept = cur is not None and str(cur).lower() in (str(spec["never_delete_value"]).lower(), "false", "36500")
         retention.append((h["label"], spec.get("default_days", 30), 36500 if kept else spec.get("default_days", 30),
                           f"{spec['key_path']} = {cur}"))
+    report(6, "Measuring saved archives")
     archive_files = archive_bytes = 0
     root = archive_root()
     if root.exists():
         for p in root.rglob("*.gz"):
             archive_files += 1
             archive_bytes += p.stat().st_size
+    report(7, "Checking daily upkeep")
     return {
         "sessions": len(rows), "on_disk": len(on_disk), "rescued": rescued, "turns": turns, "tools": tool_rows,
         "oldest": oldest, "days": days, "per_harness": per_harness, "retention": retention,
@@ -8304,6 +8350,132 @@ def dashboard_stats(conn):
         "daily": daily_job_status(), "index_bytes": default_index_path().stat().st_size
         if default_index_path().exists() else 0,
     }
+
+
+DASHBOARD_CACHE_TTL = 120  # Snapshot only; search and Recents still discover live sessions.
+DASHBOARD_CACHE_VERSION = 1
+
+
+def _dashboard_cache_context(conn):
+    path = next((row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main"), "")
+    if not path:
+        return None, None
+    # Logical index revision survives WAL checkpoint/close/reopen; file mtimes do not.
+    signature = [list(conn.execute("SELECT count(*), max(mtime), sum(size) FROM file_state").fetchone()),
+                 conn.execute("SELECT max(rowid) FROM session_fts").fetchone()[0]]
+    # A snapshot from a different harness home/config must not leak into this dashboard.
+    scope = {k: v for k, v in os.environ.items() if k.endswith(("_HOME", "_DIR", "_PATH")) or k == "HOME"}
+    return Path(path + ".dashboard.json"), [DASHBOARD_CACHE_VERSION, NAVCOM_VERSION, signature, scope]
+
+
+def _read_dashboard_cache(conn):
+    import time
+    path, context = _dashboard_cache_context(conn)
+    if path is None:
+        return None
+    try:
+        saved = json.loads(path.read_text())
+        age = time.time() - saved["at"]
+        if not 0 <= age < DASHBOARD_CACHE_TTL or saved["context"] != context:
+            return None
+        stats = saved["stats"]
+        required = {"sessions", "on_disk", "rescued", "turns", "tools", "oldest", "days", "per_harness",
+                    "retention", "claude_old_kept", "archive_files", "archive_bytes", "daily", "index_bytes"}
+        if not required <= stats.keys():
+            return None
+        stats["per_harness"] = collections.Counter(stats["per_harness"])
+        stats["snapshot_at"] = saved["at"]
+        stats["cached"] = True
+        return stats
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def _write_dashboard_cache(conn, stats):
+    import tempfile
+    import time
+    path, context = _dashboard_cache_context(conn)
+    stats["snapshot_at"] = time.time()
+    stats["cached"] = False
+    if path is None:
+        return
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=path.name + ".", delete=False) as handle:
+            temp = Path(handle.name)
+            json.dump({"at": stats["snapshot_at"], "context": context, "stats": stats}, handle)
+        os.replace(temp, path)
+    except OSError:
+        pass  # A read-only index must still have a working dashboard.
+    finally:
+        if temp is not None:
+            temp.unlink(missing_ok=True)
+
+
+def loading_frame(width, height, stage, label, elapsed):
+    """Real stage progress plus a moving scanner while an individual stage is busy."""
+    bar_width = min(52, max(12, width - 14))
+    filled = int(bar_width * stage / 8)
+    scanner = int(elapsed * 14) % bar_width
+    bar = "".join("◆" if i == scanner and stage < 8 else "█" if i < filled else "░" for i in range(bar_width))
+    rows = splash_frame(width)[:-1]
+    rows += [_band(width, bar, "orange_hot", "black"),
+             _band(width, f"{stage}/8 · {label} · {elapsed:.1f}s", "cream", "black"),
+             _band(width, "Opening automatically when ready", "grey_lt", "black")]
+    return (rows + [_line([], width)] * max(0, height - len(rows)))[:height]
+
+
+def _load_menu_dashboard(term, conn=None, index_path=None, force=False):
+    """Keep SQLite on its owning thread; a tiny renderer animates even during blocking SQL/I/O."""
+    import threading
+    import time
+    start = time.monotonic()
+    state = (0, "Opening history index")
+    done = threading.Event()
+
+    def report(stage, label):
+        nonlocal state
+        state = (stage, label)
+
+    def draw():
+        w, h = term.size()
+        stage, label = state
+        term.draw(loading_frame(w, h, stage, label, time.monotonic() - start))
+
+    def animate():
+        while not done.wait(0.08):
+            draw()
+
+    draw()  # Always show progress, including a warm cache hit.
+    animator = threading.Thread(target=animate, name="navcom-startup-progress", daemon=True)
+    animator.start()
+    opened = conn is None
+    try:
+        if opened:
+            conn = open_index(index_path or default_index_path())
+        report(1, "Checking recent dashboard snapshot")
+        stats = None if force else _read_dashboard_cache(conn)
+        if stats is None:
+            report(1, "Checking local setup")
+            auto_install_skills()
+            for fix in (ensure_claude_retention, ensure_gemini_retention, ensure_registered_retention):
+                try:
+                    fix()
+                except Exception:
+                    pass
+            auto_install_daily_job()
+            stats = dashboard_stats(conn, report)
+            _write_dashboard_cache(conn, stats)
+        report(8, "Ready · cached snapshot" if stats.get("cached") else "Ready · fresh snapshot")
+        return conn, stats
+    except BaseException:
+        if opened and conn is not None:
+            conn.close()
+        raise
+    finally:
+        done.set()
+        animator.join()
+        draw()
 
 
 MENU_ACTIONS = [
@@ -8362,6 +8534,9 @@ def dashboard_frame(stats, sel, width, height):
     if s["claude_old_kept"]:
         ret.append([("  saved so far: ", "grey_lt", None), (f"{s['claude_old_kept']} Claude chats", "green", None),
                     (" > 30d old", "grey_lt", None)])
+    if s.get("snapshot_at"):
+        age = max(0, int(time.time() - s["snapshot_at"]))
+        hist.append([(f"snapshot   {age}s ago · r refresh", "grey_lt", None)])
     top = s["per_harness"].most_common(5)
     hi = max([n for _, n in top] or [1])
     act = [[("30 days ", "grey_lt", None), (_spark(s["days"]), "cyan", None)],
@@ -8469,8 +8644,9 @@ class _Term:
 
     @staticmethod
     def draw(rows):
-        sys.stdout.write("\033[H" + "\n".join(rows) + "\033[J")
-        sys.stdout.flush()
+        stream = sys.__stdout__
+        stream.write("\033[H" + "\n".join(rows) + "\033[J")
+        stream.flush()
 
     def prompt(self, label, hint=""):
         """One-line input drawn as a band at the bottom; esc cancels."""
@@ -8508,7 +8684,7 @@ def _resume_span(plan, flash=""):
     if flash:
         return (flash, "green" if flash.startswith("✓") else "amber", None)
     if not plan or (plan["gone"] and not plan["archived"]):
-        why = "this harness can't reopen it" if not plan else f"{plan['provider']} deleted it"
+        why = "this harness can't reopen it" if not plan else (plan["note"] if plan.get("blocked") else f"{plan['provider']} deleted it")
         return [(f"{why} — start a fresh agent that reloads it with navcom --recap", "cream", None), ("   ", None, None),
                 (" r ", "ink", "amber"), (" pick agent ", "amber", None), (" c ", "ink", "amber"), (" copy", "amber", None)]
     keys = [("   ", None, None), (" r ", "ink", "amber"), (" here ", "amber", None), (" t ", "ink", "amber"),
@@ -8516,7 +8692,7 @@ def _resume_span(plan, flash=""):
             (" fresh", "amber", None)]
     if plan["gone"]:
         return [(f"navcom --resume {short_ref(plan['key'])}   (restores {plan['provider']}'s deleted file first)", "cream", None)] + keys
-    return [(plan["line"], "cream", None)] + keys
+    return [((plan.get("note", "") + " · " if plan.get("note") else "") + plan["line"], "cream", None)] + keys
 
 
 def _resume_action(conn, plan, k, term=None, key=None, provider=None, focus=None):
@@ -8557,10 +8733,16 @@ def _resume_action(conn, plan, k, term=None, key=None, provider=None, focus=None
 
 def _menu_revive(term, conn, key, provider, focus=None):
     """Pick the agent that picks this session back up: a fresh session primed with navcom --recap."""
-    options = fresh_harnesses(provider)
+    with _menu_busy(term, "Finding available fresh harnesses"):
+        options = fresh_harnesses(provider)
     if not options:
         return "· none of the agents navcom knows how to start is installed here"
     ref = display_ref(conn, key, provider)
+    try:
+        context_key = _conversation_root(conn, key, provider)
+    except ValueError:
+        context_key = key
+    context_ref = display_ref(conn, context_key, provider)
     plans = {}
     sel, flash = 0, ""
     while True:
@@ -8570,7 +8752,7 @@ def _menu_revive(term, conn, key, provider, focus=None):
             plans[h] = revive_plan(conn, key, h, provider, focus)
         plan = plans[h]
         body = [_line([("  A fresh agent starts in the session's folder and first runs ", "grey_lt", None),
-                       (f"navcom --recap {ref}", "yellow", None)], w),
+                       (f"navcom --recap {context_ref}" + (" + selected child" if context_key != key else ""), "yellow", None)], w),
                 _line([("  (every user message, where it stopped, commands run, files changed), then tells you where it left off.",
                         "grey_lt", None)], w),
                 _line([], w)]
@@ -8592,6 +8774,7 @@ def _menu_revive(term, conn, key, provider, focus=None):
         term.draw(_screen(f"REVIVE ▸ {ref}", body, w, hgt, "↑↓ pick agent · enter start here · t new tab · c copy · esc back",
                           f"navcom --resume {ref}{':' + str(focus) if focus else ''} --with {h}", resume=span))
         flash = ""
+        _menu_release_index(conn)
         k = term.key()
         if k in ("esc", "q", "left"):
             return ""
@@ -8629,21 +8812,27 @@ def _menu_search(term, conn, query):
         else:
             rest.append(w)
     q = " ".join(rest)
-    hits, cooked, note = search_hits(conn, q, providers=providers, limit=12,
-                                     role="tool" if tool else None, include_tools=tool)
+    with _menu_busy(term, "Searching indexed conversations"):
+        hits, cooked, note = search_hits(conn, q, providers=providers, limit=12,
+                                         role="tool" if tool else None, include_tools=tool)
     groups = _group_hits(conn, hits)
     items = []  # (kind, payload)
     for g in groups:
         project, title = session_meta(conn, g["key"], g["provider"])
+        title = _ui_read(conn, "annotations").get(g["key"], {}).get("name") or title
         items.append(("head", (g, project, title)))
         for h in g["hits"]:
             items.append(("hit", (g, h)))
+    all_items = items
+    children = {g['key']: _session_parent(conn, g['key'], g['provider']) for g in groups}
+    show_children = True
     sel = next((i for i, it in enumerate(items) if it[0] == "hit"), 0)
     top, plans, flash = 0, {}, ""
     while True:
         w, hgt = term.size()
         body = [_line([("  query ", "grey_lt", None), (cooked or "(nothing searchable)", "cyan", None),
                        (f"   {len(hits)} hits in {len(groups)} sessions", "grey_lt", None)], w)]
+        body.append(_line([("  h " + ("hide" if show_children else "show") + " child conversations", "amber", None)], w))
         if note:
             body.append(_line([("  note: " + note, "amber", None)], w))
         view = hgt - 10 - len(body)
@@ -8654,7 +8843,9 @@ def _menu_search(term, conn, query):
         for i, (kind, payload) in enumerate(items[top:top + view], start=top):
             if kind == "head":
                 g, project, title = payload
-                body.append(_line([("  ", None, None), (session_date(conn, g["key"]), "grey_lt", None),
+                parent, name = children[g['key']]
+                prefix = "    ↳ CHILD " + name + " · " if parent else "  ● "
+                body.append(_line([(prefix, "orange_hot" if parent else "cyan", None), (session_date(conn, g["key"]), "grey_lt", None),
                                    (f"  {g['provider']:<9}", "cyan", None), (pretty_project(project)[:28] + "  ", "cream", None),
                                    (title[:max(0, w - 60)], "gold", None)], w))
             else:
@@ -8666,7 +8857,7 @@ def _menu_search(term, conn, query):
                                    (f"{h.role}: ", ROLE_COLORS.get(h.role, "cyan"), "amber" if on else None),
                                    (snip, "ink" if on else "cream", "amber" if on else None)], w))
         if not items:
-            body.append(_line([("  No hits — try fewer words, or a OR b.", "amber", None)], w))
+            body.append(_line([("  Child hits hidden — h shows them." if all_items and not show_children else "  No hits — try fewer words, or a OR b.", "amber", None)], w))
         cur = items[sel][1] if items and items[sel][0] == "hit" else None
         cli = f"navcom {query}" + (f"   →   navcom --open {display_ref(conn, cur[0]['key'], cur[0]['provider'])}:{cur[1].msg_index}"
                                     if cur else "")
@@ -8677,12 +8868,19 @@ def _menu_search(term, conn, query):
                           f"↑↓ move · enter read · {RESUME_KEYS} · / new search · esc back", cli,
                           resume=_resume_span(plan, flash) if cur else None))
         flash = ""
+        _menu_release_index(conn)
         k = term.key()
         if k in ("r", "t", "c", "n") and cur:
             flash = _resume_action(conn, plan, k, term, cur[0]["key"], cur[0]["provider"], cur[1].msg_index)
             continue
         if k in ("esc", "q", "left"):
             return
+        if k == "h":
+            show_children = not show_children
+            items = [item for item in all_items if show_children or not children[item[1][0]['key']][0]]
+            sel = next((i for i, it in enumerate(items) if it[0] == "hit"), 0)
+            top = 0
+            continue
         if k == "/":
             return "again"
         if k in ("up", "k"):
@@ -8697,11 +8895,14 @@ def _menu_view(term, conn, key, provider, focus=None):
     last = max_msg_index(conn, key)
     lo = max(1, (focus or 1) - 60)
     hi = (focus or 1) + 120 if focus else 300
-    turns = fetch_window_rows(conn, key, [(lo, hi)])
+    with _menu_busy(term, "Opening conversation text"):
+        turns = fetch_window_rows(conn, key, [(lo, hi)])
     project, title = session_meta(conn, key, provider)
+    title = _ui_read(conn, "annotations").get(key, {}).get("name") or title
     ref = display_ref(conn, key, provider)
     plan = resume_plan(conn, key, provider)
-    scroll, flash = None, ""
+    view_state = _ui_read(conn, "view:" + key + ":" + str(focus))
+    scroll, flash = view_state.get("scroll"), ""
     while True:
         w, hgt = term.size()
         rows, anchor = [], 0
@@ -8720,7 +8921,9 @@ def _menu_view(term, conn, key, provider, focus=None):
         term.draw(_screen(f"SESSION ▸ {ref}", head + rows[scroll:scroll + view - 2], w, hgt,
                           f"↑↓ scroll · pgup/pgdn page · {RESUME_KEYS} · esc back", cli, resume=_resume_span(plan, flash)))
         flash = ""
+        _menu_release_index(conn)
         k = term.key()
+        _ui_write(conn, "view:" + key + ":" + str(focus), {"scroll": scroll})
         if k in ("r", "t", "c", "n"):
             flash = _resume_action(conn, plan, k, term, key, provider, focus)
             continue
@@ -8740,9 +8943,379 @@ def _menu_view(term, conn, key, provider, focus=None):
             scroll = len(rows)
 
 
-def _menu_list(term, conn, title, entries, cli, on_enter=None, resumable=False):
+def _ui_read(conn, name):
+    try:
+        row = conn.execute("SELECT value FROM navcom_ui WHERE name=?", (name,)).fetchone()
+        value = json.loads(row[0]) if row else {}
+        return value if isinstance(value, dict) else {}
+    except (sqlite3.Error, ValueError, TypeError):
+        return {}
+
+
+def _ui_write(conn, name, value):
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS navcom_ui (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("INSERT OR REPLACE INTO navcom_ui VALUES (?, ?)", (name, json.dumps(value)))
+        conn.commit()
+        return True
+    except sqlite3.Error:
+        conn.rollback()
+        return False
+
+
+@contextlib.contextmanager
+def _menu_busy(term, label, immediate=False):
+    """Animate long UI operations without transferring SQLite to another thread."""
+    import threading
+    import time
+    stopped = threading.Event()
+    started = time.monotonic()
+    def draw(stage=0):
+        w, h = term.size()
+        term.draw(loading_frame(w, h, stage, label, time.monotonic() - started))
+    def animate():
+        if not immediate and stopped.wait(.12):
+            return
+        while not stopped.is_set():
+            draw()
+            if stopped.wait(.08):
+                break
+    if immediate:
+        draw()
+    worker = threading.Thread(target=animate, name="navcom-ui-progress", daemon=True)
+    worker.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        worker.join()
+
+
+def _recent_families(conn, logs, annotations, limit=80):
+    """Keep whole families, ordered by their newest member; never orphan a child due to the limit."""
+    nodes = {}
+    for key, mtime, size, provider in logs:
+        parent, nickname = _session_parent(conn, key, provider)
+        nodes[key] = dict(key=key, mtime=mtime, size=size, provider=provider,
+                          parent_id=parent, nickname=nickname, children=[])
+    ids = {(n['provider'], session_ref(k)): k for k, n in nodes.items()}
+    # Older/archived parents may be absent from live discovery but still present in the index.
+    indexed = {f: (m, size) for f, m, size in conn.execute('SELECT file, mtime, size FROM file_state')}
+    for key, annotation in annotations.items():
+        if annotation.get('favorite') and key not in nodes and key in indexed:
+            mtime, size = indexed[key]
+            provider = _key_provider(conn, key)
+            parent, nickname = _session_parent(conn, key, provider)
+            nodes[key] = dict(key=key, mtime=mtime, size=size, provider=provider,
+                              parent_id=parent, nickname=nickname, children=[])
+            ids[(provider, session_ref(key))] = key
+    index_ids = {(_key_provider(conn, k), session_ref(k)): k for k in indexed}
+    pending = list(nodes)
+    for key in pending:
+        n = nodes[key]
+        identity = (n['provider'], n['parent_id'])
+        if n['parent_id'] and identity not in ids and identity in index_ids:
+            parent_key = index_ids[identity]
+            mtime, size = indexed[parent_key]
+            parent, nickname = _session_parent(conn, parent_key, n['provider'])
+            nodes[parent_key] = dict(key=parent_key, mtime=mtime, size=size, provider=n['provider'],
+                                     parent_id=parent, nickname=nickname, children=[])
+            ids[identity] = parent_key
+            pending.append(parent_key)
+    for key, n in nodes.items():
+        parent_key = ids.get((n['provider'], n['parent_id']))
+        n['parent'] = parent_key if parent_key != key else None
+    # Break malformed cycles for display. Resume validation still reports the ancestry problem.
+    for key in nodes:
+        seen, cursor = set(), key
+        while cursor is not None:
+            if cursor in seen:
+                nodes[cursor]['parent'] = None
+                break
+            seen.add(cursor)
+            cursor = nodes[cursor]['parent']
+    roots = []
+    for key, n in nodes.items():
+        if n['parent']:
+            nodes[n['parent']]['children'].append(key)
+        else:
+            roots.append(key)
+    def members(root):
+        result, stack = [], [root]
+        while stack:
+            key = stack.pop()
+            result.append(key)
+            stack.extend(sorted(nodes[key]['children'], key=lambda k: nodes[k]['mtime']))
+        return result
+    families = {root: members(root) for root in roots}
+    roots.sort(key=lambda root: max(nodes[k]['mtime'] or 0 for k in families[root]), reverse=True)
+    chosen = roots[:limit] if limit else roots
+    chosen += [root for root in roots[len(chosen):]
+               if any(annotations.get(k, {}).get('favorite') for k in families[root])]
+    keep = {k for root in chosen for k in families[root]}
+    nodes = {k: n for k, n in nodes.items() if k in keep}
+    index_logs(conn, [(k, n['mtime'], n['size'], n['provider']) for k, n in nodes.items()
+                      if os.path.exists(k.split('#', 1)[0])], progress=False)
+    for key, n in nodes.items():
+        n['project'], n['title'] = session_meta(conn, key, n['provider'])
+        n['title'] = _one_line(n['title'], 180)
+    return nodes, chosen
+
+
+def _recent_matches(conn, nodes, annotations, query):
+    if not query.strip():
+        return {}, set(nodes)
+    words = query.casefold().split()
+    matches = set()
+    for key, n in nodes.items():
+        a = annotations.get(key, {})
+        text = ' '.join(str(v) for v in (n['title'], n['project'], n['nickname'], n['provider'],
+                                         a.get('name', ''), a.get('note', ''), session_ref(key))).casefold()
+        if all(word in text for word in words):
+            matches.add(key)
+    focus = {}
+    keys = list(nodes)
+    cooked = fts_prefix_query(query) or fts_literal_query(query)
+    if cooked:
+        for start in range(0, len(keys), 400):
+            chunk = keys[start:start + 400]
+            sql = ("SELECT file, min(msg_index) FROM session_fts WHERE session_fts MATCH ? AND file IN ("
+                   + ','.join('?' for _ in chunk) + ") GROUP BY file")
+            try:
+                found = conn.execute(sql, [cooked] + chunk).fetchall()
+            except sqlite3.OperationalError as exc:
+                if not _is_query_error(exc):
+                    raise
+                found = conn.execute(sql, [fts_literal_query(query)] + chunk).fetchall() if fts_literal_query(query) else []
+            focus.update(found)
+            matches.update(focus)
+    return focus, matches
+
+
+def _recent_open_branches(nodes, expanded, matches, query='', favorites=False, annotations=None, collapsed=None):
+    opened = set(expanded)
+    relevant = set(matches) if query else set()
+    if favorites:
+        relevant.update(k for k, a in (annotations or {}).items() if a.get('favorite') and k in nodes)
+    for key in relevant:
+        if nodes[key]['children']:
+            opened.add(key)
+        parent = nodes[key]['parent']
+        while parent:
+            opened.add(parent)
+            parent = nodes[parent]['parent']
+    return opened - set(collapsed or ())
+
+
+def _recent_tree(nodes, roots, annotations, expanded, matches, query='', favorites=False, collapsed=None):
+    """Search chooses whole families; expansion controls visibility independently."""
+    opened = _recent_open_branches(nodes, expanded, matches, query, favorites, annotations, collapsed)
+    def family(key):
+        result = [key]
+        for child in nodes[key]['children']:
+            result.extend(family(child))
+        return result
+    def visible(key, depth):
+        result = [(key, depth)]
+        if key in opened:
+            for child in sorted(nodes[key]['children'], key=lambda k: nodes[k]['mtime'] or 0, reverse=True):
+                result.extend(visible(child, depth + 1))
+        return result
+    rows = []
+    for root in sorted(roots, key=lambda k: not annotations.get(k, {}).get('favorite', False)):
+        members = family(root)
+        if query and not any(k in matches for k in members):
+            continue
+        if favorites and not any(annotations.get(k, {}).get('favorite') for k in members):
+            continue
+        rows.extend(visible(root, 0))
+    return rows
+
+
+def _launch_preview(plan, selected_key):
+    if not plan or plan.get('blocked') or (plan['gone'] and not plan['archived']):
+        return 'Original unavailable · n chooses a fresh harness with saved context'
+    action = 'Open parent conversation' if plan['key'] != selected_key else 'Resume original conversation'
+    return f"{action} · {plan['provider']} · {pretty_project(plan['cwd']) or 'current folder'}"
+
+
+def _recent_last_words(conn, key):
+    row = conn.execute("SELECT f.text FROM turn_loc l JOIN session_fts f ON f.rowid=l.rid "
+                       "WHERE l.file=? AND f.role='assistant' ORDER BY l.msg_index DESC LIMIT 1", (key,)).fetchone()
+    return _one_line(row[0], 220) if row else 'No assistant response indexed yet.'
+
+
+def _menu_recent(term, conn):
+    annotations = _ui_read(conn, 'annotations')
+    state = _ui_read(conn, 'recents')
+    expanded = set(state.get('expanded', []))
+    collapsed = set(state.get('collapsed', []))
+    query, favorites = state.get('query', ''), bool(state.get('favorites'))
+    selected, top, flash = state.get('selected'), max(0, int(state.get('top', 0))), ''
+    plans, excerpts = {}, {}
+    with _menu_busy(term, 'Loading recent conversation families', immediate=True):
+        nodes, roots = _recent_families(conn, list_logs(ALL_PROVIDERS), annotations)
+        focus, matches = _recent_matches(conn, nodes, annotations, query)
+    def save():
+        return _ui_write(conn, 'recents', dict(expanded=sorted(expanded), collapsed=sorted(collapsed), query=query, favorites=favorites,
+                                             selected=selected, top=top))
+    try:
+        while True:
+            rows = _recent_tree(nodes, roots, annotations, expanded, matches, query, favorites, collapsed)
+            opened = _recent_open_branches(nodes, expanded, matches, query, favorites, annotations, collapsed)
+            sel = next((i for i, (key, _) in enumerate(rows) if key == selected), 0)
+            selected = rows[sel][0] if rows else None
+            w, h = term.size()
+            room = max(1, h - 16)
+            top = min(top, max(0, len(rows) - room))
+            if sel < top: top = sel
+            if sel >= top + room: top = sel - room + 1
+            body = [_line([('  / search names, folders, notes + conversation text · x clear', 'cyan', None)], w),
+                    _line([(f"  {'Favorites' if favorites else 'Recent families'} · {len(roots)} families · {len(rows)} visible"
+                            + (f' · search: {query}' if query else ''), 'grey_lt', None)], w),
+                    _line([('  ? keys · h children · f star · v favorites · e name · d note', 'amber', None)], w)]
+            for i, (key, depth) in enumerate(rows[top:top + room], top):
+                n, a = nodes[key], annotations.get(key, {})
+                marker = ('▾ ' if key in opened else '▸ ') if n['children'] else '● '
+                prefix = '  ' * min(depth, 8) + ('↳ CHILD ' if depth else 'CHILD (parent unavailable) ' if n['parent_id'] else '')
+                title = a.get('name') or n['title'] or n['nickname'] or '(untitled conversation)'
+                stamp = datetime.fromtimestamp(n['mtime']).strftime('%m-%d %H:%M') if n['mtime'] else '?'
+                title = _trim_snippet(title, max(18, w - len(prefix) - 48))
+                text = f"{prefix}{marker}{'★ ' if a.get('favorite') else ''}{title}"
+                tail = f"  · {n['provider']} · {pretty_project(n['project'])} · {stamp}"
+                if n['children']: text += f" [{len(n['children'])} children]"
+                if query and key in matches: text += ' [match]'
+                on = i == sel
+                body.append(_line([('▶ ' if on else '  ', 'orange_hot', None),
+                                   (text, 'ink' if on else 'orange_hot' if depth else 'gold', 'amber' if on else None),
+                                   (tail, 'ink' if on else 'grey_lt', 'amber' if on else None)], w))
+            if not rows:
+                body.append(_line([('  No matching conversations · / change search · x clear · v all/favorites', 'amber', None)], w))
+            plan = None
+            if selected:
+                n, a = nodes[selected], annotations.get(selected, {})
+                if selected not in plans: plans[selected] = resume_plan(conn, selected, n['provider'])
+                plan = plans[selected]
+                if selected not in excerpts:
+                    with _menu_busy(term, 'Reading where this conversation stopped'):
+                        excerpts[selected] = _recent_last_words(conn, selected)
+                body += [_line([], w), _line([('  ' + _launch_preview(plan, selected), 'cyan', None)], w),
+                         _line([('  ' + ('Note: ' + a['note'] if a.get('note') else 'Last reply: ' + excerpts[selected]), 'cream', None)], w),
+                         _line([('  n: fresh harness + saved context · enter: read selected conversation', 'grey_lt', None)], w)]
+            term.draw(_screen('RECENT CONVERSATIONS', body, w, h,
+                              '↑↓ move · enter read · / search · h children · ? keys · esc back',
+                              flash or ('navcom --open ' + short_ref(selected) if selected else ''),
+                              resume=_resume_span(plan) if selected else None))
+            flash = ''
+            _menu_release_index(conn)
+            k = term.key()
+            if k in ('esc', 'q'): return
+            if k == '?':
+                help_rows = [
+                    'h: expand/collapse selected branch (on a leaf child, toggles its parent)',
+                    '/: search recent names, folders, notes and conversation text',
+                    'Search keeps whole matching families; h can hide/show their children',
+                    'x: clear search; left: collapse branch or move to parent',
+                    'f: star/unstar selected conversation; v: favorites/all',
+                    'e: rename selected conversation; d: edit where-we-left-off note',
+                    'enter: read selected conversation at its matching passage',
+                    'r: resume original (or parent) here; t: resume in a new tab',
+                    'n: choose a fresh harness with saved context; c: copy command',
+                    'Your selection, filters, expansion and reading position are saved locally',
+                ]
+                entries = [([(line, 'cream', None)], None)
+                           for text in help_rows for line in _wrap(text, max(20, w - 8))]
+                _menu_list(term, conn, 'RECENTS KEYS', entries, 'navcom --sessions')
+                continue
+            if k in ('up', 'k', 'down', 'j', 'pgup', 'pgdn', 'home', 'end') and rows:
+                delta = -1 if k in ('up', 'k') else 1 if k in ('down', 'j') else -room if k == 'pgup' else room
+                pos = 0 if k == 'home' else len(rows)-1 if k == 'end' else max(0, min(len(rows)-1, sel + delta))
+                selected = rows[pos][0]
+            elif k == 'h' and selected:
+                target = selected if nodes[selected]['children'] else nodes[selected]['parent']
+                if target:
+                    if target in opened:
+                        expanded.discard(target)
+                        collapsed.add(target)
+                        selected = target
+                    else:
+                        expanded.add(target)
+                        collapsed.discard(target)
+                else:
+                    flash = 'This conversation has no children'
+            elif k == 'left' and selected:
+                if selected in opened:
+                    expanded.discard(selected)
+                    collapsed.add(selected)
+                elif nodes[selected]['parent']:
+                    selected = nodes[selected]['parent']
+            elif k in ('/', 'x'):
+                value = '' if k == 'x' else term.prompt('SEARCH RECENTS', 'names, folders, notes or conversation text · enter search · esc cancel')
+                if value is not None:
+                    query, top = value, 0
+                    collapsed.clear()
+                    if not query and selected:
+                        ancestor = nodes[selected]['parent']
+                        while ancestor:
+                            expanded.add(ancestor)
+                            ancestor = nodes[ancestor]['parent']
+                    with _menu_busy(term, 'Searching recent conversation families'):
+                        focus, matches = _recent_matches(conn, nodes, annotations, query)
+            elif k == 'v':
+                favorites, top = not favorites, 0
+            elif k in ('f', 'e', 'd') and selected:
+                a = dict(annotations.get(selected, {}))
+                if k == 'f': a['favorite'] = not a.get('favorite')
+                else:
+                    field = 'name' if k == 'e' else 'note'
+                    value = term.prompt('RENAME' if k == 'e' else 'WHERE WE LEFT OFF', 'enter saves · blank restores default · esc cancels')
+                    if value is None: continue
+                    a[field] = _one_line(value, 240)
+                annotations[selected] = a
+                flash = 'Saved' if _ui_write(conn, 'annotations', annotations) else 'Could not save: index is read-only or busy'
+                with _menu_busy(term, 'Updating recent search'):
+                    focus, matches = _recent_matches(conn, nodes, annotations, query)
+            elif k == 'enter' and selected:
+                save()
+                _menu_view(term, conn, selected, nodes[selected]['provider'], focus.get(selected))
+            elif k in ('r', 't', 'c', 'n') and selected:
+                save()
+                flash = _resume_action(conn, plan, k, term, selected, nodes[selected]['provider'], focus.get(selected))
+    finally:
+        save()
+
+
+def _recent_entries(conn, logs, limit=80):
+    parents, combined, selected = [], [], []
+    # Filter before limiting: a burst of child activity must not hide all parents.
+    for log in reversed(logs):
+        key, mtime, _size, prov = log
+        parent, name = _session_parent(conn, key, prov)
+        if len(combined) < limit or (not parent and len(parents) < limit):
+            selected.append((log, parent, name))
+            if len(combined) < limit:
+                combined.append(key)
+            if not parent:
+                parents.append(key)
+        if len(combined) >= limit and len(parents) >= limit:
+            break
+    index_logs(conn, [log for log, _, _ in selected], progress=False)
+    entries = {}
+    for (key, mtime, _size, prov), parent, name in selected:
+        project, title = session_meta(conn, key, prov)
+        stamp = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M") if mtime else "?"
+        label = f"{name} · parent {parent[:12]} · {title}" if parent else title
+        marker = ("    ↳ CHILD  ", "orange_hot", None) if parent else ("● ", "cyan", None)
+        entries[key] = ([marker, (stamp + "  ", "grey_lt", None), (f"{prov:<9}", "cyan", None),
+                         (f"{pretty_project(project)[:26]:<28}", "cream", None),
+                         (label[:120], "gold", None)], (key, prov))
+    return [entries[k] for k in parents], [entries[k] for k in combined]
+
+
+def _menu_list(term, conn, title, entries, cli, on_enter=None, resumable=False, alternate_entries=None):
     """entries: [(spans, payload)]; resumable: payloads are (key, provider) and r/t/c reopen them."""
     sel, top, plans, flash = 0, 0, {}, ""
+    primary_entries, show_children = entries, False
     while True:
         w, hgt = term.size()
         view = hgt - 9 - resumable
@@ -8762,11 +9335,20 @@ def _menu_list(term, conn, title, entries, cli, on_enter=None, resumable=False):
             if payload[0] not in plans:
                 plans[payload[0]] = resume_plan(conn, payload[0], payload[1])
             plan = plans[payload[0]]
-        term.draw(_screen(title, body, w, hgt, ("↑↓ move · enter open · " if on_enter else "↑↓ scroll · ")
-                          + (RESUME_KEYS + " · " if resumable else "") + "esc back", cli,
+        mode = "parents + children" if show_children else "parents only"
+        shown_title = f"{title} · {mode} · h toggle" if alternate_entries is not None else title
+        term.draw(_screen(shown_title, body, w, hgt, ("↑↓ move · enter open · " if on_enter else "↑↓ scroll · ")
+                          + (RESUME_KEYS + " · " if resumable else "") + ("h hide children · " if show_children else "h show children · " if alternate_entries is not None else "") + "esc back", cli,
                           resume=_resume_span(plan, flash) if resumable else None))
         flash = ""
+        _menu_release_index(conn)
         k = term.key()
+        if k == "h" and alternate_entries is not None:
+            show_children = not show_children
+            entries = alternate_entries if show_children else primary_entries
+            sel = next((i for i, (_, item) in enumerate(entries) if item == payload), 0)
+            top = 0
+            continue
         if resumable and payload and k in ("r", "t", "c", "n"):
             flash = _resume_action(conn, plan, k, term, payload[0], payload[1])
             continue
@@ -8790,6 +9372,10 @@ LEARN_PAGES = [
                    "That's the whole loop. Agents (Claude Code, Codex, Gemini, Copilot, …) already know it from\n"
                    "the skill card navcom installed for them."),
     ("GET BACK IN", "On any search hit or open session:   r  resume here   ·   t  new tab   ·   c  copy the command\n"
+                    "Recents groups families; h expands the selected parent. Child resumes open their root parent.\n"
+                    "Recents: / search text and titles · f star · v favorites · e rename · d note · x clear search.\n"
+                    "Your filter, selected conversation, expansion and reading position are saved locally.\n"
+                    "Fresh agents load the parent recap plus the selected child’s work.\n"
                     "The RESUME line shows exactly what runs: cd <its folder> && <harness> resume <id>.\n"
                     "From the shell: navcom --resume <ref>  (--tab for a new tab, --print to just print it).\n"
                     "A transcript its harness deleted is restored from navcom's archive first.\n"
@@ -8814,112 +9400,161 @@ LEARN_PAGES = [
 ]
 
 
-def run_menu(conn):
+def _menu_release_index(conn):
+    """Never hold the SQLite writer while waiting for a human to press a key."""
+    if not conn.in_transaction:
+        return
     try:
-        return _run_menu(conn)
-    except _ResumeNow as now:  # the terminal is restored by now; hand it to the harness
         conn.commit()
-        conn.close()
+    except sqlite3.OperationalError as exc:
+        conn.rollback()
+        if not any(word in str(exc).lower() for word in ('locked', 'busy')):
+            raise
+
+
+def _menu_maintain(term, conn, stats):
+    """Keep operational failures inside the TUI; retry always rechecks writer availability."""
+    global INDEX_READ_ONLY
+    import time
+    while True:
+        output = io.StringIO()
+        started = time.monotonic()
+        error = None
+        try:
+            with _menu_busy(term, 'Indexing and archiving conversations', immediate=True), \
+                    contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                _menu_release_index(conn)
+                # Fail before expensive discovery if another process owns the writer.
+                conn.execute('BEGIN IMMEDIATE')
+                conn.execute('UPDATE file_state SET size=size WHERE 0')
+                conn.commit()
+                INDEX_READ_ONLY = False
+                cmd_maintain(conn)
+        except sqlite3.OperationalError as exc:
+            conn.rollback()
+            error = str(exc)
+        if error is None:
+            try:
+                conn, stats = _load_menu_dashboard(term, conn, force=True)
+            except sqlite3.OperationalError:
+                conn.rollback()
+                output.write('\nUpkeep completed; dashboard refresh deferred. Press r on the dashboard to refresh.\n')
+        locked = error and any(word in error.lower() for word in ('locked', 'busy'))
+        title = 'UPKEEP ▸ index busy' if locked else 'UPKEEP ▸ stopped' if error else 'UPKEEP ▸ done'
+        messages = []
+        if locked:
+            messages += ['The index is busy in another process. NavCom is still open.',
+                         'Another TUI, search or daily upkeep job may hold the lock.',
+                         'Close/reopen older NavCom windows if they keep holding it, then retry.']
+        elif error:
+            messages.append('Upkeep stopped: ' + error)
+        if error:
+            messages += ['Committed work is kept; the unfinished database transaction was rolled back.',
+                         'r retries · esc or enter returns to the dashboard']
+        else:
+            messages += [f'Completed in {time.monotonic() - started:.1f}s.',
+                         'esc or enter returns to the dashboard']
+        messages += output.getvalue().splitlines()[-12:]
+        while True:
+            w, h = term.size()
+            body = [_line([('  ' + line, 'amber' if error else 'green', None)], w)
+                    for message in messages for line in _wrap(message, max(20, w - 4))]
+            term.draw(_screen(title, body, w, h, 'r retry · esc/enter back' if error else 'esc/enter back', 'navcom --maintain'))
+            _menu_release_index(conn)
+            key = term.key()
+            if key in ('esc', 'q', 'enter', 'left'):
+                return stats
+            if key == 'r' and error:
+                break
+
+
+def run_menu(conn=None, index_path=None):
+    try:
+        return _run_menu(conn, index_path)
+    except _ResumeNow as now:  # the terminal is restored by now; hand it to the harness
         return resume_here(now.plan)
 
 
-def _run_menu(conn):
+def _run_menu(conn=None, index_path=None):
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        safe_print("navcom --menu is the interactive terminal UI — run it in a terminal. "
+        safe_print("navcom --tui is the interactive terminal UI — run it in a terminal. "
                    "For scripts and agents: navcom --help")
         return 0
     import time
     with _Term() as term:
-        w, h = term.size()
-        term.draw(splash_frame(w) + [_line([], w)] * max(0, h - 20))
-        stats = dashboard_stats(conn)
-        term.key(timeout=2.2)
-        sel = 0
-        while True:
-            w, h = term.size()
-            term.draw(dashboard_frame(stats, sel, w, h))
-            k = term.key(timeout=1.0)  # 1s tick keeps the clock live
-            if k is None:
-                continue
-            if k in ("q", "esc"):
-                return 0
-            if k in ("up", "k"):
-                sel = (sel - 1) % len(MENU_ACTIONS)
-            elif k in ("down", "j"):
-                sel = (sel + 1) % len(MENU_ACTIONS)
-            elif k == "r":
-                stats = dashboard_stats(conn)
-            elif k in ("enter", "/"):
-                action = "search" if k == "/" else MENU_ACTIONS[sel][0]
-                if action == "quit":
+        conn, stats = _load_menu_dashboard(term, conn, index_path)
+        try:
+            sel = 0
+            while True:
+                w, h = term.size()
+                term.draw(dashboard_frame(stats, sel, w, h))
+                _menu_release_index(conn)
+                k = term.key(timeout=1.0)  # 1s tick keeps the clock live
+                if k is None:
+                    continue
+                if k == "q":
                     return 0
-                if action == "search":
-                    while True:
-                        q = term.prompt("SEARCH", "type words · add --claude/--codex/… or --tool · enter go · esc back")
-                        if not q or _menu_search(term, conn, q) != "again":
-                            break
-                elif action == "recent":
-                    logs = list_logs(ALL_PROVIDERS)[-80:]
-                    index_logs(conn, logs, progress=False)
-                    entries = []
-                    for key, mtime, _size, prov in reversed(logs):
-                        project, title = session_meta(conn, key, prov)
-                        stamp = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M") if mtime else "?"
-                        entries.append(([(stamp + "  ", "grey_lt", None), (f"{prov:<9}", "cyan", None),
-                                         (f"{pretty_project(project)[:26]:<28}", "cream", None),
-                                         (title[:80], "gold", None)], (key, prov)))
-                    _menu_list(term, conn, "RECENT SESSIONS", entries, "navcom --sessions",
-                               on_enter=lambda kp: _menu_view(term, conn, kp[0], kp[1]), resumable=True)
-                elif action == "open":
-                    ref = term.prompt("REF", "a ref from search results, e.g. 7ec78a59 or 7ec78a59:533 · esc back")
-                    if ref:
-                        m = re.match(r"^(.*?)[:#](\d+)$", ref)
-                        base, focus = (m.group(1), int(m.group(2))) if m else (ref, None)
-                        key, _ = resolve_ref(conn, base)
-                        if key:
-                            _menu_view(term, conn, key, _key_provider(conn, key), focus)
-                elif action == "harness":
-                    roots = provider_roots()
-                    counts = collections.Counter(l[3] for l in list_logs(ALL_PROVIDERS))
-                    entries = []
-                    for hid in ALL_PROVIDERS:
-                        n = counts.get(hid, 0)
-                        where = next((str(r) for r in roots.get(hid, []) if Path(r).exists()), "")
-                        label = EXTRA_HARNESSES.get(hid, {}).get("label", hid)
-                        entries.append(([("● " if n else "○ ", "green" if n else "grey", None),
-                                         (f"{label[:24]:<26}", "cream", None), (f"{n:>6} ", "yellow", None),
-                                         (f" --{hid:<11}", "orange_hot", None), (pretty_project(where)[:60], "grey_lt", None)], None))
-                    _menu_list(term, conn, f"HARNESSES ▸ {sum(1 for v in counts.values() if v)} active of {len(ALL_PROVIDERS)}",
-                               entries, "navcom --where")
-                elif action == "learn":
-                    entries = []
-                    for head, text in LEARN_PAGES:
-                        entries.append(([("■ " + head, "orange_hot", None)], None))
-                        for line in text.splitlines():
-                            entries.append(([("  " + line, "cream", None)], None))
-                        entries.append(([("", None, None)], None))
-                    _menu_list(term, conn, "LEARN NAVCOM", entries, "navcom --help")
-                elif action == "skill":
-                    import contextlib
-                    buf = io.StringIO()
-                    with contextlib.redirect_stdout(buf):
-                        install_skills(force=False, report=True)
-                    entries = [([("  " + line, "cream", None)], None) for line in buf.getvalue().splitlines()]
-                    entries += [([("", None, None)], None),
-                                ([("  Every agent harness reads this card, so your agents reach for navcom themselves.", "grey_lt", None)], None)]
-                    _menu_list(term, conn, "SKILL CARD", entries, "navcom --skill   ·   navcom --skill install")
-                elif action == "maintain":
-                    term.draw(_screen("UPKEEP ▸ running…", [_line([("  indexing every harness and archiving raw transcripts…", "cyan", None)], w)],
-                                      w, h, "please wait", "navcom --maintain"))
-                    import contextlib
-                    buf = io.StringIO()
-                    t0 = time.time()
-                    with contextlib.redirect_stdout(buf):
-                        cmd_maintain(conn)
-                    stats = dashboard_stats(conn)
-                    entries = [([("  " + line, "green", None)], None) for line in buf.getvalue().splitlines()]
-                    entries.append(([(f"  done in {time.time() - t0:.1f}s", "grey_lt", None)], None))
-                    _menu_list(term, conn, "UPKEEP ▸ done", entries, "navcom --maintain")
+                if k in ("up", "k"):
+                    sel = (sel - 1) % len(MENU_ACTIONS)
+                elif k in ("down", "j"):
+                    sel = (sel + 1) % len(MENU_ACTIONS)
+                elif k == "r":
+                    conn, stats = _load_menu_dashboard(term, conn, force=True)
+                elif k in ("enter", "/"):
+                    action = "search" if k == "/" else MENU_ACTIONS[sel][0]
+                    if action == "quit":
+                        return 0
+                    if action == "search":
+                        while True:
+                            q = term.prompt("SEARCH", "type words · add --claude/--codex/… or --tool · enter go · esc back")
+                            if not q or _menu_search(term, conn, q) != "again":
+                                break
+                    elif action == "recent":
+                        _menu_recent(term, conn)
+                    elif action == "open":
+                        ref = term.prompt("REF", "a ref from search results, e.g. 7ec78a59 or 7ec78a59:533 · esc back")
+                        if ref:
+                            m = re.match(r"^(.*?)[:#](\d+)$", ref)
+                            base, focus = (m.group(1), int(m.group(2))) if m else (ref, None)
+                            key, _ = resolve_ref(conn, base)
+                            if key:
+                                _menu_view(term, conn, key, _key_provider(conn, key), focus)
+                    elif action == "harness":
+                        roots = provider_roots()
+                        counts = collections.Counter(l[3] for l in list_logs(ALL_PROVIDERS))
+                        entries = []
+                        for hid in ALL_PROVIDERS:
+                            n = counts.get(hid, 0)
+                            where = next((str(r) for r in roots.get(hid, []) if Path(r).exists()), "")
+                            label = EXTRA_HARNESSES.get(hid, {}).get("label", hid)
+                            entries.append(([("● " if n else "○ ", "green" if n else "grey", None),
+                                             (f"{label[:24]:<26}", "cream", None), (f"{n:>6} ", "yellow", None),
+                                             (f" --{hid:<11}", "orange_hot", None), (pretty_project(where)[:60], "grey_lt", None)], None))
+                        _menu_list(term, conn, f"HARNESSES ▸ {sum(1 for v in counts.values() if v)} active of {len(ALL_PROVIDERS)}",
+                                   entries, "navcom --where")
+                    elif action == "learn":
+                        entries = []
+                        for head, text in LEARN_PAGES:
+                            entries.append(([("■ " + head, "orange_hot", None)], None))
+                            for line in text.splitlines():
+                                entries.append(([("  " + line, "cream", None)], None))
+                            entries.append(([("", None, None)], None))
+                        _menu_list(term, conn, "LEARN NAVCOM", entries, "navcom --help")
+                    elif action == "skill":
+                        import contextlib
+                        buf = io.StringIO()
+                        with contextlib.redirect_stdout(buf):
+                            install_skills(force=False, report=True)
+                        entries = [([("  " + line, "cream", None)], None) for line in buf.getvalue().splitlines()]
+                        entries += [([("", None, None)], None),
+                                    ([("  Every agent harness reads this card, so your agents reach for navcom themselves.", "grey_lt", None)], None)]
+                        _menu_list(term, conn, "SKILL CARD", entries, "navcom --skill   ·   navcom --skill install")
+                    elif action == "maintain":
+                        stats = _menu_maintain(term, conn, stats)
+
+        finally:
+            conn.commit()
+            conn.close()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
@@ -8940,6 +9575,21 @@ THE RECIPE (agents: this is all you need)
   navcom --skill                    print navcom's SKILL.md skill card (already auto-installed for
                                     every harness here: Claude, Codex, Gemini, Copilot, pi, omo, opencode,
                                     goose, Qwen, Kimi, Continue, Hermes, Kiro, … — navcom --skill install)
+
+DISCOVER COLLECTIONS (CLI and web share the same scopes and evidence)
+  navcom atlas                     discovery overview and grouping choices
+  navcom atlas list research       defined and suggested research families
+  navcom atlas list projects       exact project folders (also topics, districts, time, starships)
+  navcom atlas explore <collection>    branches, versions and conversations
+  navcom atlas search matrix --within <collection>    search the whole collection, not one page
+  navcom atlas show <ref>          evidence and safe resume preview; does not launch
+  navcom atlas tree <ref>          actual parent/child relationships
+  navcom atlas refresh             refresh cached evidence from the existing index
+  navcom atlas search --help       filters, --children, --limit, --offset and --json
+  navcom help browse               web scope controls, terminal keys and optional local models
+  navcom atlas help research       what each grouping means; suggestions are not ancestry
+  Atlas is read-only except its separate metadata cache. No model is required.
+  Leading atlas/help select commands; use --query "atlas help" to search those words.
 
 QUERIES — type anything; navcom never errors on query syntax
   navcom cognito token refresh      all words in one turn, each prefix-matched (auth → authentication)
@@ -8979,7 +9629,8 @@ READ
   navcom --open 7ec78a59 --user     just the user's turns
   navcom deploy --context           expand every hit in place with its neighbouring turns
   navcom --sessions                 your 20 most recent sessions, with titles
-  navcom --menu                     the retro full-screen UI: live dashboard, search, read, learn
+  navcom --menu                     open the retro local browser dashboard
+  navcom --tui                      the full-screen terminal dashboard
 
 GET BACK INTO A CONVERSATION (every search ends with the copy-paste command for the top session)
   navcom --resume 7ec78a59          cd to the session's folder and reopen it in its own harness, right
@@ -9161,9 +9812,9 @@ def build_parser():
                    help="Your most recent sessions, with titles (-n for how many; harness/date/project filters apply).")
     o.add_argument("--list", "--ls", action="store_true",
                    help="List session files with --file numbers (newest 50; -n 0 for all; honours --recent/harnesses).")
-    o.add_argument("--menu", "--tui", "--ui", action="store_true",
-                   help="The retro full-screen UI: live dashboard (retention, history, activity), search, read,\n"
-                        "learn the commands. Humans only — agents should use the plain commands.")
+    o.add_argument("--menu", "--ui", action="store_true", help="Open the retro local web menu in your browser.")
+    o.add_argument("--tui", action="store_true", help="Open the retro full-screen terminal interface.")
+    o.add_argument("--no-browser", action="store_true", help="With --menu, print the local URL without opening a browser.")
 
     m = parser.add_argument_group("summaries (slow: they call another LLM CLI)")
     m.add_argument("--solo", action="store_true", help="One consolidated summary of all hits.  navcom deploy --solo")
@@ -9583,6 +10234,61 @@ def _grok_build_bin():
     return str(home_bin) if home_bin.exists() else "grok"
 
 
+def _session_parent(conn, key, provider):
+    """Read actual ancestry, never infer it from transcript text or session_id."""
+    if provider == "claude":
+        match = re.search(r"/([0-9a-f-]{36})/subagents/", key)
+        return (match.group(1), Path(key).stem) if match else ("", "")
+    if provider != "codex":
+        return "", ""
+    path = key
+    if not os.path.isfile(path):
+        try:
+            row = conn.execute("SELECT path FROM archive_state WHERE file=?", (key,)).fetchone()
+            if row:
+                path = row[0]
+        except sqlite3.Error:
+            pass
+    try:
+        with open(path, encoding="utf-8") as handle:
+            obj = json.loads(handle.readline(1024 * 1024))
+        meta = (obj.get("payload") or {}) if obj.get("type") == "session_meta" else {}
+        source = meta.get("source")
+        spawn = source.get("subagent", {}).get("thread_spawn", {}) if isinstance(source, dict) and isinstance(source.get("subagent"), dict) else {}
+        parent = meta.get("parent_thread_id") or spawn.get("parent_thread_id") or ""
+        name = meta.get("agent_nickname") or meta.get("agent_path") or "child"
+        return (parent if isinstance(parent, str) else "", _one_line(str(name), 60))
+    except (OSError, ValueError, AttributeError):
+        return "", ""
+
+
+def _conversation_root(conn, key, provider):
+    """Resolve the entire ancestor chain; missing/cyclic ancestry must never launch a child."""
+    seen = set()
+    while True:
+        if key in seen:
+            raise ValueError("cyclic conversation ancestry; use n to load the saved context")
+        seen.add(key)
+        parent, _ = _session_parent(conn, key, provider)
+        if not parent:
+            return key
+        if not _UUID_ANY.fullmatch(parent):
+            raise ValueError("invalid parent conversation id; use n to load the saved context")
+        matches = [f for (f,) in conn.execute("SELECT file FROM file_state WHERE file LIKE ?", ("%" + parent + "%",))
+                   if session_ref(f) == parent and _key_provider(conn, f) == provider]
+        if not matches:
+            if provider == "claude":
+                candidate = str(Path(key).parent.parent) + ".jsonl"
+                matches = [candidate] if os.path.isfile(candidate) else []
+            else:
+                root = next((p for p in Path(key).parents if p.name in ("sessions", "archived_sessions")), None)
+                if root:
+                    matches = [str(p) for p in root.rglob(f"*{parent}.jsonl")]
+        if not matches:
+            raise ValueError(f"parent {parent} is missing; use n to load the saved child context")
+        key = sorted(matches)[0]
+
+
 def _resume_claude(key, ref):
     match = re.search(r"/([0-9a-f-]{36})/subagents/", key)  # a subagent sidechain → its parent session
     return ["claude", "--resume", match.group(1) if match else ref]
@@ -9674,6 +10380,12 @@ RESUME_FALLBACKS = {
 def resume_plan(conn, key, provider=None):
     """How to get back into a session: {cwd, argv, line, exact, note}. None if the harness can't."""
     provider = provider or _key_provider(conn, key)
+    selected_key = key
+    try:
+        key = _conversation_root(conn, key, provider)
+    except ValueError as exc:
+        return {"cwd": "", "argv": [], "line": "", "exact": False, "note": str(exc),
+                "provider": provider, "key": key, "gone": True, "archived": False, "blocked": True}
     project, _title = session_meta(conn, key, provider)
     if project.startswith("-"):
         project = decode_encoded_dir(project) or project
@@ -9684,7 +10396,7 @@ def resume_plan(conn, key, provider=None):
         if recorded.startswith("/"):
             cwd = recorded
     ref = session_ref(key)
-    note = ""
+    note = "resumes parent conversation" if key != selected_key else ""
     argv, exact = (RESUME_COMMANDS[provider](key, ref) if provider in RESUME_COMMANDS else None), True
     if not argv and provider in RESUME_FALLBACKS:
         argv, note = RESUME_FALLBACKS[provider](key, ref)
@@ -9711,6 +10423,8 @@ def resume_plan(conn, key, provider=None):
 
 def ensure_resumable(conn, plan):
     """A session its harness already deleted: put navcom's archived copy back first. → (ok, message)."""
+    if plan.get("blocked"):
+        return False, plan["note"]
     if not plan["gone"]:
         return True, ""
     if plan["archived"]:
@@ -9744,6 +10458,8 @@ def resume_here(plan):
             sys.stderr.write(f"navcom: the session's folder {plan['cwd']} no longer exists. The command is:\n  {plan['line']}\n")
             return 1
         os.chdir(plan["cwd"])
+    if plan.get("note"):
+        sys.stderr.write(f"navcom ▸ {plan['note']}\n")
     sys.stderr.write(f"navcom ▸ {plan['line']}\n")
     if plan.get("paste"):
         copied = copy_to_clipboard(plan["paste"])
@@ -9866,8 +10582,8 @@ def cmd_resume(conn, args, providers):
         if harness and harness not in REVIVE_AGENTS:
             safe_print(f"navcom: navcom doesn't know how to start {harness!r}. Pick one of: {', '.join(REVIVE_AGENTS)}")
             return 2
-        why = (f"navcom: {prov} can't reopen this session ({'it deleted the transcript' if plan else 'no resume-by-id'})."
-               if dead else "")
+        reason = plan["note"] if plan and plan.get("blocked") else "it deleted the transcript" if plan else "no resume-by-id"
+        why = f"navcom: {prov} can't reopen this session ({reason})." if dead else ""
         if not harness:
             if interactive and not args.print_only:
                 harness = _pick_harness_cli(conn, key, prov, why)
@@ -10084,14 +10800,26 @@ def fresh_harnesses(original=None):
 
 
 def revive_prompt(conn, key, provider, focus=None):
+    selected_key = key
+    try:
+        key = _conversation_root(conn, key, provider)
+    except ValueError:
+        pass  # A fresh harness can still read a child whose parent is unavailable.
     ref = display_ref(conn, key, provider)
+    child_context = ""
+    if key != selected_key:
+        child_ref = display_ref(conn, selected_key, provider)
+        child_context = f" Also run `navcom --recap {child_ref}` for the selected child agent's work."
+        if focus:
+            child_context += f" Read `navcom --open {child_ref}:{focus}` for the selected passage."
+        focus = None
     _project, title = session_meta(conn, key, provider)
     title = _one_line(title, 100).replace('"', "’").replace("'", "’")  # no shell quote-escaping in the line
     where = f" and `navcom --open {ref}:{focus}` for the part I was looking at" if focus else ""
     return (f"We are picking up an earlier {provider} session from {session_date(conn, key)} in this folder"
             + (f' ("{title}")' if title else "")
             + f". Before anything else, run `navcom --recap {ref}` to load what was asked, done and decided{where}. "
-              "Then tell me in a few lines where it left off and what the next step was.")
+              "Then tell me in a few lines where it left off and what the next step was." + child_context)
 
 
 def revive_plan(conn, key, harness, provider=None, focus=None):
@@ -10103,7 +10831,9 @@ def revive_plan(conn, key, harness, provider=None, focus=None):
         project, _t = session_meta(conn, key, provider)
         project = decode_encoded_dir(project) if project.startswith("-") else project
         cwd = project if project.startswith("/") else ""
-    note = ""
+    note = base.get("note", "")
+    if base.get("key", key) != key:
+        note = "fresh agent loads parent conversation and selected child context"
     if cwd and not os.path.isdir(cwd):
         note, cwd = f"its folder {cwd} is gone — starting in the current folder", ""
     prompt = revive_prompt(conn, key, provider, focus)
@@ -10215,7 +10945,11 @@ def cmd_recent_sessions(conn, logs, limit, keys=None):
         project, title = session_meta(conn, key, prov)
         stamp = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M") if mtime else "????-??-?? ??:??"
         title = (title[:90] + "…") if len(title) > 90 else title
-        safe_print(f"{stamp}  {STYLE.provider(prov, f'{prov:8s}')} {pretty_project(project) or '-':28s} {display_ref(conn, key, prov):10s} {title}")
+        parent, name = _session_parent(conn, key, prov)
+        marker = "    ↳ CHILD  " if parent else "● "
+        if parent:
+            title = f"{name} · parent {parent[:12]} · {title}"
+        safe_print(f"{marker}{stamp}  {STYLE.provider(prov, f'{prov:8s}')} {pretty_project(project) or '-':28s} {display_ref(conn, key, prov):10s} {title}")
     conn.commit()
     return 0
 
@@ -10266,6 +11000,20 @@ def cmd_where(conn, providers):
 
 
 def run(argv=None):
+    actual = list(sys.argv[1:] if argv is None else argv)
+    if not actual or actual == ['--help'] or actual == ['-h'] or actual[0] in ('atlas', 'help'):
+        import navcom_atlas_cli
+        try:
+            if actual and actual[0] == 'atlas':
+                return navcom_atlas_cli.run(sys.modules[__name__], actual[1:])
+            if actual and actual[0] == 'help' and len(actual) > 1:
+                print(navcom_atlas_cli.help_text(sys.modules[__name__], actual[1]))
+            else:
+                print(navcom_atlas_cli.OVERVIEW)
+            return 0
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            print('navcom: ' + str(exc), file=sys.stderr)
+            return 2 if isinstance(exc, ValueError) else 1
     parser = build_parser()
     if not (sys.argv[1:] if argv is None else argv):
         parser.print_help()  # bare `navcom`: the manual (LLMs and humans both start here)
@@ -10294,6 +11042,17 @@ def run(argv=None):
         return 2
 
     index_path = Path(args.index).expanduser() if args.index else default_index_path()
+    if args.no_browser and not args.menu:
+        safe_print("navcom: --no-browser requires --menu.")
+        return 2
+    if args.menu and args.tui:
+        safe_print("navcom: choose --menu for the browser or --tui for the terminal.")
+        return 2
+    if args.menu and not (args.daily or args.maintain or args.restore):
+        import navcom_web
+        return navcom_web.serve(sys.modules[__name__], index_path, open_browser=not args.no_browser)
+    if args.tui and not (args.daily or args.maintain or args.restore):
+        return run_menu(index_path=index_path)
     try:
         conn = open_index(index_path)
     except sqlite3.Error as exc:
@@ -10322,7 +11081,7 @@ def run(argv=None):
     if args.restore:
         return cmd_restore(conn, args.restore, providers)
 
-    if args.menu:
+    if args.tui:
         return run_menu(conn)
     if args.where:
         return cmd_where(conn, providers)

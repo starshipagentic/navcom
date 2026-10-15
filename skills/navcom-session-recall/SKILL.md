@@ -75,7 +75,7 @@ navcom --restore 7ec78a59        # transcript deleted by its harness? put it bac
 - `--solo` / `--summary` hand the hits to another LLM CLI, so they're slow (≤150s). Usually
   better to read the hits and summarize them yourself.
 - `navcom --help` is the full manual. `navcom --where` shows which harness logs exist.
-- Humans: `navcom --menu` is a full-screen retro dashboard (retention, history, search). Agents should use
+- Humans: `navcom --tui` is a full-screen retro terminal dashboard; `navcom --menu` opens a local browser dashboard (retention, history, search). Agents should use
   the plain commands above.
 - `navcom --skill` prints this card; `navcom --skill install` (re)installs it for every harness here.
 
@@ -83,3 +83,27 @@ navcom --restore 7ec78a59        # transcript deleted by its harness? put it bac
 
 Report what navcom found (session ref, date, harness, project, turn numbers and quoted snippets)
 separately from what you verified live now, and flag anything memory-derived as possibly stale.
+
+## Atlas: discover and understand collections
+
+```bash
+navcom atlas                       # commands and grouping guide
+navcom atlas list research         # defined and suggested research families
+navcom atlas list projects         # full project paths and collection IDs
+navcom atlas help districts        # how folder districts differ from ancestry
+navcom atlas search listener --json # structured discovery for agents
+navcom atlas refresh               # incremental evidence cache, existing index only
+```
+
+Use `navcom atlas explore <collection>` to see branches, then
+`navcom atlas search <words> --within <collection>` to stay in that entire
+collection across pages. `--children` expands child tasks; otherwise child-only
+hits identify the parent and matching child. `navcom atlas show <ref>` and
+`navcom atlas tree <ref>` explain context and actual ancestry without launching.
+Results print exact next commands; `--json` keeps diagnostics on stderr.
+Suggested families and version mentions are evidence, not implementation proof.
+Read the reported freshness; `atlas refresh` uses indexed user/assistant turns,
+never starts a model, and does not replace `navcom --maintain` for new raw logs.
+
+`navcom --help` is the overview. Use `navcom help search|read|resume|atlas|maintenance|all`
+and `navcom atlas <command> --help` for focused help.

@@ -156,3 +156,162 @@ def test_paste_agents_get_the_prompt_on_the_clipboard_when_started(navcom, index
     plan = navcom.revive_plan(indexed, _codex_key(indexed), "kimi", "codex")
     navcom.resume_here(plan)
     assert copied == [plan["paste"]] and "paste it once it starts" in capsys.readouterr().err
+
+@pytest.fixture
+def agent_family(navcom, tmp_path):
+    import json
+    conn = navcom.open_index(tmp_path / 'family.sqlite')
+    keys = []
+    ids = ['01a126c8-331b-7aa2-8783-d9ff30c38f32',
+           '01a1320b-bf55-73f1-adb1-c82ca8f1ab69',
+           '01a1320b-bf55-73f1-adb1-c82ca8f1ab70']
+    for i, sid in enumerate(ids):
+        path = tmp_path / 'sessions' / f'rollout-2026-10-12T16-36-33-{sid}.jsonl'
+        path.parent.mkdir(exist_ok=True)
+        meta = {'id': sid, 'session_id': ids[0], 'cwd': str(tmp_path if i == 0 else path.parent)}
+        if i:
+            meta.update(source={'subagent': {'thread_spawn': {'parent_thread_id': ids[i-1]}}},
+                        agent_nickname='Galileo')
+        path.write_text(json.dumps({'type': 'session_meta', 'payload': meta}) + '\n' +
+                        json.dumps({'type': 'response_item', 'payload': {'type': 'message', 'role': 'user',
+                                   'content': [{'type': 'input_text', 'text': f'conversation {i}'}]}}) + '\n')
+        keys.append(str(path))
+    logs = [(key, i + 1, __import__('os').path.getsize(key), 'codex') for i, key in enumerate(keys)]
+    navcom.index_logs(conn, logs, progress=False)
+    return conn, keys, ids, logs
+
+
+def test_nested_child_resumes_root_with_root_cwd(navcom, agent_family, tmp_path):
+    conn, keys, ids, _ = agent_family
+    for key in keys:
+        plan = navcom.resume_plan(conn, key, 'codex')
+        assert plan['argv'] == ['codex', 'resume', ids[0]]
+        assert plan['cwd'] == str(tmp_path)
+        assert plan['key'] == keys[0]
+        assert bool(plan['note']) == (key != keys[0])
+
+
+def test_child_r_and_t_use_same_parent(navcom, agent_family, monkeypatch):
+    conn, keys, ids, _ = agent_family
+    plan = navcom.resume_plan(conn, keys[-1], 'codex')
+    monkeypatch.setattr(navcom.shutil, 'which', lambda exe: '/usr/bin/' + exe)
+    with pytest.raises(navcom._ResumeNow) as caught:
+        navcom._resume_action(conn, plan, 'r')
+    launched = []
+    monkeypatch.setattr(navcom, 'resume_in_new_tab', lambda p: (launched.append(p) or True, 'opened'))
+    navcom._resume_action(conn, plan, 't')
+    assert launched == [caught.value.plan]
+    assert launched[0]['argv'][-1] == ids[0]
+
+
+def test_fresh_harness_loads_parent_and_selected_child(navcom, agent_family, tmp_path):
+    conn, keys, ids, _ = agent_family
+    for harness in navcom.REVIVE_AGENTS:
+        plan = navcom.revive_plan(conn, keys[-1], harness, 'codex', focus=4)
+        prompt = plan['paste'] or plan['argv'][-1]
+        assert f'navcom --recap {navcom.short_ref(keys[0])}' in prompt
+        assert f'navcom --recap {navcom.short_ref(keys[-1])}' in prompt
+        assert f'navcom --open {navcom.short_ref(keys[-1])}:4' in prompt
+        assert plan['cwd'] == str(tmp_path)
+
+
+def test_missing_parent_never_launches_child(navcom, agent_family):
+    conn, keys, _, _ = agent_family
+    from pathlib import Path
+    Path(keys[0]).unlink()
+    conn.execute('DELETE FROM file_state WHERE file=?', (keys[0],))
+    plan = navcom.resume_plan(conn, keys[1], 'codex')
+    assert plan['blocked'] and not plan['argv']
+    assert not navcom.ensure_resumable(conn, plan)[0]
+    assert 'parent' in navcom._resume_span(plan)[0][0]
+    assert 'navcom --recap' in navcom.revive_plan(conn, keys[1], 'codex', 'codex')['argv'][-1]
+
+
+def test_cycle_never_launches_child(navcom, agent_family):
+    import json
+    from pathlib import Path
+    conn, keys, ids, _ = agent_family
+    path = Path(keys[0])
+    lines = path.read_text().splitlines()
+    meta = json.loads(lines[0])
+    meta['payload']['parent_thread_id'] = ids[-1]
+    path.write_text(json.dumps(meta) + '\n' + '\n'.join(lines[1:]) + '\n')
+    plan = navcom.resume_plan(conn, keys[-1], 'codex')
+    assert plan['blocked'] and 'cyclic' in plan['note']
+
+
+def test_recents_filters_before_limit_and_labels_children(navcom, agent_family):
+    conn, keys, _, logs = agent_family
+    parents, combined = navcom._recent_entries(conn, logs, limit=2)
+    assert [payload[0] for _, payload in parents] == [keys[0]]
+    assert any('Galileo' in str(spans) and 'parent' in str(spans) for spans, _ in combined)
+
+
+def test_recents_h_toggle_and_launch(navcom, agent_family, monkeypatch):
+    conn, keys, ids, logs = agent_family
+    parents, combined = navcom._recent_entries(conn, logs)
+    class Term:
+        inputs = iter(['h', 'up', 'r'])
+        frames = []
+        def size(self): return 140, 30
+        def draw(self, frame): self.frames.append('\n'.join(frame))
+        def key(self): return next(self.inputs)
+    term = Term()
+    monkeypatch.setattr(navcom.shutil, 'which', lambda exe: '/usr/bin/' + exe)
+    with pytest.raises(navcom._ResumeNow) as caught:
+        navcom._menu_list(term, conn, 'RECENT', parents, '', on_enter=lambda item: None,
+                          resumable=True, alternate_entries=combined)
+    assert 'parents only' in term.frames[0] and 'parents + children' in term.frames[1]
+    assert caught.value.plan['argv'][-1] == ids[0]
+
+@pytest.mark.parametrize('launch_key', ['enter', 't'])
+def test_n_picker_launches_fresh_harness_with_family_context(navcom, agent_family, monkeypatch, launch_key):
+    conn, keys, _, _ = agent_family
+    monkeypatch.setattr(navcom, 'fresh_harnesses', lambda provider: ['claude'])
+    monkeypatch.setattr(navcom.shutil, 'which', lambda exe: '/usr/bin/' + exe)
+    launched = []
+    monkeypatch.setattr(navcom, 'resume_in_new_tab', lambda plan: (launched.append(plan) or True, 'opened'))
+    class Term:
+        def size(self): return 140, 30
+        def draw(self, frame): pass
+        def key(self): return launch_key
+    plan = navcom.resume_plan(conn, keys[-1], 'codex')
+    if launch_key == 'enter':
+        with pytest.raises(navcom._ResumeNow) as caught:
+            navcom._resume_action(conn, plan, 'n', Term(), keys[-1], 'codex')
+        launched.append(caught.value.plan)
+    else:
+        navcom._resume_action(conn, plan, 'n', Term(), keys[-1], 'codex')
+    assert launched[0]['argv'][0] == 'claude'
+    prompt = launched[0]['argv'][-1]
+    for key in (keys[0], keys[-1]):
+        assert f'navcom --recap {navcom.short_ref(key)}' in prompt
+
+
+def test_archived_child_keeps_parent_routing(navcom, agent_family, tmp_path):
+    from pathlib import Path
+    conn, keys, ids, _ = agent_family
+    navcom._ensure_archive_table(conn)
+    # Preserve ancestry even when only the archived child transcript remains.
+    path = Path(keys[-1])
+    saved = tmp_path / 'saved-child.jsonl'
+    saved.write_bytes(path.read_bytes())
+    columns = {row[1] for row in conn.execute('PRAGMA table_info(archive_state)')}
+    assert {'file', 'path'} <= columns
+    conn.execute('INSERT INTO archive_state (file, path) VALUES (?, ?)', (keys[-1], str(saved)))
+    path.unlink()
+    assert navcom.resume_plan(conn, keys[-1], 'codex')['argv'][-1] == ids[0]
+
+
+def test_children_are_marked_at_start_of_tui_and_printed_rows(navcom, agent_family, capsys):
+    conn, keys, _, logs = agent_family
+    parents, combined = navcom._recent_entries(conn, logs)
+    assert parents[0][0][0][0] == '● '
+    for spans, (key, _) in combined:
+        text = ''.join(span[0] for span in spans)
+        assert text.startswith('    ↳ CHILD  ' if key != keys[0] else '● ')
+    navcom.cmd_recent_sessions(conn, logs, limit=80)
+    rows = ANSI.sub('', capsys.readouterr().out).splitlines()[1:]
+    assert rows[0].startswith('    ↳ CHILD  ')
+    assert rows[1].startswith('    ↳ CHILD  ')
+    assert rows[2].startswith('● ')

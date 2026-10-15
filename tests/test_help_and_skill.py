@@ -38,9 +38,28 @@ def test_every_help_example_runs(navcom, tmp_path):
     env = fake_home.env_for(home)
     env["NAVCOM_SUMMARY_TIMEOUT"] = "1"
     env["PATH"] = "/usr/bin:/bin"  # no LLM CLIs: --solo must degrade, not hang
+    subprocess.run([sys.executable, str(ROOT / "navcom.py"), "--maintain"],
+                   env=env, cwd=workdir, capture_output=True, check=True)
     failures = []
     for cmd in help_examples(navcom) + help_examples(navcom, navcom.SKILL_MD):
         args = shlex.split(cmd)[1:]
+        if "--menu" in args:
+            import select, signal
+            from urllib.request import urlopen
+            child = subprocess.Popen([sys.executable, str(ROOT / "navcom.py")] + args + ["--no-browser"],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=workdir)
+            try:
+                assert select.select([child.stdout], [], [], 15)[0], "web menu did not start"
+                line = child.stdout.readline()
+                url = re.search(r"http://127\.0\.0\.1:\d+/", line)
+                assert url, line
+                with urlopen(url.group(), timeout=5) as response:
+                    assert b"Mission control" in response.read()
+            finally:
+                child.send_signal(signal.SIGINT)
+                _, stderr = child.communicate(timeout=5)
+            assert child.returncode == 0 and "Traceback" not in stderr
+            continue
         proc = subprocess.run([sys.executable, str(ROOT / "navcom.py")] + args, capture_output=True,
                               text=True, env=env, cwd=workdir, timeout=60)
         if "Traceback" in proc.stderr or proc.returncode not in (0, 1):
@@ -55,3 +74,16 @@ def test_repo_skill_file_matches_embedded_card(navcom):
 def test_skill_card_frontmatter(navcom):
     head = navcom.SKILL_MD.split("---")
     assert "name: navcom-session-recall" in head[1] and "description:" in head[1]
+
+
+def test_complete_help_contains_atlas_and_browse_controls(navcom):
+    import navcom_atlas_cli as cli
+    all_help=cli.help_text(navcom,'all')
+    for command in ('list','explore','search','show','tree','refresh'):
+        assert 'navcom atlas '+command in all_help
+    assert '--within' in all_help and '--children' in all_help
+    browse=cli.help_text(navcom,'browse')
+    assert 't opens a new tab' in browse and 'n chooses a fresh harness' in browse
+    assert 'no LLM' in browse
+    assert '--within' in cli.help_text(navcom,'search',atlas=True)
+    assert '--project' in cli.help_text(navcom,'search')

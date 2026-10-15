@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "navcom"
-version = "0.9.1"
+version = "0.10.0"
 description = "Super-fast search over past AI coding sessions: Claude Code, Codex, Gemini CLI, pi, omo, opencode, goose"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,7 +26,7 @@ navcom = "navcom:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
-only-include = ["navcom.py"]
+only-include = ["navcom.py", "navcom_web.py", "navcom_web.html", "navcom_intelligence.py", "navcom_atlas.py", "navcom_discovery.py", "navcom_atlas_cli.py", "navcom_research.py", "navcom_atlas.js", "navcom_atlas.css"]
 
 [tool.hatch.build.targets.sdist]
-include = ["navcom.py", "README.md", "pyproject.toml", "features", "tests", "skills", "docs"]
+include = ["navcom.py", "navcom_web.py", "navcom_web.html", "navcom_intelligence.py", "navcom_atlas.py", "navcom_discovery.py", "navcom_atlas_cli.py", "navcom_research.py", "navcom_atlas.js", "navcom_atlas.css", "README.md", "pyproject.toml", "features", "tests", "skills", "docs"]

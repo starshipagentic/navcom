@@ -45,7 +45,7 @@ wrote.
 
 Run `navcom --where` to see what it found on your machine.
 
-## `navcom --menu`
+## `navcom --tui`
 
 A full-screen retro dashboard for humans. It shows your history (sessions, turns, tool output, and
 how many sessions were rescued after their harness deleted them) and retention (each harness's
@@ -57,7 +57,9 @@ running, so the commands are easy to pick up.
 ![navcom --menu dashboard](https://raw.githubusercontent.com/starshipagentic/navcom/main/docs/menu-dashboard.png)
 
 It needs only the standard library and a truecolor terminal (Atari raster-bar styling, with a
-block-glyph wordmark that renders the same in any font). Bare `navcom` prints the manual.
+block-glyph wordmark that renders the same in any font). Bare `navcom` and `navcom --help` show the command overview.
+Use `navcom help all` for the full option and Atlas subcommand reference, or
+`navcom help browse` for web and terminal controls.
 `navcom --sessions` lists your recent sessions.
 
 ## Install
@@ -137,8 +139,35 @@ navcom --resume 7ec78a59 --tab      # in a new tab: cmux workspace, tmux window,
 navcom --resume 7ec78a59 --print    # just print the command (pipes and agents always get this)
 ```
 
-In `navcom --menu`, every search hit and open session shows a **RESUME** line with that command:
-press **r** to resume here, **t** for a new tab, **c** to copy it.
+`navcom --tui` opens automatically with an animated startup bar showing the active stage and elapsed
+time. Dashboard snapshots are cached for up to two minutes (invalidated when the index changes);
+**r** forces a fresh snapshot. Search and Recents still discover current conversations.
+
+In `navcom --tui`, every search hit and open session shows a **RESUME** line with that command:
+press **r** to resume here, **t** for a new tab, **c** to copy it. Global search labels child hits
+and **h** hides/shows them. **Escape** returns to the dashboard; only **q** quits from there.
+
+Recents groups complete conversation families, ordered by their latest activity. **h** expands or
+collapses the selected parent; children sit directly below it with an indented **↳ CHILD** marker.
+Nested children retain their own level. Missing parents are explicitly labeled.
+
+- **?** shows every Recents shortcut, including in narrow terminals.
+- **/** searches names, folders, notes and indexed conversation text within the recent families.
+  Search keeps whole matching families, including children that do not match independently.
+  Matching branches open initially; **h** still collapses and expands them. **enter** opens the
+  matching passage. **x** clears search. On a leaf child, **h** toggles its parent branch.
+- **f** stars a conversation; **v** shows favorites with their parent context. Starred families remain
+  available even when older than the 80 most recent families.
+- **e** gives a conversation a recognizable name; **d** adds a short “where we left off” note.
+  Without a note, the detail panel shows an excerpt labeled **Last reply**.
+- Filters, expanded families, selected conversation, list position and reading position persist
+  locally in the index. Names and notes do not modify the original transcripts.
+
+The selection preview names the launch action, harness and working folder. For Codex and Claude
+children, **r**, **t**, and **c** target the root parent. **n** opens a fresh-harness picker with parent
+and selected-child context; **t** in that picker starts it in a new tab. Opening Recents, searching,
+reading long conversations and running upkeep show animated progress when they take time.
+`--sessions` also marks child rows at the left edge.
 
 ![navcom --menu resume line](https://raw.githubusercontent.com/starshipagentic/navcom/main/docs/menu-resume.png)
 
@@ -166,7 +195,7 @@ Every one of the 30 harnesses works. The 17 that take an opening prompt on their
 already primed. The rest (Kimi, Crush, goose, Hermes, Aider, Amp, …) start plainly: navcom prints the start
 command plus the prompt to paste, and when it launches them for you it puts the prompt on your clipboard.
 Without `--with`, `--resume` on a session that can't be reopened asks which agent to use. In
-`navcom --menu`, `r` on such a session (or `n` on any session) opens a REVIVE picker. A raw
+`navcom --tui`, `r` on such a session (or `n` on any session) opens a REVIVE picker. A raw
 `--open` of a long session can run to hundreds of KB; the recap is about 8k tokens. In a live test, a
 fresh Claude given only the revive prompt rebuilt a five-month-old Codex review in three turns: what was
 checked, the two leftovers it flagged, and what was next. Search results also point at it:
@@ -298,3 +327,87 @@ The index lives at `$NAVCOM_INDEX` (default `$CODEX_HOME/navcom-index.sqlite`) a
 call. Only new or changed sessions are read, and a growing JSONL is read from where it left off.
 A session stays searchable after its harness deletes the transcript. Claude Code, for example,
 prunes old sessions. `navcom --where` shows the counts, and `navcom --reindex` rebuilds.
+
+### Local browser mission control
+
+Run `navcom --menu` to open a retro-styled local webpage, or `navcom --tui` for the terminal UI.
+Keep its terminal running; Ctrl+C stops the web server. `navcom --menu --no-browser` prints the URL
+without opening a browser. The server binds only to 127.0.0.1 and loads no external assets.
+
+The browser offers conversation families, text search within recent families, reading/paging,
+favorites, names, notes, saved position, launch previews, fresh-harness selection, and upkeep with
+progress and retryable errors. Launch buttons open a terminal tab using the displayed command.
+An unavailable tab integration provides a copyable command instead.
+
+**Suggest with local model** is optional and runs only when clicked. It checks CapCom's selected
+local profile (`CAPCOM_CONFIG`, or its saved default profile), then resident Ollama models.
+`NAVCOM_CAPCOM_PROFILE` selects another existing named profile. Bertha works through an existing
+CapCom private endpoint or tunnel; no Bertha dependency is imposed on other installations.
+NavCom never starts a server, pulls weights, unloads models, or uses cloud providers for suggestions.
+Ollama choices are limited to already-resident models of at most 8 GiB, with a 2,048-token context,
+6,000-character input cap, 180-token output cap, one request at a time, and a 15-second timeout.
+Already-running OpenAI-compatible local services use the same excerpt/output bounds.
+Suggestions are labeled and require **Use this name and note** before saving. Without a running
+model, every other feature remains available.
+
+TUI upkeep keeps lock failures inside its screen: **r** retries and **Esc** returns to the dashboard.
+Menus commit pending metadata writes before waiting for input, so idle updated windows do not
+hold the index writer. Older already-running NavCom windows need reopening to receive this fix.
+
+### Conversation Atlas
+
+`navcom --menu` now has two views: the existing Library and an organic
+**Conversation Atlas**. Explore the full index by topic, project, planet district,
+time, or recorded Starship family. Natural-language searches create a new map;
+conversation nodes lead to related work, actual parents/children, the reader,
+and the existing parent-safe launch controls. Zoom, drag, use the trail to go
+back, or choose Browse as cards.
+
+The map runs locally without a model. Optional voice input requires an already
+available on-device browser speech pack; otherwise type or use system dictation.
+See [Atlas behavior, provenance and Starship link contract](docs/conversation-atlas.md).
+
+### Atlas from the command line
+
+```sh
+navcom --help
+navcom atlas list research
+navcom atlas explore research:exp29
+navcom atlas search listener --within research:exp30
+navcom atlas list districts --json
+navcom atlas help research
+navcom atlas search --help
+```
+
+Atlas is CLI-first: the web UI and commands use the same discovery service.
+`list` supports `topics`, `research`, `projects`, `districts`, `time`, and
+`starships`. Copy a collection ID into `explore` or `search --within`; result
+blocks print the next command. `show REF` explains context and resume targets;
+`tree REF` prints actual ancestry. Neither launches a harness. Use existing
+`--open`, `--recap`, and `--resume` commands when ready.
+
+Search within a collection covers all its pages. Child-only matches show their
+parent and the matching child's evidence; `--children` expands tasks. Narrow
+with `--provider`, `--since`, `--until`, or `--favorites`, page with `--limit` and
+`--offset`, and use `--json` for versioned machine output (warnings on stderr).
+Paths wrap without truncation. Collection IDs remain stable when labels change;
+combined IDs joined by `+` represent intersecting collections.
+
+`navcom atlas refresh` incrementally extracts suggested families and branches
+from the existing index. It uses a private atomic sidecar (`INDEX.atlas.json`),
+not a SQLite writer or an LLM. Normal discovery never scans raw logs or starts a
+model. Upkeep also refreshes this cache. Suggestions are labeled; version
+mentions are not implementation claims, and shared subjects are not ancestry.
+Missing/stale caches are reported while ordinary indexed discovery stays usable.
+
+The web search defaults to **Search only this collection** after entering a
+collection. Uncheck to search the archive; explicit filters remain. Changing
+Grouping preserves scope. **Copy this view as CLI command** reproduces the
+query, scope, filters and page. Cards offer full paths, copy actions, evidence,
+Search here, and parent/child navigation.
+
+Help is layered: `navcom help search`, `read`, `resume`, `atlas`, `maintenance`,
+or `all`; `navcom atlas help districts` explains a grouping; each subcommand has
+`--help`. Leading `atlas` and `help` are reserved commands: use
+`navcom --query "atlas help"` for a literal search. Other existing commands remain
+compatible. No MCP server is required.
