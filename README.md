@@ -98,8 +98,9 @@ navcom --skill list            # Skillflag-compatible (github.com/osolmaz/skillf
 navcom --skill export | npx skillflag install --agent claude    # … so its installer works too
 ```
 
-`navcom --help` is the full manual, written for LLMs: the two-step recipe, the query rules and an
-example for every option. The test suite runs every example in it.
+`navcom --help` is the command overview. Use `navcom help all` for the full manual,
+`navcom help space` for galactic navigation, or a subcommand's `--help` for its
+parameters. Help is available without indexing or starting a web server.
 
 ## Use
 
@@ -110,7 +111,7 @@ navcom --resume 395e14b4            # get back into it: cd to its folder + reope
 navcom --recap 395e14b4             # its whole story, sized for an LLM (picking old work back up)
 navcom drizzle --context            # expand every hit with the turns around it
 navcom --sessions                   # your most recent sessions, with titles
-navcom --menu                       # the retro dashboard: retention, history, search, learn
+navcom --menu                       # the Galactic Bridge, Library and Conversation Atlas
 navcom drizzle --solo               # one LLM summary of all the hits
 ```
 
@@ -330,7 +331,7 @@ prunes old sessions. `navcom --where` shows the counts, and `navcom --reindex` r
 
 ### Local browser mission control
 
-Run `navcom --menu` to open a retro-styled local webpage, or `navcom --tui` for the terminal UI.
+Run `navcom --menu` to open the local Galactic Bridge, or `navcom --tui` for the terminal UI.
 Keep its terminal running; Ctrl+C stops the web server. `navcom --menu --no-browser` prints the URL
 without opening a browser. The server binds only to 127.0.0.1 and loads no external assets.
 
@@ -354,17 +355,248 @@ TUI upkeep keeps lock failures inside its screen: **r** retries and **Esc** retu
 Menus commit pending metadata writes before waiting for input, so idle updated windows do not
 hold the index writer. Older already-running NavCom windows need reopening to receive this fix.
 
+### Fly through your work
+
+`navcom --menu` opens the Galactic Bridge. Select a system, product planet,
+experiment moon, district, expertise candidate, starbase or recorded ship, then **Fly to**. Drag the
+chart to pan, use **+ / −** to zoom, and **Back / Forward** to recover your
+viewpoint, selection and search. Narrow screens keep destination labels readable;
+**Fit** provides an overview with full names at a readable size. On crowded small
+screens, select an object to reveal its full name in the destination panel.
+Searching does not rearrange the chart.
+
+Conversation results keep recorded families together. A parent card shows its
+child count and an expandable list of matching tasks; each task opens at its
+matching turn. A child passage and its parent have separate read actions.
+NavCom does not infer parenthood from a task-like title when a provider did not
+record the relationship.
+
+The Navigator accepts `fly to Polaris`, `find matrix in exp32`,
+`fly to exp32 then find matrix`, `home` and `back`. Spoken-style punctuation such
+as `Fly to experiment 32, then find matrix.` works too; quoted queries and code
+syntax stay literal. **Search only this place**
+controls the allowed area. Named places resolve inside that area before searching;
+ambiguous names show choices, and an unknown place never falls back to a global
+search. In the CLI, repeat the request with `--choose <returned-place-id>` to select
+a validated candidate. Code, documents and conversations retain
+their separate evidence and coverage. Typed input and local voice use the same Navigator. The microphone records up to
+20 seconds through an existing `whisper.cpp` tiny/base model, with two CPU threads
+and one transcription at a time across NavCom processes. Review the transcript
+before searching. Stop, Cancel and Escape release recording; no audio is retained.
+`navcom voice status` checks availability without loading the model, and
+`navcom voice transcribe clip.wav` uses the same service (mono 16-bit PCM, 16 kHz).
+Set `NAVCOM_WHISPER_MODEL` to an existing model under 200 MiB. NavCom downloads
+nothing; when unavailable, type or use system dictation.
+
+The same behavior is available from the CLI:
+
+```sh
+navcom atlas refresh --space --harvest
+navcom atlas list systems
+navcom atlas list planets --within <system-id>
+navcom atlas explore <planet-id>
+navcom atlas navigate "fly to Polaris" --json
+navcom atlas navigate "find matrix" --within <moon-id> --json
+navcom atlas navigate "find matrix in exp32" --json
+navcom atlas navigate "fly to exp32 then find matrix" --choose <returned-place-id> --json
+navcom atlas search matrix --within <district-id> --evidence
+navcom atlas related <moon-id> --query matrix
+navcom atlas files <planet-id> --query README
+navcom atlas list ships
+navcom atlas inspect <ship-id>
+navcom atlas context <ship-id> --query login
+navcom atlas list stars
+navcom atlas inspect <star-candidate-id>
+navcom atlas inspect <star-candidate-id> --observe
+navcom help space
+navcom atlas navigate --help
+```
+
+Opening the bridge starts a bounded background intake when its last completed
+sweep is older than ten minutes. A fresh menu first indexes the native conversation
+logs, so discovery does not depend on a previous CLI search. **Pause** survives
+reload, keeps published evidence and saves the
+current position; **Continue chart** resumes it. Each sweep pins the indexed
+project inventory, so later index changes cannot shuffle a continuation. The web
+pass stops after two minutes; the CLI's `--seconds` and `--limit` bound one pass,
+with an exact continuation command in its output. `--restart` pins a fresh sweep.
+Failures and unavailable projects are disclosed without starving later projects.
+
+Select a destination, then **Fly to**; double-clicking flies directly. Drag the map
+or its small **Overview** to move around, and use **+ / −** to zoom. **Fit** shows
+the whole current chart. Narrow windows retain the same geography and readable
+names. **Back** restores your camera, query, selection and open evidence panels.
+Same-named products show distinguishing path suffixes; the inspector keeps their
+full paths. Product descriptions prefer the harvested README at that product's
+own boundary over component package metadata; explicit owner descriptions win.
+
+`atlas files PLACE` lists the code and documents retained for a product,
+experiment or district. `--query` filters file paths; use each returned
+`sources read` command to open its pinned snapshot. Follow the returned
+continuation command for more files. Missing paths and scan limits are disclosed;
+a budget-limited inventory requires a narrower district instead of unstable
+later pages. This never scans the live repository or starts another harvest.
+
+**Connections & versions** uses cached Starforge lineage and both source-search
+paths. It shows suggested version families, retained files you can read, and exact
+documented links you can fly along. `atlas related PLACE --query TEXT` exposes the
+same evidence and continuation controls from the CLI. Folder versions are
+suggestions, not proven ancestry; missing harvested files remain explicit. See the
+[native relationship contract](docs/native-relationships-contract.md).
+
+Browsing reads the saved chart while existing Starforge harvest analyzes bounded
+code and documents. Unchanged sources reuse cached artifacts. Existing explicit
+scopes stay registered; updating one source retains other published snapshots even
+when their original storage is offline. Native Git ignore rules and metadata
+budgets apply; raw provider config is not added by document discovery.
+`sources discover --json` reports its selected files, exclusions and pagination.
+Use `sources harvest ROOT --include src --include docs` to register a larger code
+scope, then refresh the chart; no catalog copying or manual synchronization is
+needed. Starforge is optional for the map and required for source analysis.
+
+Systems and product boundaries come from observed folders, Git identities and
+declared application manifests; suggested relationships are labelled. Nested
+runnable applications can become separate candidate planets even when their
+repository has no workspace declaration. Bounded automatic intake retains their
+manifests and code, and existing Starforge entry/build detection supplies the
+evidence. New harvests group districts within each application scope. Districts
+reuse cached Starforge token groups. Missing or stale metadata stays visible as
+uncertainty. Machines and storage are physical locations, separate from conceptual
+geography. **Inspect code locations** shows a product, experiment or district's
+recorded paths, observed host, Git checkout, branch and commit. Native Git common
+directories distinguish linked worktrees from independent repository copies.
+`atlas inspect <planet-id> --refresh` repeats this bounded read-only observation;
+ordinary inspection uses its dated cache. It does not pick a preferred copy or
+infer working changes, runtime or availability after the observation date.
+**Inspect ship** uses the installed Starship metadata observer and
+automatically finds exact-location receipts in commission records. It shows the
+mission, carried-history inventory and captain viewpoint with their separate dates
+and source paths. Remote locations remain unobserved; a receipt is not a current
+integrity, receiving or takeover check. Repeated inspections read the cache;
+`atlas inspect <ship-id> --refresh` repeats the metadata observation.
+`atlas context SHIP` lists carried sessions. Add `--query WORDS` to search them,
+`--session ID --turn N` to read an exact original message, or `--handover` to read
+the ship's handover document. Preserve the returned catalog SHA with `--catalog`
+when paging or opening a result; a changed catalog requires a fresh read.
+`--offset`, `--limit` and `--max-chars` bound the output. This uses the installed
+Starship reader and the selected local ship's retained dialogue, without resuming
+a captain or substituting current host history. Remote ships remain unavailable.
+Refresh discovers separate local commission archives from Starship evidence and
+caches their metadata. **Stored ship copies** at the galaxy and **Ships & stored
+context** on linked ships/products open those copies. `atlas list ships` and
+search include them too. Archives with a carried catalog can read context but cannot board a captain;
+archive integrity stays unverified until separately checked.
+
+Navigator searches and `atlas search --space --evidence` also check carried
+conversations through that same native reader. Results identify their physical
+ship, recorded title or verbatim matching excerpt, and original turn. Opening a
+result preserves its catalog pin. Product searches include ships with a recorded
+source association; district searches do not inherit the entire product's cargo.
+An exact ship search stays on that copy. Cached results include zero-match reads;
+repeat a partial search to check remaining ships within the next bounded pass.
+These snapshots remain separate from current host conversations and are not
+semantic rankings or evidence of captain readiness.
+Expertise candidates are separate destinations across systems. Existing native
+Hermes profiles and supported Compose/OCI metadata supply their identity,
+description, charter references and provider interfaces. A declared description
+and charter remain a **candidate**, with runtime availability unknown; automatic
+descriptions stay unconfirmed. A generic repository or default charter alone does
+not establish expertise. Discovery is paged and cached, with unvisited roots and
+coverage gaps visible.
+
+**Inspect expert** reads that recorded metadata. `atlas inspect <star-id> --refresh`
+updates the selected dossier. `--observe` explicitly checks an existing provider
+process; it does not ask the expert a question, start a gateway/model, or prove
+answer quality. Observations retain their time and provider binding separately
+from metadata. **Ask expert** prepares the exact question and provider command.
+**Open question in Hermes** revalidates it and opens the native agent terminal.
+Hermes uses its own configured model, tools and hooks, and may use remote services
+or change files; this is an explicit action, separate from chart navigation.
+`navcom atlas ask STAR "question"` prepares the same review. Repeat with
+`--launch --review TOKEN` only to open that reviewed action.
+
+**Board ship** discovers the exact host/workspace route in native captain metadata
+and uses installed Starship tools to validate it. `navcom atlas board SHIP` previews;
+`--validate` checks the native thread; `--launch --review TOKEN` revalidates and
+opens it. Missing, ambiguous or remote routes remain unavailable. A terminal
+dispatch does not prove an expert reply, restored context or captain takeover. See the
+[spatial vision](docs/spatial-navigation-vision.md) and
+[implementation status](docs/galactic-implementation-plan.md).
+
+### A place through time
+
+```sh
+navcom history timeline <planet-id>
+navcom history explore <planet-id> <commit-sha> --query login
+navcom history timeline --repo ~/dev/project
+navcom history explore HEAD --repo ~/dev/project --query login
+navcom history system <system-id> --at 2026-04-01 --query login --json
+navcom history system --cursor <next-cursor> --json
+navcom history system --cursor <failed-cursor> --retry-larger --json
+navcom history land <planet-id> --cursor <cursor> --result-key <result-key> --json
+navcom history land <planet-id> --cursor <cursor> --result-key <result-key> --group <district-id> --query login
+navcom help history
+```
+
+History selects one actual Git repository and reads the exact committed tree.
+The current place supplies its address and file scope; historical manifests,
+README clues, file inventory and Starforge code groups come from the chosen
+commit. Both Starforge search paths operate on the historical snapshot. Dirty
+working files and current conversations are excluded. Renamed paths are not
+silently followed. For `timeline` and `explore`, a place spanning multiple
+repositories requires an explicit physical copy through `--repo`.
+
+Snapshots and analyses are cached by commit, selected paths and tool identity,
+outside the source repository. Nothing checks out or rewrites your current work.
+Large scopes fail with a bounded-budget error; unsupported files, hidden paths,
+submodules, symlinks, LFS pointers and shallow history are disclosed. Git dates
+are recorded metadata, not deployment dates or proof of a whole galaxy's state.
+
+`history system` visits the current system or galaxy's repository-backed products
+at a UTC cutoff. Current IDs, positions and containment remain navigation
+addresses. Historical names, manifests, files and search results come from
+committed trees; missing history stays unknown. The first request pins repository
+HEADs, and `next_cursor` continues those same pins even if today's repositories
+change. The default page visits four repositories within a 30-second budget;
+coverage includes unvisited and unavailable places. This does not infer deleted
+products, historical ownership or commit-to-conversation relationships.
+
+After a snapshot-size failure, the printed `--retry-larger` command creates a
+separate bounded local-cache journey, retaining the same pinned HEADs, cutoff
+and scopes. It allows up to 10,000 files and 64 MiB per repository; the original
+view remains available. It requires an existing failed cursor and does not raise
+the per-file or execution-time limits. Omitted snapshot flags inherit the saved
+cursor's limits on later pages; explicitly changed limits are rejected.
+
+`history land` enters a product or experiment from a saved system view. Follow
+its printed **Land** command; the cursor and result key select the exact saved
+native evidence. The returned districts are Starforge's existing source groups,
+with their file membership visible. A district query runs both native search
+paths within those exact retained files. Landing never consults current product
+ownership, resolves a new HEAD or harvests current files. Missing or changed
+snapshot evidence is reported instead of silently returning to the present.
+
+In the bridge, **Explore time** opens the UTC cutoff controls for a system or
+galaxy. **Observed commit dates** moves among dates actually returned by the
+service; **Continue remaining repositories** extends coverage. **Return to
+present** restores current evidence. Historical files open in the same source
+reader, with their pinned commit shown. Reload, Back and **Copy journey link**
+retain the dated session's repository pins. The link works against the same local
+NavCom history cache; an unavailable pin is reported instead of silently choosing
+newer evidence. The camera and current addresses stay steady while evidence
+changes. See the [system-history contract](docs/system-history-contract.md).
+
 ### Conversation Atlas
 
-`navcom --menu` now has two views: the existing Library and an organic
+Alongside the Galactic bridge, `navcom --menu` offers the Library and
 **Conversation Atlas**. Explore the full index by topic, project, planet district,
 time, or recorded Starship family. Natural-language searches create a new map;
 conversation nodes lead to related work, actual parents/children, the reader,
 and the existing parent-safe launch controls. Zoom, drag, use the trail to go
 back, or choose Browse as cards.
 
-The map runs locally without a model. Optional voice input requires an already
-available on-device browser speech pack; otherwise type or use system dictation.
+The map runs locally without a model. The Galactic Bridge’s optional voice input
+uses existing local Whisper tools; otherwise type or use system dictation.
 See [Atlas behavior, provenance and Starship link contract](docs/conversation-atlas.md).
 
 ### Atlas from the command line
@@ -411,3 +643,66 @@ or `all`; `navcom atlas help districts` explains a grouping; each subcommand has
 `--help`. Leading `atlas` and `help` are reserved commands: use
 `navcom --query "atlas help"` for a literal search. Other existing commands remain
 compatible. No MCP server is required.
+
+### Cached local source search (Starforge)
+
+NavCom can harvest local code and documentation through an **installed Starforge**,
+then search both its ranked concept/gem results and its broader code/document
+search. Conversation search remains dependency-free. No model is started or called.
+
+```sh
+navcom sources harvest ~/dev/my-project --include README.md --include src
+navcom sources list
+navcom sources search 'login' --within my-project
+navcom sources search 'protocol goals' --mode text --ext md --json
+navcom sources read <source-id> docs/architecture.md --line 40 --limit 80
+navcom sources refresh
+navcom help sources
+navcom sources search --help
+```
+
+`harvest` adds or updates one source; repeating it replaces that source's include
+scope and keeps other registered sources. With no `--include`, it scans the root.
+`refresh` checks all registered sources and only reharvests changed content or a
+changed Starforge/adapter implementation. Search uses the last complete snapshot;
+it does **not** refresh automatically. Repeated queries are cached by snapshot,
+query, scope and options. Source results print an Atlas conversation search command
+when the source matches an indexed project.
+
+`--mode both` (default) returns two separate result lists. `concept` uses Starforge's
+concept ranking over harvested gems. `text` uses Starforge's existing `code-search`
+callback over cached files, including Markdown and small files omitted by the gem
+finder. Text matching is a literal phrase unless `--regex` is supplied; it is not
+semantic document search. `--ext` affects only text results. `--within` selects an
+exact source ID, unique directory name, or absolute root. `--limit` applies to each
+path; reaching the limit is reported rather than implying exhaustive results.
+
+`sources read` opens a numbered window from an exact published source snapshot,
+never the live working file. The default is 80 lines; each response is limited to
+200 lines and 64 KiB of displayed text. Returned `snapshot` and `published` values
+can pin later reads with `--snapshot` and `--published`. An exact unchanged artifact
+remains readable when other sources publish. Changed snapshots and unpinned stale
+results fail explicitly; reads report the publication actually verified.
+`--history <receipt-id>`
+reads a prepared Git snapshot and verifies its file against the pinned receipt.
+The bridge's **Open source** action uses this same service, shows the original
+path and provenance, and provides previous/next windows and a copyable CLI command.
+
+The private cache defaults to `navcom-sources` beside the conversation index.
+Override it with `NAVCOM_SOURCES_CACHE` or `--cache PATH` on each subcommand.
+The cache must be outside the harvested source root. Snapshots are local copies
+of supported source/document files; hidden files/directories, symlinks and
+Starforge's excluded directories are omitted. `sources list --json` reports exact
+scope, supported extensions and exclusions. This is not a complete backup or a
+secret scanner: only harvest directories you intend to make locally searchable.
+Default limits are 10,000 files, 64 MiB total and 2 MiB per file; `harvest --help`
+explains overrides. Exceeding a limit fails without replacing the previous cache.
+Old generations are retained; this version has no automatic cache pruning.
+
+NavCom uses the Python runtime of `starforge` on PATH. For a nonstandard install,
+set `NAVCOM_STARFORGE_PYTHON` to the interpreter where Starforge is installed.
+`list` and help work without Starforge. Harvest uses Starforge's local analysis
+stage without Git pulls, modifying original repositories, or updating Starforge's
+global catalog. Refresh holds a separate nonblocking writer lock; searches remain
+available against the last complete publication. CLI and bridge searches/readers
+consume the same published artifacts.

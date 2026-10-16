@@ -1,0 +1,186 @@
+{
+  "schema_version": 1,
+  "source_project": "Starship",
+  "source_catalog": "art/atlas/catalog.json",
+  "source_catalog_sha256": "07c39c00e44d3577bedfc380fee42960b8ab7e2b64bbf0c94faf48298cda8b02",
+  "method": "Catalog-selected original PNG bytes; no image modification or regeneration.",
+  "license_note": "Owner's existing generated art library. Source documentation states image_gen provenance; no separate art license declaration was found.",
+  "assets": [
+    {
+      "role": "starbase",
+      "id": "08-starbase/starbase-core",
+      "file": "starbase.png",
+      "sha256": "172b673e5553280a93336f178761722fbe2ddcee5a9348d550aca7079627dad0",
+      "bytes": 313948,
+      "width": 419,
+      "height": 420,
+      "suggested_display_width": 220,
+      "source_image": "art/atlas/sprites/08-starbase/09-starbase-core.png",
+      "source_sheet": "art/atlas/sheets/08-starbase.png",
+      "crop": [
+        828,
+        800,
+        419,
+        420
+      ],
+      "provenance": "built-in image_gen; original-resolution alpha component extraction; exact model unavailable",
+      "culture": "Starbase facilities",
+      "kind": "facility",
+      "title": "Starbase Core"
+    },
+    {
+      "role": "dock",
+      "id": "08-starbase/arrival-dock",
+      "file": "dock.png",
+      "sha256": "5a8b31bb4b75063dec7f2f5263f694b39659e9dc8584b7fa11b62af14a69a057",
+      "bytes": 244227,
+      "width": 395,
+      "height": 402,
+      "suggested_display_width": 220,
+      "source_image": "art/atlas/sprites/08-starbase/01-arrival-dock.png",
+      "source_sheet": "art/atlas/sheets/08-starbase.png",
+      "crop": [
+        9,
+        4,
+        395,
+        402
+      ],
+      "provenance": "built-in image_gen; original-resolution alpha component extraction; exact model unavailable",
+      "culture": "Starbase facilities",
+      "kind": "facility",
+      "title": "Arrival Dock"
+    },
+    {
+      "role": "archive",
+      "id": "08-starbase/archive-vault",
+      "file": "archive.png",
+      "sha256": "05fab09c678829620c6b8e40ec61a5d49bfc8e0290abaaaa65999953879ef8b0",
+      "bytes": 241115,
+      "width": 370,
+      "height": 383,
+      "suggested_display_width": 220,
+      "source_image": "art/atlas/sprites/08-starbase/02-archive-vault.png",
+      "source_sheet": "art/atlas/sheets/08-starbase.png",
+      "crop": [
+        442,
+        22,
+        370,
+        383
+      ],
+      "provenance": "built-in image_gen; original-resolution alpha component extraction; exact model unavailable",
+      "culture": "Starbase facilities",
+      "kind": "facility",
+      "title": "Archive Vault"
+    },
+    {
+      "role": "lab",
+      "id": "08-starbase/science-lab",
+      "file": "lab.png",
+      "sha256": "38d9457163abdcc3059ea51638a32d9d6cd88b54896e85307e6a3ec2a1c9c1aa",
+      "bytes": 275301,
+      "width": 395,
+      "height": 380,
+      "suggested_display_width": 220,
+      "source_image": "art/atlas/sprites/08-starbase/03-science-lab.png",
+      "source_sheet": "art/atlas/sheets/08-starbase.png",
+      "crop": [
+        849,
+        14,
+        395,
+        380
+      ],
+      "provenance": "built-in image_gen; original-resolution alpha component extraction; exact model unavailable",
+      "culture": "Starbase facilities",
+      "kind": "facility",
+      "title": "Science Lab"
+    },
+    {
+      "role": "navcom",
+      "id": "08-starbase/navcom-relay",
+      "file": "navcom.png",
+      "sha256": "6336fda611b0c4a0bcd82922adef32c303a40d5450bf5f3ac7865732db302847",
+      "bytes": 163036,
+      "width": 369,
+      "height": 389,
+      "suggested_display_width": 220,
+      "source_image": "art/atlas/sprites/08-starbase/05-navcom-relay.png",
+      "source_sheet": "art/atlas/sheets/08-starbase.png",
+      "crop": [
+        446,
+        422,
+        369,
+        389
+      ],
+      "provenance": "built-in image_gen; original-resolution alpha component extraction; exact model unavailable",
+      "culture": "Starbase facilities",
+      "kind": "facility",
+      "title": "Navcom Relay"
+    },
+    {
+      "role": "observatory",
+      "id": "08-starbase/observatory",
+      "file": "observatory.png",
+      "sha256": "3f10becd2cf1f4ee96b164cbd81748c354e3becc543f5553232a250a7adfe963",
+      "bytes": 263539,
+      "width": 375,
+      "height": 414,
+      "suggested_display_width": 220,
+      "source_image": "art/atlas/sprites/08-starbase/08-observatory.png",
+      "source_sheet": "art/atlas/sheets/08-starbase.png",
+      "crop": [
+        444,
+        824,
+        375,
+        414
+      ],
+      "provenance": "built-in image_gen; original-resolution alpha component extraction; exact model unavailable",
+      "culture": "Starbase facilities",
+      "kind": "facility",
+      "title": "Observatory"
+    },
+    {
+      "role": "city",
+      "id": "09-human-cities/city",
+      "file": "city.png",
+      "sha256": "5f015934571c82b857c5b24a251750692af3da3a0fff20263d0573edb83f7b2d",
+      "bytes": 287027,
+      "width": 409,
+      "height": 377,
+      "suggested_display_width": 180,
+      "source_image": "art/atlas/sprites/09-human-cities/05-city.png",
+      "source_sheet": "art/atlas/sheets/09-human-cities.png",
+      "crop": [
+        421,
+        440,
+        409,
+        377
+      ],
+      "provenance": "built-in image_gen; original-resolution alpha component extraction; exact model unavailable",
+      "culture": "Human settlements · seven sizes",
+      "kind": "city",
+      "title": "City"
+    },
+    {
+      "role": "ship",
+      "id": "03-verdant-fleet/scout",
+      "file": "ship.png",
+      "sha256": "51bb8f28cef1e11380f941cd51d9ae5da92489327a96bcea4485ac7f9f2f832d",
+      "bytes": 77933,
+      "width": 231,
+      "height": 193,
+      "suggested_display_width": 85,
+      "source_image": "art/atlas/sprites/03-verdant-fleet/02-scout.png",
+      "source_sheet": "art/atlas/sheets/03-verdant-fleet.png",
+      "crop": [
+        519,
+        113,
+        231,
+        193
+      ],
+      "provenance": "built-in image_gen; original-resolution alpha component extraction; exact model unavailable",
+      "culture": "Verdant Gardeners",
+      "kind": "fleet",
+      "title": "Scout"
+    }
+  ]
+}

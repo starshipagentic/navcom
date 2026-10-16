@@ -45,15 +45,34 @@ def test_scoped_search_parent_context_and_api_parity(navcom,tmp_path,monkeypatch
     assert r['matches']==1 and r['nodes'][0]['key']==parent
     assert r['nodes'][0]['open_key']==child
     assert r['nodes'][0]['matching_children'][0]['ref']=='child'
+    assert r['nodes'][0]['matching_children'][0]['key']==child
+    assert r['nodes'][0]['matching_children'][0]['start']==1
     web=WebApp(navcom,tmp_path/'index.sqlite').get(c,'/api/atlas',params)
     assert r==web
     expanded=d.view(c,dict(params,children=['1']))
     assert expanded['nodes'][0]['key']==child
+    assert expanded['nodes'][0]['parent_key']==parent
     # Regrouping stays scoped instead of returning unrelated projects.
     regroup=d.view(c,dict(params,action=['list'],grouping=['districts']))
     assert len(regroup['nodes'])==1 and regroup['nodes'][0]['count']==1
     tree=d.view(c,{'action':['tree'],'ref':['child']})
     assert [(n['key'],n['depth']) for n in tree['nodes']]==[(parent,0),(child,1)]
+    c.close()
+
+
+def test_matching_children_open_actual_matched_turns_in_stable_order(navcom,tmp_path,monkeypatch):
+    c,parent,child,other,d=fixture(navcom,tmp_path,monkeypatch)
+    second=add(navcom,c,tmp_path/'second.jsonl','Second task','unrelated opening','/dev/new-research',parent='main')
+    with open(second,'a') as handle:
+        handle.write(json.dumps(dict(type='response_item',payload=dict(type='message',role='assistant',
+            content=[dict(type='output_text',text='zebracorn located in the second turn')])) )+'\n')
+    navcom.index_logs(c,[(second,1700000001,Path(second).stat().st_size,'codex')],force=True,progress=False)
+    params={'action':['search'],'q':['zebracorn']}
+    node=next(n for n in d.view(c,params)['nodes'] if n['key']==parent)
+    children={n['key']:n for n in node['matching_children']}
+    assert children[child]['start']==1 and children[second]['start']==2
+    assert next(n for n in node['matching_children'] if n['key']==node['open_key'])==node['matching_children'][0]
+    assert node['matching_children']==next(n for n in d.view(c,params)['nodes'] if n['key']==parent)['matching_children']
     c.close()
 
 
@@ -173,3 +192,19 @@ def test_untitled_matrix_results_use_evidence_labels(navcom,tmp_path,monkeypatch
     assert WebApp(navcom,tmp_path/'index.sqlite').get(c,'/api/atlas',
         {'action':['search'],'within':['research:exp32'],'q':['matrix']})['nodes']==r['nodes']
     c.close()
+
+
+def test_equal_child_matches_keep_order_across_fresh_cli_processes(navcom,tmp_path,monkeypatch):
+    import os
+    c,parent,child,other,d=fixture(navcom,tmp_path,monkeypatch)
+    left=add(navcom,c,tmp_path/'left.jsonl','Same task','quartzneedle identical text','/dev/new-research',parent='main')
+    right=add(navcom,c,tmp_path/'right.jsonl','Same task','quartzneedle identical text','/dev/new-research',parent='main')
+    c.close()
+    orders=[]
+    for seed in ('1','2','5'):
+        result=subprocess.run([sys.executable,str(ROOT/'navcom.py'),'atlas','search','quartzneedle','--json',
+            '--index',str(tmp_path/'index.sqlite')],env=dict(os.environ,PYTHONHASHSEED=seed),capture_output=True,text=True)
+        assert result.returncode==0,result.stderr
+        node=json.loads(result.stdout)['nodes'][0]
+        orders.append((node['open_key'],[ch['key'] for ch in node['matching_children']]))
+    assert orders==[(right,[right,left])]*3

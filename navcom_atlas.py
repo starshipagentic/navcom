@@ -72,6 +72,23 @@ def fleet_snapshot():
     except (OSError,ValueError,TypeError,KeyError): return [], ''
 
 
+def _file_generation(path):
+    try:
+        st=Path(path).stat()
+        return (st.st_dev,st.st_ino,st.st_size,st.st_mtime_ns,st.st_ctime_ns)
+    except OSError:
+        return None
+
+
+def _month(stamp):
+    if not stamp:return 'Undated'
+    local=time.localtime(stamp)
+    # strftime performs another timezone conversion on macOS. Preserve unusual
+    # platform year formatting through the original path outside normal dates.
+    if not 1000<=local.tm_year<=9999:return time.strftime('%Y-%m',local)
+    return f'{local.tm_year:04d}-{local.tm_mon:02d}'
+
+
 class Atlas:
     def __init__(self, api):
         self.api=api
@@ -82,18 +99,27 @@ class Atlas:
         self.fleet_date=''
         self.trail_cache={}
 
+    @staticmethod
+    def database_generation(conn):
+        db=next((r[2] for r in conn.execute('PRAGMA database_list') if r[1]=='main'),'')
+        return (_file_generation(db),_file_generation(db+'-wal')) if db else None
+
     def catalog(self,conn):
+        # A pooled caller captures this before opening its read snapshot. If a
+        # writer publishes during a search, the next request must invalidate.
+        generation=getattr(self,'_read_generation',self.database_generation(conn))
         annotations=self.api._ui_read(conn,'annotations')
-        signature=(tuple(conn.execute('SELECT count(*), max(mtime), sum(size) FROM file_state').fetchone()),
-                   identity(json.dumps(annotations,sort_keys=True)),
-                   conn.execute('SELECT count(*) FROM file_meta').fetchone()[0])
+        rows=conn.execute('SELECT s.file,s.mtime,s.msg_index,m.provider,m.project,m.title,s.size FROM file_state s LEFT JOIN file_meta m ON m.file=s.file ORDER BY s.file').fetchall()
+        fleet_path=Path(os.environ.get('NAVCOM_STARSHIP_ROOT',str(Path.home()/'dev/starship'))).expanduser()/'bridge/data.json'
+        signature=(identity(json.dumps(rows)),identity(json.dumps(annotations,sort_keys=True)),
+                   generation,
+                   str(fleet_path),_file_generation(fleet_path),os.environ.get('TZ'),time.tzname)
         with self.lock:
             if signature==self.signature and time.monotonic()-self.built<120: return self.records
             ships,self.fleet_date=fleet_snapshot()
             ships.sort(key=lambda p:-len(p[1]))
             records={}
-            rows=conn.execute('SELECT s.file,s.mtime,s.msg_index,m.provider,m.project,m.title FROM file_state s LEFT JOIN file_meta m ON m.file=s.file').fetchall()
-            for key,mtime,turns,provider,project,title in rows:
+            for key,mtime,turns,provider,project,title,_size in rows:
                 provider=provider or self.api.detect_provider_from_path(key)
                 project=project or self.api._project_from_key(key,provider) or 'Unknown project'
                 parent,nickname=self.api._session_parent(conn,key,provider)
@@ -109,7 +135,7 @@ class Atlas:
                 records[key]=dict(id=identity(key),key=key,title=title,project=display,provider=provider,
                                   mtime=mtime or 0,turns=turns or 0,topics=[t for t,_ in labels],
                                   basis={t:words for t,words in labels},district=district(display),
-                                  month=time.strftime('%Y-%m',time.localtime(mtime)) if mtime else 'Undated',
+                                  month=_month(mtime),
                                   favorite=bool(annotation.get('favorite')),fleet=fleet,parent_id=parent,
                                   words=tokens(title+' '+display+' '+annotation.get('note','')+' '+(nickname if parent else '')))
             self.records=records;self.signature=signature;self.built=time.monotonic();self.trail_cache={}

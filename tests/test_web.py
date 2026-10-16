@@ -163,3 +163,66 @@ def test_atlas_http_search_and_project_drilldown(web):
     assert detail['nodes'][0]['kind'] == 'conversation'
     with pytest.raises(HTTPError) as caught: request('/api/atlas?lens=invalid')
     assert caught.value.code == 400
+
+
+def test_space_api_reuses_cli_contract_and_serves_only_packaged_art(web, monkeypatch, tmp_path):
+    import navcom_navigation
+    import navcom_space
+    server, request, key, index = web
+    cache=tmp_path/'space.json';sources=tmp_path/'sources'
+    monkeypatch.setenv('NAVCOM_SPACE_CACHE',str(cache))
+    monkeypatch.setenv('NAVCOM_SOURCES_CACHE',str(sources))
+    monkeypatch.setenv('NAVCOM_STARSHIP_ROOT',str(tmp_path/'no-fleet'))
+    with server.app.connect() as conn:
+        navcom_space.refresh(server.app.api,conn,cache,source_cache=sources)
+        cli=navcom_navigation.view(server.app.api,conn,space_cache=cache,source_cache=sources,action='explore',limit=80)
+    response=request('/api/space?action=explore&limit=80')
+    assert response==cli
+    assert 'Galactic bridge' in request('/',token=False)
+    for route in ['/api/space','/api/space/refresh']:
+        with pytest.raises(HTTPError) as caught:request(route,{} if route.endswith('refresh') else None,token=False)
+        assert caught.value.code==403
+    with urlopen(f'http://127.0.0.1:{server.server_port}/assets/starship/city.png') as art:
+        assert art.headers['Content-Type'].startswith('image/png')
+        assert art.read(8)==b'\x89PNG\r\n\x1a\n'
+    with pytest.raises(HTTPError) as caught:request('/assets/starship/../../navcom.py',token=False)
+    assert caught.value.code==404
+
+
+def test_space_refresh_retains_navigation_when_starforge_unavailable(web, monkeypatch, tmp_path):
+    import navcom_sources
+    import time
+    server,request,_,_=web
+    monkeypatch.setenv('NAVCOM_SPACE_CACHE',str(tmp_path/'space.json'))
+    monkeypatch.setenv('NAVCOM_SOURCES_CACHE',str(tmp_path/'sources'))
+    monkeypatch.setenv('NAVCOM_STARSHIP_ROOT',str(tmp_path/'no-fleet'))
+    monkeypatch.setenv('NAVCOM_STARFORGE_PYTHON',str(tmp_path/'missing-starforge'))
+    assert request('/api/space/refresh',{})['running']
+    deadline=time.monotonic()+15
+    while request('/api/task')['running'] and time.monotonic()<deadline:time.sleep(.03)
+    task=request('/api/task')
+    assert not task['running'] and not task['error']
+    assert task['coverage']['runtime_error']
+    assert task['coverage']['more']
+    assert request('/api/space')['nodes']
+
+
+def test_web_voice_size_limit_and_existing_local_provider(web, monkeypatch):
+    import base64
+    import navcom_voice
+    _, request, _, _ = web
+    monkeypatch.setattr(navcom_voice,'status',lambda:dict(available=True,model_loaded=False))
+    seen=[]
+    monkeypatch.setattr(navcom_voice,'transcribe',lambda audio:seen.append(audio) or dict(text='fly to example'))
+    assert request('/api/voice')['model_loaded'] is False
+    assert 'navcom-capture' in request('/navcom_voice_worklet.js',token=False)
+    assert 'getUserMedia' in request('/navcom_voice.js',token=False)
+    recording=b'x'*600000
+    assert request('/api/voice',{'audio':base64.b64encode(recording).decode()})['text']=='fly to example'
+    assert seen==[recording]
+    with pytest.raises(HTTPError) as error:request('/api/voice',{'audio':''},extra={'Content-Length':'950001'})
+    assert error.value.code==400
+    with pytest.raises(HTTPError) as error:request('/api/state',{'query':''},extra={'Content-Length':'70000'})
+    assert error.value.code==400
+    with pytest.raises(HTTPError) as error:request('/api/voice',{'audio':'anything'},token=False)
+    assert error.value.code==403

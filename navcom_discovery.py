@@ -208,6 +208,7 @@ class Discovery:
                 hit={'start':start,'role':rows[0][1],'excerpt':self.api._one_line(rows[0][2],340)} if rows else None
                 self.atlas.enrich(conn,node,records[key],hit);nodes=[node]
                 node['parent_ref']=self.api.session_ref(parents[key]) if parents[key] else None
+                node['parent_key']=parents[key]
                 node['child_refs']=[self.api.session_ref(k) for k in records if parents[k]==key]
                 node['resume_plan']=self.api.resume_plan(conn,key,records[key]['provider'])
             matched={n['key'] for n in nodes}
@@ -240,7 +241,7 @@ class Discovery:
                 families[root].append(key)
             ordered=sorted(families,key=lambda k:(bool(preferred) and not any(research.family(records[m]['project']) in preferred for m in families[k]),-max((scores.get(m,0) for m in families[k]),default=0),bool(records[k]['parent_id']),-records[k]['turns'] if c and c['grouping']=='research' else -records[k]['mtime'],k))
             for key in ordered:
-                matches=families[key];focus=max(matches,key=lambda k:(scores.get(k,0),k==key,records[k]['mtime']))
+                matches=families[key];focus=max(matches,key=lambda k:(scores.get(k,0),k==key,records[k]['mtime'],k))
                 r=records[key];node=self.atlas.public(r,'Matching child task' if key not in matched else 'Indexed conversation')
                 branch_hits=self.hits(conn,records,c,cache) if c else {}
                 hit=branch_hits.get(focus)
@@ -249,8 +250,12 @@ class Discovery:
                     if rows:hit={'start':index,'role':rows[0][1],'excerpt':self.api._one_line(rows[0][2],340)}
                 self.atlas.enrich(conn,node,records[focus],hit,c['label'] if c and c.get('branch') else '')
                 node['evidence_ref']=self.api.session_ref(focus);node['evidence_key']=focus
-                node['open_key']=focus;node['matching_children']=[dict(ref=self.api.session_ref(m),label=records[m]['title']) for m in matches if m!=key]
+                node['open_key']=focus
+                node['matching_children']=[dict(key=m,ref=self.api.session_ref(m),label=records[m]['title'],
+                    start=(evidence.get(m) or branch_hits.get(m) or {}).get('start',1))
+                    for m in sorted(matches,key=lambda m:(m!=focus,-scores.get(m,0),-records[m]['mtime'],m)) if m!=key]
                 node['child_count']=sum(p==key for p in parents.values());node['parent_ref']=self.api.session_ref(parents[key]) if parents[key] else None
+                node['parent_key']=parents[key]
                 if r['parent_id'] and not parents[key]:node['reason']+=' · parent not indexed'
                 nodes.append(node)
         total=len(nodes);page=nodes[offset:offset+limit]

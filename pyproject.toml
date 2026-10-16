@@ -17,6 +17,9 @@ classifiers = [
 ]
 dependencies = []
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [project.urls]
 Homepage = "https://github.com/starshipagentic/navcom"
 Repository = "https://github.com/starshipagentic/navcom"
@@ -26,7 +29,7 @@ navcom = "navcom:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
-only-include = ["navcom.py", "navcom_web.py", "navcom_web.html", "navcom_intelligence.py", "navcom_atlas.py", "navcom_discovery.py", "navcom_atlas_cli.py", "navcom_research.py", "navcom_atlas.js", "navcom_atlas.css"]
+only-include = ["navcom.py", "navcom_web.py", "navcom_web.html", "navcom_intelligence.py", "navcom_atlas.py", "navcom_discovery.py", "navcom_atlas_cli.py", "navcom_research.py", "navcom_sources.py", "navcom_source_reader.py", "navcom_place_files.py", "navcom_place_overview.py", "navcom_history.py", "navcom_history_cli.py", "navcom_system_history.py", "navcom_historical_conversations.py", "navcom_historical_landing.py", "navcom_voice.py", "navcom_voice.js", "navcom_voice_worklet.js", "navcom_star_chat.py", "navcom_ship_boarding.py", "navcom_ship_context.py", "navcom_carried_search.py", "navcom_navigation.py", "navcom_relationships.py", "navcom_native_families.py", "navcom_navigation_intent.py", "navcom_space.py", "navcom_stars.py", "navcom_star_inspection.py", "navcom_fleet.py", "navcom_commission_archives.py", "navcom_ship_inspection.py", "navcom_place_inspection.py", "navcom_source_discovery.py", "navcom_chart_refresh.py", "assets/starship", "navcom_sources_worker.py", "navcom_atlas.js", "navcom_space.js", "navcom_space.css", "navcom_atlas.css"]
 
 [tool.hatch.build.targets.sdist]
-include = ["navcom.py", "navcom_web.py", "navcom_web.html", "navcom_intelligence.py", "navcom_atlas.py", "navcom_discovery.py", "navcom_atlas_cli.py", "navcom_research.py", "navcom_atlas.js", "navcom_atlas.css", "README.md", "pyproject.toml", "features", "tests", "skills", "docs"]
+include = ["navcom.py", "navcom_web.py", "navcom_web.html", "navcom_intelligence.py", "navcom_atlas.py", "navcom_discovery.py", "navcom_atlas_cli.py", "navcom_research.py", "navcom_sources.py", "navcom_source_reader.py", "navcom_place_files.py", "navcom_place_overview.py", "navcom_history.py", "navcom_history_cli.py", "navcom_system_history.py", "navcom_historical_conversations.py", "navcom_historical_landing.py", "navcom_voice.py", "navcom_voice.js", "navcom_voice_worklet.js", "navcom_star_chat.py", "navcom_ship_boarding.py", "navcom_ship_context.py", "navcom_carried_search.py", "navcom_navigation.py", "navcom_relationships.py", "navcom_native_families.py", "navcom_navigation_intent.py", "navcom_space.py", "navcom_stars.py", "navcom_star_inspection.py", "navcom_fleet.py", "navcom_commission_archives.py", "navcom_ship_inspection.py", "navcom_place_inspection.py", "navcom_source_discovery.py", "navcom_chart_refresh.py", "assets/starship", "navcom_sources_worker.py", "navcom_atlas.js", "navcom_space.js", "navcom_space.css", "navcom_atlas.css", "README.md", "pyproject.toml", "features", "tests", "skills", "docs"]

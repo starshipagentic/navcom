@@ -1,7 +1,34 @@
 # navcom diary
 
+- [2026-10-16 — The bridge survives a reload](2026-10-16-bridge-survives-reload.md) — SIGPIPE crash fixed at the web entry only (CLI pipe behavior unchanged); real-subprocess regression test; default bridge relaunched on a new port.
+
+- [2026-10-16 — Galactic navigation handoff](2026-10-16-galactic-navigation-handoff.md) — Start here to resume: full owner concept, Wirth/official-plan status, native tool reuse, commands, installed/runtime state, known crash, live-test outcomes and next steps.
+
+- [2026-10-16 — Land in the past](2026-10-16-land-in-the-past.md)
+
+- [2026-10-16 — Product clues and pinned history](2026-10-16-product-clues-and-pinned-history.md)
+
+- [2026-10-16 — Overview labels and spoken courses](2026-10-16-overview-labels-and-spoken-courses.md)
+
+- [2026-10-16 — Flight room and conversation families](2026-10-16-flight-room-and-conversation-families.md)
+
+- [2026-10-16 — Recognizable places and return paths](2026-10-16-recognizable-places-and-return-paths.md)
+
+- [2026-10-16 — Search carried context and publish charts](2026-10-16-search-carried-context-and-publish-charts.md)
+
+- [2026-10-16 — Land and read carried context](2026-10-16-land-and-read-carried-context.md)
+
+- [2026-10-16 — Scoped flight and version coverage](2026-10-16-scoped-flight-and-version-coverage.md)
+- [2026-10-16 — Readable flight and native connections](2026-10-16-readable-flight-and-native-connections.md)
+- [2026-10-16 — Hidden applications and physical copies](2026-10-16-hidden-apps-and-physical-copies.md)
+- [2026-10-16 — Expertise candidates, readable sources and a dated system view](2026-10-16-expertise-source-windows-system-time.md)
+- [2026-10-16 — Read the code and travel in time](2026-10-16-read-the-code-and-travel-in-time.md)
+- [2026-10-16 — History and ship context retain their source](2026-10-16-history-and-ship-context.md)
+- [2026-10-16 — First galactic flight, with evidence underneath](2026-10-16-first-galactic-flight.md)
+
 | Date | Entry | Summary |
 |---|---|---|
+| 2026-10-15 | [A universe you can return to](2026-10-15-a-universe-you-can-return-to.md) | Owner-defined galaxy, product systems and planets, experimental moons, cities, expertise stars, starbases, and commissioned ships carrying a recoverable viewpoint; machines and cloud form the underlying physical plane. |
 | 2026-10-02 | [navcom 0.9.1: every harness can revive an old session](2026-10-02-navcom-091-revive-every-harness.md) | PASTE_START for the 13 agents without a prompt flag (kimi, crush, goose, dsh, hermes, cline, reasonix, deepcode, aider, agy, kiro, amp, grok-dev): start command + prompt to paste, prompt auto-copied to clipboard when navcom launches them; REVIVE picker lists all 30, prompt-capable first. |
 | 2026-10-02 | [navcom 0.9.0: revive old sessions with their context](2026-10-02-navcom-090-recap-revive.md) | navcom --recap REF = ~30k-char context pack (user msgs, where it stopped, commands, files changed); --resume REF --with HARNESS starts a fresh agent (17 harnesses) primed to run it; dead sessions ask which agent; menu REVIVE picker (r on dead / n anywhere); search footer + --open + --json + skill card point at it; live: fresh claude rebuilt a 5-month-old Codex review in 3 turns, $0.29. |
 | 2026-10-02 | [navcom 0.8.0: get back into any conversation](2026-10-02-navcom-080-resume.md) | navcom --resume REF (cd + exec the harness here; --tab via cmux/tmux/iTerm2/WezTerm/kitty/Terminal; --print), resume line in search footer / --open / --json, menu RESUME line with r/t/c; per-harness table for all 30 (Kimi session_, Amp T-, Gemini sessionId, Grok Build ~/.grok/bin); deleted sessions auto-restored from archive or marked read-only; Gemini repr rows repaired (schema v3); 1,459 duplicate parser lines removed. |
@@ -15,3 +42,11 @@
 | 2026-09-30 | [navcom 0.2.2: `navcom --skill`](2026-09-30-navcom-022-skill-flag.md) | `--skill` prints the stock SKILL.md, `--skill install` full-service install; Skillflag-compatible list/export (deterministic tar), interop proven with `npx skillflag install`; rejected its never-install rule. |
 | 2026-09-30 | [navcom 0.2.1: self-installing skill, --help as manual, fair per-harness -n](2026-09-30-navcom-021-skills-help-fairness.md) | Skill card embedded + silently installed into ~/.claude/skills, $CODEX_HOME/skills, ~/.agents/skills (hash-guarded, never clobbers edits); -n per harness merged by BM25; --help rewritten as the LLM manual, all 37 documented examples tested. |
 | 2026-09-30 | [navcom 0.2.0: LLM-proof search + 4 new harnesses](2026-09-30-navcom-020-llm-proof-search.md) | Mined 1,093 real LLM navcom calls (89 crashes, 109 zero-hit, 17 locks, 4GB-log slowness). Rewrote query cooker (0 errors / 60k fuzz, 911/918 historical queries now hit), compact default, --open drill-down, --here/--days/--this-session, text-only matching, self-exclusion, incremental+WAL+lock-tolerant index, bounded summarizers; added pi/omo/opencode/goose; BDD+pytest; published 0.2.0. |
+- [2026-10-15 — NavCom orchestrates local Starforge harvest](2026-10-15-navcom-orchestrates-local-harvest.md)
+- [2026-10-16 — Starforge already searches skipped files](2026-10-16-starforge-already-searches-skipped-files.md)
+- [2026-10-16 — Starforge source search is now a NavCom CLI capability](2026-10-16-starforge-source-cli.md)
+
+- [Voice, native handoffs and dated turns](2026-10-16-voice-native-handoffs-and-dated-turns.md) — shared CLI/UI actions, native timestamp ingestion and local speech proof.
+- [Resumable chart intake](2026-10-16-resumable-chart-intake.md) — shared automatic harvest, native root grouping, stable lab identities, question evidence and browser continuity.
+
+- [Stored ships and native submodules](2026-10-16-stored-ships-and-native-submodules.md) — automatic archive discovery, carried-context navigation and native Git ownership.
