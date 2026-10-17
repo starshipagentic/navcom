@@ -1,0 +1,39 @@
+{
+  "title": "The Galaxy Becomes a Cockpit",
+  "eyebrow": "E2E PROOF TOUR · NAVCOM 0.11.0",
+  "plan": "Galactic cockpit pass: action rail, hue families, dated journey, CLI-up law",
+  "context": "Captured from the installed navcom 0.11.0 bridge on the owner's real chart (147 harvested sources, 6,693 conversations). Every button is one API call that is the twin of a navcom command, and the same command is printed beside it.",
+  "proofTarget": "the bridge can act on any place without bending the CLI: same services, same commands, same answers; dated travel survives reload; the headless CLI is untouched and faster.",
+  "beats": [
+    "Every system keeps its own color; inside a system, its products share that family",
+    "Select a product: one action rail, each action paired with its exact navcom command",
+    "The rail's files panel and the copied CLI command return the same 98 retained files",
+    "Ask expert opens a review with its command; nothing is sent from a click",
+    "Syra as of Oct 1, 2026: land in sign-in, search login, read the pinned source, reload — still there"
+  ],
+  "captions": {
+    "01-galaxy-system-hues.png": "Galaxy: each solar system keeps its own stable color, derived in the view from its ID (no color in the data)",
+    "02-syra-hue-family.png": "Inside Syra, every product shares Syra's green family — you can tell which system you are in",
+    "03-product-action-rail.png": "syrenity-mobile selected: ONE action rail; each action shows the service's own navcom command with Copy",
+    "04-rail-files-panel.png": "Browse saved files → 1–40 of 98 retained files: _layout.tsx 625 B, forgot-password-confirm.tsx 13,037 B",
+    "05-cli-twin-same-files.png": "The copied command run in a terminal: the same files, the same sizes — the UI is a view over the CLI",
+    "06-star-rail.png": "A living star (Hermes expert): its rail offers inspect, history and Ask — no special-case UI",
+    "07-ask-opens-review-not-send.png": "Ask expert opens a REVIEW dialog with the exact navcom atlas ask command; nothing is sent from a click",
+    "08-syra-as-of-oct-1.png": "Explore time: Syra reconstructed at 2026-10-01 12:00 UTC from the saved, pinned session",
+    "09-dated-district-login.png": "Landed in the committed 'sign in' district and searched login — only that district's committed files (snippets blurred: public repo)",
+    "10-pinned-source-reader.png": "The original file at pinned commit 1325eaa77fed, labelled 'captured' honestly (code blurred: client source, public repo)",
+    "11-reload-keeps-dated-journey.png": "Reload: still Oct 1, still sign in, still 'login', Back to dated system ready — the reload bug is fixed",
+    "12-narrow-390-product-rail.png": "390 px phone width: the rail stacks, every command stays copyable, no horizontal scroll",
+    "13-reduced-motion-arrival.png": "Reduced motion: arrival on syrenity-mobile is instant; its code districts appear as cities"
+  },
+  "verdict": {
+    "headline": "The cockpit acts, the CLI stays clean",
+    "lines": [
+      "PROVEN: rail actions are twin calls of the printed navcom commands (UI files == CLI files)",
+      "PROVEN: dated journey UI == API across Back/Forward/reload/copied link (7/7 live), no cache writes",
+      "PROVEN: 1,156 pytest + 176 BDD scenarios green; architecture law enforced by 143 tests",
+      "PROVEN: headless CLI loads zero galaxy code; sigpipe 0.14 s, import 0.05 s",
+      "OPEN: live microphone (voice → future living star) and captain boarding (needs a local route or remote attachment)"
+    ]
+  }
+}

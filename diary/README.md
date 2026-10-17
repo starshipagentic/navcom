@@ -1,5 +1,13 @@
 # navcom diary
 
+- [2026-10-16 — The galaxy becomes a cockpit](2026-10-16-galaxy-becomes-a-cockpit.md) — one action rail per place (each action = one twin API call + the service's own navcom command), system hue families, archive sprite, review-first launches, focus/memo/Library-state polish, proof gif.
+- [2026-10-16 — The dated journey is proven live](2026-10-16-dated-journey-proven-live.md) — Playwright UI == API on Syra Oct 1 → mobile → sign-in → login → pinned file → Back/Forward/reload/copied link (camera in links); write guards; reload bug fixed; 7/7 on installed 0.11.0.
+- [2026-10-16 — BDD for every cockpit verb](2026-10-16-bdd-for-every-cockpit-verb.md) — real "Orchard" fixture galaxy, verb-family features, mutation-tested; `ask/board --launch` no-terminal KeyError fixed.
+- [2026-10-16 — The web adapter goes thin](2026-10-16-web-adapter-goes-thin.md) — shared maintain/prepare_launch/annotate/dashboard_snapshot/search_json, new read routes, tests/test_architecture.py makes the law executable.
+- [2026-10-16 — Services hold the law](2026-10-16-services-hold-the-law.md) — no color/sprite in data, one path resolver, node CLI commands, kill_group, refresh drive(); navcom_history.py frozen (its bytes are the snapshot key).
+- [2026-10-16 — Command words search again](2026-10-16-command-words-search-again.md) — `navcom history of …` searches again (LLM-proof promise restored), import navcom halved, DNA gate.
+- [2026-10-16 — The package ships only the product](2026-10-16-package-ships-only-the-product.md) — anchored sdist (no LABS/private, no internal docs), LABS/**/private gitignored, plan trimmed.
+- [2026-10-16 — KISS ledger](2026-10-16-kiss-ledger.md) — what got simpler, what the maps got wrong, and every simplification waiting on an owner decision.
 - [2026-10-16 — The bridge survives a reload](2026-10-16-bridge-survives-reload.md) — SIGPIPE crash fixed at the web entry only (CLI pipe behavior unchanged); real-subprocess regression test; default bridge relaunched on a new port.
 
 - [2026-10-16 — Galactic navigation handoff](2026-10-16-galactic-navigation-handoff.md) — Start here to resume: full owner concept, Wirth/official-plan status, native tool reuse, commands, installed/runtime state, known crash, live-test outcomes and next steps.
