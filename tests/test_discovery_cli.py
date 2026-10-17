@@ -127,7 +127,7 @@ def test_help_and_command_errors_are_explanatory(tmp_path):
     for args in commands:
         p=subprocess.run([sys.executable,str(ROOT/'navcom.py'),*args],capture_output=True,text=True)
         assert p.returncode==0 and p.stdout.strip(),(args,p.stderr)
-    p=subprocess.run([sys.executable,str(ROOT/'navcom.py'),'atlas','unknown'],capture_output=True,text=True)
+    p=subprocess.run([sys.executable,str(ROOT/'navcom.py'),'atlas','list','nonsense'],capture_output=True,text=True)
     assert p.returncode==2 and 'invalid choice' in p.stderr
 
 

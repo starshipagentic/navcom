@@ -83,6 +83,19 @@ def discover():
     return dict(available=False, message='No suitable model is already running. Everything still works. NavCom will not start or download one.')
 
 
+def excerpt(api, conn, key):
+    """What the model reads of one indexed conversation: its first three turns and its last ten,
+    user and assistant only, each cut to 1200 characters."""
+    last = api.max_msg_index(conn, key)
+    turns = api.fetch_window_rows(conn, key, [(1, 3), (max(4, last - 10), last)])
+    return '\n'.join(f'{role}: {text[:1200]}' for _, role, text in turns if role in ('user', 'assistant'))
+
+
+def suggest_for(api, conn, key):
+    """Suggest a title and note for one indexed conversation (nothing is saved)."""
+    return suggest(excerpt(api, conn, key))
+
+
 def suggest(text):
     if not LOCK.acquire(blocking=False):
         raise ValueError('A local suggestion is already running. Try again when it finishes.')

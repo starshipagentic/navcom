@@ -118,6 +118,19 @@ def parser():
     return p
 
 
+WORKER = Path(__file__).with_name("navcom_sources_worker.py")
+
+
+def source_id(root):
+    """Stable source identity for one resolved root (explicit or discovered harvest)."""
+    return hashlib.sha256(str(root).encode()).hexdigest()[:16]
+
+
+def worker_argv(interpreter=None):
+    """Run the harvest/search worker in the Starforge runtime; callers own stdio and timeouts."""
+    return [interpreter or runtime(), str(WORKER)]
+
+
 def runtime():
     override = os.environ.get("NAVCOM_STARFORGE_PYTHON")
     if override:
@@ -148,6 +161,45 @@ def runtime():
             "Starforge runtime unavailable. Install Starforge, or set NAVCOM_STARFORGE_PYTHON to the Python interpreter where it is installed."
         )
     return interpreter
+
+
+class WorkerError(ValueError):
+    """The Starforge worker refused or failed; its own reason went to stderr, or is this message."""
+
+    def __init__(self, returncode, reason=""):
+        super().__init__(reason or f"Starforge worker stopped (exit {returncode})")
+        self.returncode = returncode
+
+
+def sources_list(cache):
+    """Harvested sources with their scope and coverage (`navcom sources list`)."""
+    state = Path(cache) / "current.json"
+    if not state.exists():
+        return dict(schema_version=1, sources=[], published=None)
+    return dict(schema_version=1, **json.loads(state.read_text()))
+
+
+def search(cache, query, *, within=None, paths=(), mode="both", regex=False, ext=None, limit=20, progress=None):
+    """Search harvested sources: ranked Starforge concepts plus literal code/document text
+    (`navcom sources search`). With progress (a terminal), progress(message) hears the start and
+    the worker's own messages stream to stderr; without it they are captured and a failure's
+    reason becomes the WorkerError message."""
+    if not 1 <= limit <= 200:
+        raise ValueError("--limit must be between 1 and 200")
+    if mode not in ("both", "concept", "text"):
+        raise ValueError("--mode must be both, concept or text")
+    if mode == "concept" and (regex or ext):
+        raise ValueError("--regex and --ext apply to the text path; use --mode text or both")
+    request = dict(action="search", cache=str(cache), paths=list(paths), query=query, within=within,
+                   mode=mode, regex=regex, ext=ext, limit=limit)
+    if progress:
+        progress("starting Starforge search")
+    completed = subprocess.run(worker_argv(), input=json.dumps(request), stdout=subprocess.PIPE,
+                               stderr=None if progress else subprocess.PIPE, text=True)
+    if completed.returncode:
+        reasons = [line for line in (completed.stderr or "").splitlines() if line.startswith("navcom sources: ")]
+        raise WorkerError(completed.returncode, reasons[-1].removeprefix("navcom sources: ") if reasons else "")
+    return json.loads(completed.stdout)
 
 
 def conversation_source(api, root, index):
@@ -233,24 +285,13 @@ def run(api, argv):
         p.print_help()
         return 0
     try:
+        from navcom_navigation import history_cache, paths
         index = getattr(args, "index", None) or api.default_index_path()
-        cache = (
-            (
-                args.cache
-                or Path(
-                    os.environ.get(
-                        "NAVCOM_SOURCES_CACHE", str(index.parent / "navcom-sources")
-                    )
-                )
-            )
-            .expanduser()
-            .resolve()
-        )
+        cache = paths(index, sources=args.cache)[1].resolve()
         if args.action == "read":
             from navcom_source_reader import read_source
-            history_cache=args.history_cache or Path(os.environ.get("NAVCOM_HISTORY_CACHE",str(index.parent/"navcom-history")))
             result=read_source(args.source,args.path,line=args.line,limit=args.limit,cache_path=cache,
-                history_cache=history_cache,history=args.history,snapshot=args.snapshot,published=args.published)
+                history_cache=args.history_cache or history_cache(index),history=args.history,snapshot=args.snapshot,published=args.published)
             if args.json:print(json.dumps(result,indent=2))
             else:
                 print(result.get("source_path") or result.get("original_path") or args.path)
@@ -258,12 +299,11 @@ def run(api, argv):
                 if result.get("cli_command"):print("\n"+result["cli_command"])
             return 0
         if args.action == "list":
-            state = cache / "current.json"
-            result = (
-                dict(schema_version=1, **json.loads(state.read_text()))
-                if state.exists()
-                else dict(schema_version=1, sources=[], published=None)
-            )
+            result = sources_list(cache)
+        elif args.action == "search":
+            result = search(cache, " ".join(args.words), within=args.within, paths=args.path, mode=args.mode,
+                            regex=args.regex, ext=args.ext, limit=args.limit,
+                            progress=lambda message: print("navcom sources ▸ " + message, file=sys.stderr, flush=True))
         else:
             request = dict(action=args.action, cache=str(cache))
             discovery = None
@@ -296,7 +336,7 @@ def run(api, argv):
                     )
                 request["sources"] = [
                     dict(
-                        id=hashlib.sha256(str(root).encode()).hexdigest()[:16],
+                        id=source_id(root),
                         root=str(root),
                         label=root.name,
                         include=args.include or ["."],
@@ -306,30 +346,13 @@ def run(api, argv):
                         conversation_collection=collection,
                     )
                 ]
-            if args.action == "search":
-                if not 1 <= args.limit <= 200:
-                    raise ValueError("--limit must be between 1 and 200")
-                if args.mode == "concept" and (args.regex or args.ext):
-                    raise ValueError(
-                        "--regex and --ext apply to the text path; use --mode text or both"
-                    )
-                request.update(
-                    paths=args.path,
-                    query=" ".join(args.words),
-                    within=args.within,
-                    mode=args.mode,
-                    regex=args.regex,
-                    ext=args.ext,
-                    limit=args.limit,
-                )
             print(
                 "navcom sources ▸ starting Starforge " + args.action,
                 file=sys.stderr,
                 flush=True,
             )
-            worker = Path(__file__).with_name("navcom_sources_worker.py")
             completed = subprocess.run(
-                [runtime(), str(worker)],
+                worker_argv(),
                 input=json.dumps(request),
                 stdout=subprocess.PIPE,
                 text=True,
@@ -343,6 +366,8 @@ def run(api, argv):
         else:
             render(result)
         return 0
+    except WorkerError as exc:
+        return exc.returncode
     except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
         print("navcom sources: " + str(exc), file=sys.stderr)
         return 1

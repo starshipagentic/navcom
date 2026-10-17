@@ -85,3 +85,37 @@ Feature: Queries never break on punctuation or odd syntax
     Then it succeeds
     And the output contains "no exact phrase match"
     And the "claude" harness is in the results
+
+  @critical
+  Scenario Outline: A search may start with a command word
+    When I run: navcom <query>
+    Then it succeeds
+    And the output does not contain "invalid choice"
+    And the output contains "query: <shown>"
+    And the "codex" harness is in the results
+
+    Examples:
+      | query                            | shown    |
+      | history of the cognito auth bug  | history* |
+      | sources of the cognito auth bug  | sources* |
+      | atlas of the cognito auth bug    | atlas*   |
+      | voice of the cognito auth bug    | voice*   |
+
+  @critical
+  Scenario: Asking for help with unknown words searches them
+    When I run: navcom help me find the cognito auth bug
+    Then it succeeds
+    And the output does not contain "Unknown help subject"
+    And the output contains "query: help*"
+    And the "codex" harness is in the results
+
+  Scenario: A real subcommand after a command word still runs that command
+    When I run: navcom history timeline --help
+    Then it succeeds
+    And the output contains "usage: navcom history timeline"
+    When I run: navcom help search
+    Then it succeeds
+    And the output contains "navcom <words>"
+    When I run: navcom atlas help research
+    Then it succeeds
+    And the output does not contain "query:"

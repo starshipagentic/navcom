@@ -136,6 +136,7 @@ navcom history timeline <planet-id>
 navcom history explore <planet-id> <commit-sha> --query login --json
 navcom history system <system-id> --at 2026-04-01 --query login --json
 navcom history system --cursor <next-cursor> --json
+navcom history land <planet-id> --cursor <cursor> --result-key <result-key> --json
 ```
 
 NavCom orchestrates existing Starforge harvest and both search paths. Concept/gem
@@ -220,6 +221,7 @@ linked-worktree versus independent-copy evidence; --refresh rechecks locations.
 `navcom history timeline PLACE` lists committed changes to a place's paths.
 `navcom history explore PLACE REVISION --query WORDS` searches that exact tree.
 `navcom help history` explains repository selection, scope and cache parameters.
+`navcom history land PLACE --cursor PIN --result-key KEY` enters a saved historical product; add --group ID or --query WORDS to inspect its exact native group or source scope.
 `navcom history conversations PLACE --at DATE` reads individually dated indexed turns.
 `navcom atlas ask STAR "question"` prepares a native Hermes handoff.
 `navcom atlas board SHIP --validate` checks a native captain route.

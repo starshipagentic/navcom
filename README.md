@@ -640,9 +640,10 @@ Search here, and parent/child navigation.
 
 Help is layered: `navcom help search`, `read`, `resume`, `atlas`, `maintenance`,
 or `all`; `navcom atlas help districts` explains a grouping; each subcommand has
-`--help`. Leading `atlas` and `help` are reserved commands: use
-`navcom --query "atlas help"` for a literal search. Other existing commands remain
-compatible. No MCP server is required.
+`--help`. A leading `atlas`, `sources`, `history` or `voice` word is a command only
+before one of its subcommands (or alone, or with `--help`); `help` only before a help
+subject. Anything else is an ordinary search, so `navcom history of the login fix`
+searches. No MCP server is required.
 
 ### Cached local source search (Starforge)
 

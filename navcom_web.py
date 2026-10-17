@@ -1,19 +1,31 @@
-"""Local, dependency-free browser interface for NavCom. No external assets or services."""
+"""Local, dependency-free browser interface for NavCom. No external assets or services.
+
+A thin HTTP adapter (docs/architecture.md, layer 4): each route validates its
+request, derives cache paths with navcom_navigation, and calls the same service
+function a CLI command reaches. tests/test_architecture.py keeps the route table.
+"""
 import json
-import os
 from pathlib import Path
 import secrets
 import signal
-import subprocess
 import sqlite3
 import threading
-import tempfile
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 import webbrowser
-from navcom_discovery import Discovery, refresh as refresh_discovery
+from navcom_discovery import Discovery
+import navcom_navigation as navigation
 import navcom_research as research
+
+
+def _turn(value):
+    """An optional turn number (REF:TURN in `navcom --resume REF:TURN --with HARNESS`)."""
+    if value in (None, ''):
+        return None
+    if isinstance(value, bool) or not str(value).isdigit() or int(value) < 1:
+        raise ValueError('Turn must be a positive whole number.')
+    return int(value)
 
 
 class WebApp:
@@ -29,14 +41,24 @@ class WebApp:
         self.atlas = Discovery(api)
 
     def connect(self):
-        from navcom_navigation import conversation_connection
-        conn = conversation_connection(self.index_path, timeout=.3)
-        return conn
+        return navigation.conversation_connection(self.index_path, timeout=.3)
+
+    def caches(self):
+        """Chart, source and historical caches for this index, read per request (env may change)."""
+        space_cache, source_cache = navigation.paths(self.index_path)
+        return space_cache, source_cache, navigation.history_cache(self.index_path)
 
     def key(self, conn, value):
         if not isinstance(value, str) or not conn.execute('SELECT 1 FROM file_state WHERE file=?', (value,)).fetchone():
             raise ValueError('Conversation not found. Refresh the list.')
         return value
+
+    def plan(self, conn, key, harness, turn):
+        """The plan `navcom --resume REF[:TURN] [--with HARNESS]` uses; a turn focuses a fresh harness."""
+        if harness and harness not in self.api.REVIVE_AGENTS:
+            raise ValueError('Unknown harness')
+        focus = _turn(turn)
+        return self.api.revive_plan(conn, key, harness, focus=focus) if harness else self.api.resume_plan(conn, key)
 
     def recent(self, conn, query='', refresh=False):
         api = self.api
@@ -60,72 +82,61 @@ class WebApp:
     def get(self, conn, route, params):
         api = self.api
         value = lambda name, default='': params.get(name, [default])[0]
+        number = lambda name, default: int(value(name, str(default)))
+        space_cache, source_cache, history_cache = self.caches()
         if route == '/api/voice':
             import navcom_voice
             return navcom_voice.status()
         if route == '/api/history/conversations':
-            import navcom_navigation as navigation
             import navcom_historical_conversations
-            space_cache,_=navigation.paths(self.index_path)
             return navcom_historical_conversations.view(api,conn,within=value('within'),as_of=value('at'),
-                space_cache=space_cache,query=value('q'),limit=int(value('limit','20')))
+                space_cache=space_cache,query=value('q'),limit=number('limit',20))
         if route == '/api/recent':
             return self.recent(conn, value('q'), value('refresh') == '1')
         if route == '/api/source':
-            import navcom_navigation as navigation
             from navcom_source_reader import read_source
-            _,source_cache=navigation.paths(self.index_path)
-            return read_source(value('source'),value('path'),line=int(value('line','1')),limit=int(value('limit','80')),
-                cache_path=source_cache,history_cache=Path(os.environ.get('NAVCOM_HISTORY_CACHE',str(self.index_path.parent/'navcom-history'))),
+            return read_source(value('source'),value('path'),line=number('line',1),limit=number('limit',80),
+                cache_path=source_cache.resolve(),history_cache=history_cache,
                 history=value('history'),snapshot=value('snapshot'),published=float(value('published')) if value('published') else None)
+        if route == '/api/sources':
+            import navcom_sources
+            return navcom_sources.sources_list(source_cache.resolve())
+        if route == '/api/sources/search':
+            import navcom_sources
+            if not value('q').strip():raise ValueError('Search needs words.')
+            return navcom_sources.search(source_cache.resolve(),value('q'),within=value('within') or None,
+                paths=params.get('path',[]),mode=value('mode','both'),regex=value('regex')=='1',ext=value('ext') or None,
+                limit=number('limit',20))
         if route == '/api/space/inspect':
-            import navcom_navigation as navigation
-            space_cache,_=navigation.paths(self.index_path)
             return navigation.inspect(space_cache=space_cache,within=value('within'),refresh=value('refresh')=='1',observe=value('observe')=='1')
         if route == '/api/space/context':
-            import navcom_navigation as navigation
-            space_cache,_=navigation.paths(self.index_path)
             return navigation.context(space_cache,value('within'),action=value('action','inspect'),query=value('q'),ref=value('ref'),
-                turn=int(value('turn')) if value('turn') else None,offset=int(value('offset','0')),limit=int(value('limit','10')),max_chars=int(value('max_chars','2000')),expected_catalog=value('catalog'))
+                turn=int(value('turn')) if value('turn') else None,offset=number('offset',0),limit=number('limit',10),max_chars=number('max_chars',2000),expected_catalog=value('catalog'))
         if route == '/api/space/files':
-            import navcom_navigation as navigation
             import navcom_place_files
-            space_cache,source_cache=navigation.paths(self.index_path)
             return navcom_place_files.files(space_cache,source_cache,value('within'),query=value('q'),
-                limit=int(value('limit','40')),offset=int(value('offset','0')),generation=value('generation'))
+                limit=number('limit',40),offset=number('offset',0),generation=value('generation'))
         if route == '/api/space/related':
-            import navcom_navigation as navigation
             import navcom_relationships
-            space_cache,source_cache=navigation.paths(self.index_path)
             return navcom_relationships.related(space_cache,source_cache,value('within'),query=value('q'),
-                limit=int(value('limit','20')),seconds=float(value('seconds','15')),offset=int(value('offset','0')))
+                limit=number('limit',20),seconds=float(value('seconds','15')),offset=number('offset',0))
         if route == '/api/history':
-            import navcom_navigation as navigation
             import navcom_history
             if value('action','timeline')!='timeline':raise ValueError('Use the history explorer to prepare a selected revision.')
             if not value('within'):raise ValueError('Select a repository-backed destination for its history.')
-            space_cache,source_cache=navigation.paths(self.index_path)
-            return navcom_history.view(value('within'),action='timeline',space_cache=space_cache,
-                source_cache=source_cache,cache_path=Path(os.environ.get('NAVCOM_HISTORY_CACHE',str(self.index_path.parent/'navcom-history'))),limit=int(value('limit','50')))
+            return navcom_history.view(value('within'),action='timeline',repo=Path(value('repo')) if value('repo') else None,space_cache=space_cache,
+                source_cache=source_cache,include=params.get('include') or None,limit=number('limit',50))
         if route == '/api/space':
-            import navcom_navigation as navigation
-            space_cache,source_cache=navigation.paths(self.index_path)
             return navigation.view(api,conn,space_cache=space_cache,source_cache=source_cache,
                 action=value('action','explore'),kind=value('kind'),within=value('within'),query=value('q'),
-                limit=int(value('limit','80')),offset=int(value('offset','0')),include_evidence=value('evidence')=='1')
+                limit=number('limit',80),offset=number('offset',0),include_evidence=value('evidence')=='1')
         if route == '/api/navigate':
-            import navcom_navigation as navigation
-            space_cache,source_cache=navigation.paths(self.index_path)
             return navigation.navigate(api,conn,space_cache=space_cache,source_cache=source_cache,
-                text=value('q'),within=value('within'),local=value('local','1')!='0',limit=int(value('limit','20')),scope_choice=value('choose'))
+                text=value('q'),within=value('within'),local=value('local','1')!='0',limit=number('limit',20),scope_choice=value('choose'))
         if route == '/api/atlas':
             return self.atlas.view(conn, params)
         if route == '/api/status':
-            stats = api._read_dashboard_cache(conn)
-            if stats is None:
-                stats = api.dashboard_stats(conn)
-                api._write_dashboard_cache(conn, stats)
-            return dict(stats=stats, task=dict(self.task))
+            return dict(stats=api.dashboard_snapshot(conn), task=dict(self.task))
         if route == '/api/task':
             return dict(self.task)
         if route == '/api/harnesses':
@@ -145,27 +156,32 @@ class WebApp:
                         turns=api.fetch_window_rows(conn, key, [(start, start + 79)]),
                         plan=plan, preview=api._launch_preview(plan, key),
                         last_reply=api._recent_last_words(conn, key))
-        if route == '/api/plan':
+        if route == '/api/session/search':
             key = self.key(conn, value('key'))
-            harness = value('harness')
-            if harness:
-                if harness not in api.REVIVE_AGENTS:
-                    raise ValueError('Unknown harness')
-                return api.revive_plan(conn, key, harness)
-            return api.resume_plan(conn, key)
+            limit = number('limit', api.DEFAULT_LIMIT)
+            if not value('q').strip():raise ValueError('Search needs words.')
+            if not 1 <= limit <= 200:raise ValueError('Search limit must be between 1 and 200.')
+            hits, cooked, note = api.search_hits(conn, value('q'), keys=[key], limit=limit)
+            return api.search_json(conn, api._group_hits(conn, hits), cooked, note)  # `WORDS --file REF --json`
+        if route == '/api/recap':
+            key = self.key(conn, value('key'))
+            budget = number('max_chars', 0)
+            if budget < 0:raise ValueError('max_chars must not be negative.')
+            return dict(key=key, recap=api.session_recap(conn, key, budget=budget or api.RECAP_BUDGET))
+        if route == '/api/plan':
+            return self.plan(conn, self.key(conn, value('key')), value('harness'), value('turn'))
         if route == '/api/state':
             return api._ui_read(conn, 'web')
         raise ValueError('Unknown request')
 
     def post(self, conn, route, data):
         api = self.api
+        space_cache, source_cache, history_cache = self.caches()
         if route in ('/api/space/ask','/api/space/board'):
-            import navcom_navigation as navigation
             for field in ('within','question','review_token'):
                 if not isinstance(data.get(field,''),str):raise ValueError('The selected destination, question and review identity must be text.')
             for field in ('launch','validate'):
                 if field in data and not isinstance(data[field],bool):raise ValueError('Action switches must be booleans.')
-            space_cache,_=navigation.paths(self.index_path)
             return navigation.interact(api,space_cache=space_cache,within=data.get('within',''),
                 action=route.rsplit('/',1)[-1],question=data.get('question',''),launch=data.get('launch') is True,
                 review_token=data.get('review_token',''),validate=data.get('validate') is True)
@@ -181,10 +197,8 @@ class WebApp:
             limit=data.get('limit',20)
             if not isinstance(limit,int) or isinstance(limit,bool):raise ValueError('Historical search limit must be an integer.')
             return navcom_historical_landing.landing(data['cursor'],data['within'],result_key=data['result_key'],
-                group_id=data.get('group'),query=data.get('q',''),limit=limit,seconds=15,
-                cache_path=Path(os.environ.get('NAVCOM_HISTORY_CACHE',str(self.index_path.parent/'navcom-history'))))
+                group_id=data.get('group'),query=data.get('q',''),limit=limit,seconds=15,cache_path=history_cache)
         if route == '/api/history/system':
-            import navcom_navigation as navigation
             import navcom_system_history
             for field in ('within','at','q'):
                 if not isinstance(data.get(field,''),str):raise ValueError('Historical place, date and query must be text.')
@@ -193,19 +207,17 @@ class WebApp:
             retry_larger=data.get('retry_larger',False)
             if not isinstance(retry_larger,bool):raise ValueError('Historical retry_larger must be a boolean.')
             if retry_larger and not cursor:raise ValueError('A larger historical retry requires an existing pinned cursor.')
-            space_cache,source_cache=navigation.paths(self.index_path)
             return navcom_system_history.view(data.get('within',''),data.get('at',''),space_cache=space_cache,
-                source_cache=source_cache,cache_path=Path(os.environ.get('NAVCOM_HISTORY_CACHE',str(self.index_path.parent/'navcom-history'))),
+                source_cache=source_cache,cache_path=history_cache,
                 query=data.get('q',''),cursor=cursor,limit=int(data.get('limit',4)),seconds=30,retry_larger=retry_larger)
         if route == '/api/history/explore':
-            import navcom_navigation as navigation
             import navcom_history
             if not isinstance(data.get('within'),str) or not data['within']:raise ValueError('Select a repository-backed destination for its history.')
             if not isinstance(data.get('revision'),str) or not data['revision']:raise ValueError('Select an exact Git revision.')
             if not isinstance(data.get('q',''),str):raise ValueError('Historical query must be text.')
-            space_cache,source_cache=navigation.paths(self.index_path)
-            return navcom_history.view(data['within'],data['revision'],action='explore',space_cache=space_cache,
-                source_cache=source_cache,cache_path=Path(os.environ.get('NAVCOM_HISTORY_CACHE',str(self.index_path.parent/'navcom-history'))),query=data.get('q',''),limit=int(data.get('limit',50)))
+            if data.get('repo') is not None and not isinstance(data['repo'],str):raise ValueError('Git copy must be text.')
+            return navcom_history.view(data['within'],data['revision'],action='explore',repo=Path(data['repo']) if data.get('repo') else None,space_cache=space_cache,
+                source_cache=source_cache,cache_path=history_cache,query=data.get('q',''),limit=int(data.get('limit',50)))
         if route == '/api/space/refresh':
             if self.task.get('running') and self.task.get('kind')=='chart':
                 return dict(self.task)
@@ -220,11 +232,7 @@ class WebApp:
             return dict(self.task, message='Pausing chart intake; published evidence stays available')
         if route == '/api/suggest':
             import navcom_intelligence
-            key = self.key(conn, data.get('key'))
-            last = api.max_msg_index(conn, key)
-            turns = api.fetch_window_rows(conn, key, [(1, 3), (max(4, last - 10), last)])
-            text = '\n'.join(f'{role}: {text[:1200]}' for _, role, text in turns if role in ('user', 'assistant'))
-            return navcom_intelligence.suggest(text)
+            return navcom_intelligence.suggest_for(api, conn, self.key(conn, data.get('key')))
         if route == '/api/upkeep':
             if not self.mutation.acquire(blocking=False):
                 raise sqlite3.OperationalError('database is busy: upkeep is already running')
@@ -241,28 +249,14 @@ class WebApp:
                 return {'saved': True}
             key = self.key(conn, data.get('key'))
             if route == '/api/annotation':
-                annotations = api._ui_read(conn, 'annotations')
-                entry = dict(annotations.get(key, {}))
-                for field in ('name', 'note'):
-                    if field in data:
-                        if not isinstance(data[field], str): raise ValueError('Name and note must be text')
-                        entry[field] = api._one_line(data[field], 240)
-                if 'favorite' in data: entry['favorite'] = bool(data['favorite'])
-                annotations[key] = entry
-                if not api._ui_write(conn, 'annotations', annotations):
-                    raise sqlite3.OperationalError('database is locked; changes were not saved')
+                entry = api.annotate(conn, key, name=data.get('name'), note=data.get('note'), favorite=data.get('favorite'))
                 self.catalog_at = 0
                 return entry
             if route == '/api/launch':
-                harness = data.get('harness')
-                if harness and harness not in api.REVIVE_AGENTS: raise ValueError('Unknown harness')
-                plan = api.revive_plan(conn, key, harness) if harness else api.resume_plan(conn, key)
+                plan = self.plan(conn, key, data.get('harness'), data.get('turn'))
                 if not plan: raise ValueError('Original unavailable. Choose a fresh harness.')
-                ok, message = api.ensure_resumable(conn, plan)
+                ok, message, plan = api.prepare_launch(conn, plan)
                 if not ok: raise ValueError(message)
-                if plan['cwd'] and not os.path.isdir(plan['cwd']): raise ValueError('The working folder no longer exists.')
-                if not (api.shutil.which(plan['argv'][0]) or os.path.isfile(plan['argv'][0])):
-                    raise ValueError('That harness is not installed. Copy the command to use it elsewhere.')
                 ok, message = api.resume_in_new_tab(plan)
                 return dict(ok=ok, message=message, command=plan['line'])
             raise ValueError('Unknown request')
@@ -272,25 +266,11 @@ class WebApp:
     def upkeep(self):
         conn = self.connect()
         try:
-            conn.execute('BEGIN IMMEDIATE')
-            conn.execute('UPDATE file_state SET size=size WHERE 0')
-            conn.commit()
-            api = self.api
-            api.INDEX_READ_ONLY = False
-            self.task = dict(running=True, message='Discovering conversations', error=False)
-            logs = api.list_logs(api.ALL_PROVIDERS)
-            self.task['message'] = 'Indexing new and changed conversations'
-            changed = api._index_logs(conn, logs, progress=False, upgrade=False)
-            self.task['message'] = 'Updating older transcript parsers'
-            upgraded = api.upgrade_stale_parses(conn, logs, budget=None)
-            self.task['message'] = 'Preserving raw transcript archives'
-            files, raw = api.archive_logs(conn, logs, budget=None)
-            conn.commit()
-            self.task['message'] = 'Refreshing discovery evidence'
-            refresh_discovery(conn)
+            self.api.claim_index_writer(conn)
+            done = self.api.maintain(conn, progress=lambda message: self.task.update(message=message))
             self.catalog_at = 0
             self.task = dict(running=False, error=False,
-                             message=f'Complete: {changed} indexed, {upgraded} updated, {files} archived ({raw / 1e6:.1f} MB).')
+                             message=f"Complete: {done['changed']} indexed, {done['upgraded']} updated, {done['files']} archived ({done['raw'] / 1e6:.1f} MB).")
         except Exception as exc:
             conn.rollback()
             message = str(exc)
@@ -301,23 +281,13 @@ class WebApp:
             conn.close()
             self.mutation.release()
 
-
     def refresh_space(self, automatic=False):
-        import navcom_navigation as navigation
         import navcom_chart_refresh
-        space_cache,source_cache=navigation.paths(self.index_path)
-        deadline=time.monotonic()+120
+        space_cache, source_cache, _ = self.caches()
         try:
-            while True:
-                result=navcom_chart_refresh.refresh(self.index_path,space_cache,source_cache,
-                    automatic=automatic,sync_index=True,seconds=max(1,min(60,deadline-time.monotonic())),
-                    cancel=self.refresh_cancel,progress=lambda message:self.task.update(message=message))
-                self.task.update(coverage=result)
-                if result['complete'] or result['paused'] or result.get('runtime_error') or result.get('index_error'):
-                    break
-                if time.monotonic()>=deadline-2:
-                    result = dict(result, stop_reason='time_budget')
-                    break
+            result=navcom_chart_refresh.drive(self.index_path,space_cache,source_cache,automatic=automatic,sync_index=True,
+                cancel=self.refresh_cancel,progress=lambda message:self.task.update(message=message),
+                on_pass=lambda result:self.task.update(coverage=result))
             suffix=(' · paused; Continue chart resumes' if result['paused'] else
                     ' · two-minute work limit reached; progress saved, Continue chart resumes' if result.get('stop_reason')=='time_budget' else
                     ' · more remain; progress saved' if result['more'] else
@@ -350,30 +320,29 @@ def make_server(api, index_path, port=0):
                 self.end_headers()
                 self.wfile.write(raw)
             except (BrokenPipeError, ConnectionResetError): pass  # visitor left mid-response
+        def local(self):
+            """Only this loopback address may load the page or call the API (no DNS rebinding)."""
+            return self.headers.get('Host') == f'127.0.0.1:{self.server.server_port}'
         def authorized(self):
-            expected = f'127.0.0.1:{self.server.server_port}'
-            if self.headers.get('Host') != expected: return False
+            if not self.local(): return False
             origin = self.headers.get('Origin')
-            if origin and origin != 'http://' + expected: return False
+            if origin and origin != f'http://127.0.0.1:{self.server.server_port}': return False
             return secrets.compare_digest(self.headers.get('X-Navcom-Token', ''), app.token)
         def do_GET(self):
             route = urlparse(self.path)
-            if route.path in ('/navcom_atlas.js', '/navcom_atlas.css', '/navcom_space.js', '/navcom_space.css', '/navcom_voice.js', '/navcom_voice_worklet.js'):
-                if self.headers.get('Host') != f'127.0.0.1:{self.server.server_port}':
-                    self.send(403, {'error': 'Local access only'}); return
+            view = route.path in ('/navcom_atlas.js', '/navcom_atlas.css', '/navcom_space.js', '/navcom_space.css', '/navcom_voice.js', '/navcom_voice_worklet.js')
+            if (view or route.path == '/' or route.path.startswith('/assets/starship/')) and not self.local():
+                self.send(403, {'error': 'Local access only'}); return
+            if view:
                 path = Path(__file__).with_name(route.path[1:])
                 self.send(200, path.read_text(), 'text/javascript' if path.suffix == '.js' else 'text/css'); return
             if route.path.startswith('/assets/starship/'):
-                if self.headers.get('Host') != f'127.0.0.1:{self.server.server_port}':
-                    self.send(403, {'error': 'Local access only'}); return
                 name=route.path.removeprefix('/assets/starship/')
                 if name not in {'starbase.png','dock.png','archive.png','lab.png','navcom.png','observatory.png','city.png','ship.png'}:
                     self.send(404,{'error':'Unknown asset'});return
                 path=Path(__file__).parent/'assets'/'starship'/name
                 self.send(200,path.read_bytes(),'image/png');return
             if route.path == '/':
-                if self.headers.get('Host') != f'127.0.0.1:{self.server.server_port}':
-                    self.send(403, {'error': 'Local access only'}); return
                 template = Path(__file__).with_name('navcom_web.html').read_text()
                 self.send(200, template.replace('__NAVCOM_TOKEN__', json.dumps(app.token)), 'text/html'); return
             if not self.authorized():
