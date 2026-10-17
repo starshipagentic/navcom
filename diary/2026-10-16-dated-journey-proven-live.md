@@ -36,8 +36,8 @@ acceptance never finished. The Chrome extension also cannot reach this Mac's
 - **The reader is honest about dates.** It shows "committed …" only when the
   response carries a commit date, and "captured …" otherwise.
 - **Result:** 7/7 against private checkout bridges, then **7/7 against the
-  installed 0.11.0 bridge** (`http://127.0.0.1:57981/`), with the history cache
-  unchanged.
+  installed 0.11.0 bridge** (`http://127.0.0.1:57981/`), and 7/7 again after the PyPI
+  reinstall (`http://127.0.0.1:60126/`), with the history cache unchanged.
 
 ## Decisions
 

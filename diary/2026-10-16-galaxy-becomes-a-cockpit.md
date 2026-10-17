@@ -92,7 +92,7 @@ TMPDIR=$SCRATCH .venv/bin/python navcom.py --menu --no-browser         # a priva
 
 ## Appendix
 
-- Live checks used private checkout bridges started by agents (each killed afterwards) and, after install, the owner's default bridge, restarted at `http://127.0.0.1:57981/` (pid 38243).
+- Live checks used private checkout bridges started by agents (each killed afterwards) and, after install, the owner's default bridge, restarted at `http://127.0.0.1:57981/` (pid 38243), then again on the PyPI build at `http://127.0.0.1:60126/` (pid 58863), where the live suite passed 7/7 once more.
 - An earlier bridge the owner started (pid 33920, Oct 14, `navcom --menu`) was never touched. It still runs pre-0.11.0 code until they restart it.
 - One proof wrote to the history cache: opening commit `5f8d12703cd5` of the awaliv2 copy (`/Users/t/clients/awali/awaliv2`) created a pinned snapshot under `~/.codex/navcom-history`. Nothing else was written.
 - Mutation checks: 12/12 for the first rail build and 10/10 for the polish fixes. Each mutant was caught by `tests/test_space_action_rail.py` or the camera and relationship tests.
