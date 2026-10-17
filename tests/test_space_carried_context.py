@@ -1,22 +1,14 @@
 """Execute the actual carried-context controller with a small DOM fixture."""
 from pathlib import Path
-import shutil
-import subprocess
 
 import pytest
+from test_space_camera import js_between as section, run_js
 
 
 JS = (Path(__file__).resolve().parents[1] / 'navcom_space.js').read_text()
 
 
-def section(start, end):
-    position = JS.index(start)
-    return JS[position:JS.index(end, position)]
-
-
 def run_controller(body, extra=''):
-    if not shutil.which('node'):
-        pytest.skip('Node is required for bridge controller proof')
     functions = section('const fresh=', '\nlet route=')
     functions += section('function carriedState(', 'function openFiles(')
     functions += section('function url(){', 'function remember(')
@@ -24,6 +16,7 @@ def run_controller(body, extra=''):
     functions += section('function restore(', 'function setActive(')
     functions += section('function selectedNode(', 'function setSelection(')
     functions += section('function pageOffset(', 'function renderDestinationPager(')
+    functions += section('const reads=new Map();', 'function historyPanel(')
     script = "const assert=require('node:assert/strict');\n" + functions + """
 class Element {
  constructor(tag, attrs={}, children=[]) {
@@ -60,8 +53,7 @@ function begin(state={}){route.carriedRead=carriedState({...baseState(),...state
 const panel=el('section');
 const document={body:el('body'),activeElement:null};document.activeElement=document.body;
 """ + extra + "\n" + body
-    result = subprocess.run(['node', '-e', script], capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr
+    run_js(script)
 
 
 def test_open_and_close_keep_chart_camera_search_and_scope():

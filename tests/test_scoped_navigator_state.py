@@ -1,21 +1,8 @@
 """The browser retains one search boundary and ignores cancelled responses."""
-from pathlib import Path
-import shutil
-import subprocess
-
-import pytest
-
-
-JS = (Path(__file__).resolve().parents[1] / 'navcom_space.js').read_text()
-
-
-def section(start, end):
-    return JS[JS.index(start):JS.index(end, JS.index(start))]
+from test_space_camera import js_between as section, run_js
 
 
 def run_controller(body, helpers=''):
-    if not shutil.which('node'):
-        pytest.skip('Node required for bridge controller proof')
     script = "const assert=require('node:assert/strict');\n" + section('function pageOffset(', 'function renderDestinationPager(')
     script += section('async function changeSearchPage(', 'form.addEventListener(')
     script += helpers
@@ -36,8 +23,7 @@ const response=()=>({published:123,center:{id:'system:fixture',label:'Fixture'},
  intent:{action:'search',query:'matrix',within:'system:fixture'},nodes:[],total:90,offset:0,limit:40,more:true,
  evidence:{sources:[{source_id:'original-local-source'}]}});
 """ + body
-    result = subprocess.run(['node', '-e', script], capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr
+    run_js(script)
 
 
 def test_search_page_keeps_original_local_boundary_after_checkbox_changes():

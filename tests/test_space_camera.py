@@ -9,17 +9,20 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+# Shared by every space-view test that runs the shipped controller under Node.
 def js_between(start, end):
+    """The shipped navcom_space.js text from `start` up to (not including) `end`."""
     source = (ROOT / "navcom_space.js").read_text()
     begin = source.index(start)
     return source[begin:source.index(end, begin)]
 
 
 def run_js(script):
+    """Run a Node script that asserts on the shipped controller; skip without Node."""
     if not shutil.which("node"):
-        pytest.skip("Node required for bridge camera proof")
+        pytest.skip("Node required for bridge controller proof")
     result = subprocess.run(
-        ["node", "-e", script], capture_output=True, text=True, timeout=20
+        ["node", "-e", script], capture_output=True, text=True, timeout=30
     )
     assert result.returncode == 0, result.stderr
 
@@ -241,4 +244,24 @@ const saved=JSON.parse(JSON.stringify(route));
 restore(saved);const returned=retainMapLayout(projectedNodes(view.nodes));initializeCamera(returned);transform();
 assert.deepEqual(returned.map(p=>({id:p.n.id,x:p.x,y:p.y})),updated.map(p=>({id:p.n.id,x:p.x,y:p.y})));
 assert.deepEqual(route.pan,saved.pan,'Back restores the expanded chart camera');
+"""))
+
+
+def test_a_copied_link_carries_the_camera_rounded_and_restores_it_in_a_new_tab():
+    link = js_between("function url(){", "// A tab owns") + js_between("function linkCamera(", "function timeKey(")
+    run_js(camera_program(link + r"""
+const location={href:'http://127.0.0.1:9/?view=space'};
+const points=fixture(80);
+route=fresh();assert.equal(url().searchParams.has('camera'),false,'no camera before the chart is framed');
+initializeCamera(points);transform();scale(.8);scale(.8);route.pan.x-=45.3;route.pan.y+=44.6;transform();
+const moved={scale:cameraFrame().scale,pan:{...route.pan}},camera=url().searchParams.get('camera');
+assert.equal(camera,[+moved.scale.toPrecision(4),Math.round(moved.pan.x),Math.round(moved.pan.y)].join('_'),'absolute scale (4 digits) and whole-pixel pan');
+// A new tab or profile has no history.state: the link alone restores the same camera.
+route=fresh();restore({place:'',...linkCamera(new URL(location.href+'&camera='+camera).searchParams)});
+assert.equal(route.cameraReady,true);initializeCamera(points);transform();
+assert.ok(Math.abs(cameraFrame().scale/moved.scale-1)<1e-4,'same scale');
+assert.ok(Math.abs(route.pan.x-moved.pan.x)<=.5&&Math.abs(route.pan.y-moved.pan.y)<=.5,'same pan');
+assert.equal(url().searchParams.get('camera'),camera,'the restored view writes the same link');
+for(const bad of ['','x_1_2','0_1_2','3_1_2','1_2','1_2_3_4','.5_1e9_0','.5__0'])
+ assert.deepEqual(linkCamera(new URLSearchParams({camera:bad})),{},bad);
 """))

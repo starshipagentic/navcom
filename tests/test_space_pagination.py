@@ -1,28 +1,16 @@
 """Large destination sets remain reachable without changing search or camera state."""
 import json
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 
-import pytest
 
 import navcom_space
 from navcom_web import WebApp
+from test_space_camera import js_between, run_js
 
 ROOT=Path(__file__).resolve().parents[1]
 JS=(ROOT/'navcom_space.js').read_text()
-
-
-def js_between(start,end):
-    return JS[JS.index(start):JS.index(end,JS.index(start))]
-
-
-def run_js(script):
-    if not shutil.which('node'):
-        pytest.skip('Node required for bridge controller proof')
-    result=subprocess.run(['node','-e',script],capture_output=True,text=True)
-    assert result.returncode==0,result.stderr
 
 
 def large_catalog(tmp_path):
@@ -42,10 +30,13 @@ def test_all_large_place_destinations_are_reachable_in_identical_cli_api_pages(t
     sources=tmp_path/'sources';index=tmp_path/'absent.sqlite'
     monkeypatch.setenv('NAVCOM_SPACE_CACHE',str(cache));monkeypatch.setenv('NAVCOM_SOURCES_CACHE',str(sources))
     app=WebApp(None,index);seen=[]
+    # Places carry their CLI commands; adapters only pin them to the caches in use.
+    bare=lambda nodes:[{k:v for k,v in n.items() if k!='commands'} for n in nodes]
     for offset,count in ((0,80),(80,80),(160,45)):
         page=app.get(None,'/api/space',dict(action=['explore'],within=['system:fixture'],offset=[str(offset)],limit=['80']))
         direct=navcom_space.view(cache,action='explore',within='system:fixture',offset=offset,limit=80)
-        assert page['nodes']==direct['nodes']==expected[offset:offset+count]
+        assert bare(page['nodes'])==bare(direct['nodes'])==expected[offset:offset+count]
+        assert [n['commands'] for n in direct['nodes']]==[navcom_space.commands(n) for n in expected[offset:offset+count]]
         assert page['more']==(offset+count<205)
         assert page['total']==205 and len(page['nodes'])==count
         seen.extend(n['id'] for n in page['nodes'])
@@ -54,7 +45,8 @@ def test_all_large_place_destinations_are_reachable_in_identical_cli_api_pages(t
                         '--offset','160','--limit','80','--space-cache',str(cache),'--source-cache',str(sources),
                         '--index',str(index),'--json'],capture_output=True,text=True)
     assert cli.returncode==0,cli.stderr
-    assert json.loads(cli.stdout)['nodes']==expected[160:]
+    assert bare(json.loads(cli.stdout)['nodes'])==expected[160:]
+    assert [n['commands'] for n in json.loads(cli.stdout)['nodes']]==[n['commands'] for n in page['nodes']]
     assert not index.exists()
 
 

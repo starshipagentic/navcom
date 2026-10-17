@@ -1,24 +1,15 @@
 """Keyboard flight controls and editable voice review preserve the user's context."""
 from pathlib import Path
-import shutil
-import subprocess
+from test_space_camera import run_js
 
-import pytest
 
 ROOT=Path(__file__).resolve().parents[1]
-
-
-def node(script):
-    if not shutil.which('node'):
-        pytest.skip('Node required for bridge controller proof')
-    result=subprocess.run(['node','-e',script],capture_output=True,text=True,timeout=15)
-    assert result.returncode==0,result.stderr
 
 
 def test_keyboard_select_reaches_fly_without_changing_desktop_pointer_selection():
     source=(ROOT/'navcom_space.js').read_text()
     select=source[source.index('function setSelection('):source.index('function shellQuote(')]
-    node("const assert=require('node:assert/strict');\n"+select+"""
+    run_js("const assert=require('node:assert/strict');\n"+select+"""
 let route={place:'system:fixture',q:'matrix',zoom:2,pan:{x:12,y:9}},innerWidth=1440;
 const reducedMotion={matches:false},scrolls=[],focus=[],places={querySelectorAll:()=>[]};
 const fly={focus:options=>focus.push(options)},inspector={querySelector:()=>fly,scrollIntoView:options=>scrolls.push(options)};
@@ -42,7 +33,7 @@ def test_overlength_navigator_text_is_kept_without_any_request_or_route_change()
     source=(ROOT/'navcom_space.js').read_text()
     start=source.index('async function search(push=')
     search=source[start:source.index("form.addEventListener('submit'",start)]
-    node("const assert=require('node:assert/strict');\n"+search+"""
+    run_js("const assert=require('node:assert/strict');\n"+search+"""
 const original='x'.repeat(650);let focused=false;
 const input={value:original,maxLength:500,focus:()=>focused=true},navigatorStatus={};
 const route={place:'system:fixture',q:'older query',local:false,offset:80,zoom:2,pan:{x:7,y:9}};
@@ -96,4 +87,4 @@ async function record(){await voice.start();worklet.port.onmessage({data:new Flo
  assert.ok(requests.every(r=>r.path==='/api/voice'),'Voice review never submits navigation');assert.ok(stopped>=2);
 })().catch(e=>{voice.cancel();console.error(e);process.exitCode=1});
 """
-    node(harness+source+checks)
+    run_js(harness+source+checks)

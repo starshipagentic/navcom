@@ -1,24 +1,7 @@
 """Shipped flight/history controllers preserve keyboard and in-flight searches."""
-from pathlib import Path
-import shutil
-import subprocess
-
 import pytest
 
-
-JS = (Path(__file__).resolve().parents[1] / 'navcom_space.js').read_text()
-
-
-def section(start, end):
-    begin = JS.index(start)
-    return JS[begin:JS.index(end, begin)]
-
-
-def run_js(script):
-    if not shutil.which('node'):
-        pytest.skip('Node required for journey controller proof')
-    result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=15)
-    assert result.returncode == 0, result.stderr
+from test_space_camera import js_between as section, run_js
 
 
 def test_forward_survives_back_reload_and_new_branch_discards_old_tail():

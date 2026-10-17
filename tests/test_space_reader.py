@@ -1,14 +1,9 @@
 """Shared transcript rerenders must not strand the bridge reader on mobile."""
 from pathlib import Path
-import shutil
-import subprocess
-
-import pytest
+from test_space_camera import run_js
 
 
 def test_reader_close_survives_paging_failure_and_rerender_without_focus_churn():
-    if not shutil.which('node'):
-        pytest.skip('Node required for reader controller proof')
     source=(Path(__file__).resolve().parents[1]/'navcom_space.js').read_text()
     reader=source[source.index('let readerOrigin='):source.index('const voiceInput=',source.index('let readerOrigin='))]
     script=r"""
@@ -54,6 +49,5 @@ function tick(){if(observing)observerCallback()}
  const before=disconnects;listeners.pagehide();assert.equal(disconnects,before+1);
 })().catch(e=>{console.error(e);process.exitCode=1});
 """
-    result=subprocess.run(['node','-e',script],capture_output=True,text=True)
-    assert result.returncode==0,result.stderr
+    run_js(script)
     assert 'closeReader(false);datedTicket++' in source, 'Leaving the bridge must disconnect its reader observer without stealing nav focus'

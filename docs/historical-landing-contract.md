@@ -46,6 +46,16 @@ result key and pin. Back returns to the earlier viewpoint; reload and links must
 reopen that same saved state. Search changes the query, never the date or pins.
 Explicit Return to present remains the route to current geography.
 
-Implementation and native CLI/browser evidence are tracked in the active
-[galactic plan](galactic-implementation-plan.md). This contract by itself does
+Journey links carry the camera. The URL holds `camera=SCALE_X_Y`: the absolute
+scale to four significant digits and the pan in whole pixels, updated with
+`replaceState` whenever the camera moves (a camera move never adds a history
+entry). A copied link opened in a new tab or profile therefore lands on the same
+date, pin, district, query and view; Back and reload keep using the exact camera
+saved in history state. A link carries the current camera only: after *Back to
+dated system* from a freshly opened link, the system opens at its default framing.
+The camera is view state; no service or CLI result names it.
+
+Implementation and native CLI/browser evidence are recorded in the
+[land in the past](../diary/2026-10-16-land-in-the-past.md) and
+[handoff](../diary/2026-10-16-galactic-navigation-handoff.md) diaries. This contract by itself does
 not establish that the journey has passed.

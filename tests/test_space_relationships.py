@@ -1,25 +1,9 @@
 """Connections preserve pinned source identities and ignore stale navigation replies."""
 from pathlib import Path
-import shutil
-import subprocess
-
-import pytest
+from test_space_camera import js_between, run_js
 
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def js_between(start, end):
-    source = (ROOT / "navcom_space.js").read_text()
-    begin = source.index(start)
-    return source[begin:source.index(end, begin)]
-
-
-def run_js(script):
-    if not shutil.which("node"):
-        pytest.skip("Node required for bridge relationship proof")
-    result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=15)
-    assert result.returncode == 0, result.stderr
 
 
 def test_related_source_refs_preserve_snapshot_and_publication_for_exact_reads():
@@ -58,10 +42,11 @@ restore(saved);assert.equal(route.relatedQuery,'engine versions');assert.equal(r
 
 def test_connections_ignore_out_of_order_or_departed_place_responses_and_errors():
     load = js_between("async function loadRelated(", "function renderRelated(")
-    run_js("const assert=require('node:assert/strict');\n" + load + r"""
+    reads = js_between("const reads=new Map();", "function historyPanel(")
+    run_js("const assert=require('node:assert/strict');\n" + reads + load + r"""
 let active=true,relatedTicket=0,route={relatedPlace:'planet:orchard',relatedQuery:'old',relatedOffset:0};
 let selected={id:'planet:orchard'},view={published:123};
-const relatedViews=new Map(),requests=[],renders=[];
+const requests=[],renders=[];
 const panel={writes:0,replaceChildren(){this.writes++}},inspector={querySelector:()=>panel};
 const el=(...args)=>args,button=(...args)=>args,closeRelated=()=>{},selectedNode=()=>selected;
 const renderRelated=(...args)=>renders.push(args);
@@ -70,8 +55,7 @@ const api=url=>new Promise((resolve,reject)=>requests.push({url,resolve,reject})
  const old=loadRelated(selected);route.relatedQuery='new';const current=loadRelated(selected);
  requests[1].resolve({id:'new'});await current;
  requests[0].resolve({id:'old'});await old;
- assert.equal(renders.length,1);assert.equal(renders[0][1].id,'new');
- assert.equal(relatedViews.size,1,'Stale results must not enter the panel cache');
+ assert.equal(renders.length,1);assert.equal(renders[0][1].id,'new','a late reply to an older query is not shown');
  assert.equal(new URL(requests[1].url,'http://localhost').searchParams.get('q'),'new');
  // A successful response cannot paint into a different selected destination.
  route.relatedQuery='departed';const departing=loadRelated(selected);selected={id:'planet:other'};
@@ -84,5 +68,7 @@ const api=url=>new Promise((resolve,reject)=>requests.push({url,resolve,reject})
  active=true;route.relatedQuery='back';const back=loadRelated(selected);
  requests[4].resolve({id:'back'});await back;assert.equal(renders.length,2);
  assert.equal(renders[1][1].id,'back');
+ // Any other rail click re-renders the panel: the unchanged request is answered from memory.
+ await loadRelated(selected);assert.equal(requests.length,5);assert.equal(renders.at(-1)[1].id,'back');
 })().catch(error=>{console.error(error);process.exitCode=1});
 """)

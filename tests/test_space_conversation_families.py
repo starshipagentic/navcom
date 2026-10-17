@@ -1,16 +1,12 @@
 """The real card controller preserves parent identity and exact child passage targets."""
 from pathlib import Path
-import shutil
-import subprocess
+from test_space_camera import run_js
 
-import pytest
 
 ROOT=Path(__file__).resolve().parents[1]
 
 
 def test_parent_child_actions_use_recorded_keys_and_matching_turns():
-    if not shutil.which('node'):
-        pytest.skip('Node is required for bridge controller proof')
     source=(ROOT/'navcom_space.js').read_text()
     controller=source[source.index('function conversationCard('):source.index('function renderSearch(')]
     script=r'''
@@ -43,5 +39,4 @@ click(plain,'Read conversation →');assert.deepEqual(opened.pop(),{key:'/ordina
 const expanded=conversationCard({key:'/child',label:'Expanded child',child:true,parent_key:'/parent',start:4});
 click(expanded,'Read parent conversation →');assert.deepEqual(opened.pop(),{key:'/parent',start:1});
 '''
-    result=subprocess.run(['node','-e',script],capture_output=True,text=True,timeout=15)
-    assert result.returncode==0,result.stderr
+    run_js(script)
