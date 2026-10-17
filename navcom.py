@@ -51,7 +51,7 @@ def load_module(code, name):
 clean_mod = load_module(LOG_CLEAN_QUICK_CODE, "log_clean_quick")
 fts_mod = load_module(LOG_SEARCH_FTS5_CODE, "log_search_fts5")
 
-NAVCOM_VERSION = "0.10.0"
+NAVCOM_VERSION = "0.11.0"
 DEFAULT_LIMIT = 20  # hits per harness
 
 # Every harness navcom knows how to read. Order = display order in help/listings.
