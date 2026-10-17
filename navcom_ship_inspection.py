@@ -71,6 +71,12 @@ def _safe_path(path):
     return not any(p.is_symlink() for p in (*reversed(path.parents), path))
 
 
+def commission_tools(borrowed=False):
+    """Independently installed ship-commission scripts (resolved per call, never cached)."""
+    tools = Path.home() / ".codex" / "skills" / "ship-commission" / "scripts"
+    return tools / "borrowed" if borrowed else tools
+
+
 def _tool_identity(tool_root):
     root = Path(tool_root).expanduser()
     if not root.is_absolute() or ".starship" in root.parts or not _safe_path(root):
@@ -271,7 +277,7 @@ def inspect_ship(entity, cache_path, *, refresh=False, tool_root=None, receipt_p
     root = _absolute(physical.get("path"))
     local = host.casefold().rstrip(".") in {"localhost", "127.0.0.1", "::1", socket.gethostname().casefold().rstrip(".")}
     gaps = []
-    selected_tool = Path(tool_root or Path.home() / ".codex" / "skills" / "ship-commission" / "scripts").expanduser()
+    selected_tool = Path(tool_root or commission_tools()).expanduser()
     tool = None
     # Do not load or execute an observer for a remote or unlocated ship.
     if local and root:

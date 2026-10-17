@@ -35,7 +35,6 @@ EXPANSIONS = [
  {'deploy','deployment','hosting','server'}, {'tax','taxes','cpa'},
  {'search','searching','find','retrieval'}, {'conversation','conversations','session','sessions','history'},
 ]
-COLORS = ['#b2d9ac','#eabf83','#94c9db','#d2b4df','#e89f88','#9ccabf','#c6c68c','#a9b6de']
 
 
 def tokens(text):
@@ -248,7 +247,6 @@ class Atlas:
                     self.enrich(conn,node,records[key],hits[key] or None,label)
                     node['label']=label+' · '+('Child task' if records[key]['parent_id'] else 'Main conversation')
                     node['original_title']=records[key]['title'];nodes.append(node)
-        for n in nodes:n['color']=COLORS[int(identity(n['label'])[:6],16)%len(COLORS)]
         relations={'exp29':[('exp30','Separate listener / chat experiment'),('exp32','Reuses EXP29 engine for JEV investigation')],
                    'exp30':[('exp29','Comparison baseline, not the same version lineage')],
                    'exp32':[('exp29','Original engine lineage'),('observatory','Benchmark project split out from EXP32')],
@@ -354,8 +352,7 @@ class Atlas:
                                   project_names=[name for name,_ in collections.Counter(r['project'] for r in members).most_common(3)],
                                   examples=[r['title'] for r in sorted(members,key=lambda r:(bool(r['parent_id']),-r['mtime']))[:3]]))
             center=dict(id='center',label=group or (query if query else 'Your conversation universe'),kind='group')
-        for i,n in enumerate(nodes):
-            n['color']=COLORS[int(identity(n['label'])[:6],16)%len(COLORS)]
+        for n in nodes:
             edges.append(dict(source=center['id'],target=n['id'],kind=n.get('reason','')))
         return dict(center=center,nodes=nodes,edges=edges,total=total,offset=offset,more=offset+limit<total,
                     indexed=len(records),matches=total_matches,scope=len(chosen),query=query,terms=terms,lens=lens,

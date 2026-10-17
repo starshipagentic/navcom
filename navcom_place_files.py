@@ -69,7 +69,7 @@ def files(space_cache, source_cache, within, *, query='', limit=40, offset=0, ge
         raise ValueError('File limit must be 1–200 and offset must be nonnegative.')
     if not isinstance(query, str) or len(query) > 500:
         raise ValueError('File filter must be at most 500 characters.')
-    catalog = navcom_space._read(Path(space_cache).expanduser()) or {}
+    catalog = navcom_space.load_catalog(space_cache) or {}
     center = navcom_space.view(space_cache, action='show', within=within, catalog=catalog)['center']
     if center['kind'] not in ('planet', 'moon', 'district'):
         raise ValueError('Choose a product, experiment or district to browse its retained files.')
@@ -148,14 +148,3 @@ def files(space_cache, source_cache, within, *, query='', limit=40, offset=0, ge
     result['cli_command'] = shlex.join(command+['--offset',str(offset),'--generation',current])
     result['next_command'] = shlex.join(command+['--offset',str(offset+limit),'--generation',current]) if result['more'] else None
     return result
-
-
-def render(data):
-    print(data['center']['label']+' · retained files')
-    for file in data['files']:
-        print(file['relative_path']+' · '+str(file['bytes'])+' bytes\n  '+file['read_command'])
-    print(str(data['offset']+1 if data['files'] else 0)+'–'+str(data['offset']+len(data['files']))+' of '+str(data['total'])+' matching retained files.')
-    print('Published harvest only; current source files were not read. Coverage is bounded, not a full-repository inventory.')
-    for error in data['errors']: print(error['source_id']+': '+error['message'])
-    if not data['coverage']['complete']: print('Inventory coverage is incomplete: '+json.dumps(data['coverage']))
-    if data['next_command']: print('More: '+data['next_command'])

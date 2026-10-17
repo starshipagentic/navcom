@@ -11,9 +11,6 @@ import subprocess
 import threading
 import time
 
-KINDS = {'galaxies','systems','planets','moons','cities','stars','bases','starbases','ships'}
-PREFIXES = ('galaxy:','system:','planet:','moon:','district:','star:','star-candidate:','starbase:','ship:','fleet:')
-
 # Browser requests use separate SQLite connections, but can reuse Atlas's existing
 # short-lived metadata catalog. Keep only four indexes in memory, never on disk.
 _ATLAS_POOL = OrderedDict()
@@ -91,13 +88,14 @@ def _conversation_atlas(api, conn, deadline):
 
 
 def paths(index, space=None, sources=None):
+    """The chart and source caches beside an index; explicit paths, then env, win."""
     return (Path(space or os.environ.get('NAVCOM_SPACE_CACHE', str(index)+'.space.json')).expanduser(),
             Path(sources or os.environ.get('NAVCOM_SOURCES_CACHE',str(Path(index).parent/'navcom-sources'))).expanduser())
 
 
-def is_spatial(args):
-    return (getattr(args,'command','') in ('navigate','related','inspect','ask','board','files','context') or getattr(args,'space',False) or getattr(args,'grouping','') in KINDS or
-            any(str(getattr(args,k,'') or '').startswith(PREFIXES) for k in ('collection','within','ref')))
+def history_cache(index):
+    """The historical snapshot cache: NAVCOM_HISTORY_CACHE, else beside the index."""
+    return Path(os.environ.get('NAVCOM_HISTORY_CACHE', str(Path(index).parent/'navcom-history')))
 
 
 def context(space_cache, within, *, action='inspect', query='', ref='', turn=None, offset=0, limit=10, max_chars=2000, expected_catalog=''):
@@ -202,21 +200,14 @@ def _carried_candidates(entities, nodes, selected):
 
 def evidence(api, conn, space_cache, source_cache, within, query, limit=12, *, query_style='literal', catalog=None):
     """Fan out existing search engines within the saved place; never infer ownership from hits."""
-    import sqlite3
-    import time
     import navcom_space
     import navcom_sources
     from navcom_discovery import Discovery
-    catalog=catalog if catalog is not None else (navcom_space._read(Path(space_cache).expanduser()) or {})
+    catalog=catalog if catalog is not None else (navcom_space.load_catalog(space_cache) or {})
     selected=navcom_space.view(space_cache,action='show',within=within,catalog=catalog)['center']
     entities=catalog['entities']
     if isinstance(entities,dict):entities=list(entities.values())
-    root_id=selected['id'] if within else None
-    eligible={root_id} if root_id else {n['id'] for n in entities}
-    while root_id:
-        expanded=eligible|{n['id'] for n in entities if n.get('parent_id') in eligible}
-        if expanded==eligible:break
-        eligible=expanded
+    eligible=navcom_space.subtree(entities,selected['id']) if within else {n['id'] for n in entities}
     nodes=[n for n in entities if n['id'] in eligible]
     scopes={};collections=set();missing_scopes=[]
     for node in nodes:
@@ -240,14 +231,12 @@ def evidence(api, conn, space_cache, source_cache, within, query, limit=12, *, q
                             complete=True)
     if scopes:
         try:
-            interpreter=navcom_sources.runtime()
             request=dict(action='batch-search',cache=str(Path(source_cache).resolve()),query=query,
                 scopes=[dict(source_id=sid,paths=[] if '.' in relative else sorted(relative))
                         for sid,relative in sorted(scopes.items())],
                 mode='both',limit=min(limit,50),time_budget_seconds=20)
             if query_style=='question':request['text_mode']='question_terms'
-            p=subprocess.run([interpreter,str(Path(navcom_sources.__file__).with_name('navcom_sources_worker.py'))],
-                input=json.dumps(request),capture_output=True,text=True,timeout=30)
+            p=subprocess.run(navcom_sources.worker_argv(),input=json.dumps(request),capture_output=True,text=True,timeout=30)
             if p.returncode:
                 results['errors'].append(p.stderr.strip()[-400:] or 'Source search worker failed.')
             else:
@@ -329,7 +318,7 @@ def evidence(api, conn, space_cache, source_cache, within, query, limit=12, *, q
 def view(api, conn, *, space_cache, source_cache, action='list', kind='', within='', query='',limit=50,offset=0,include_evidence=False,catalog=None):
     import navcom_space
     from navcom_navigation_intent import retrieval_style
-    catalog=catalog if catalog is not None else (navcom_space._read(Path(space_cache).expanduser()) or {})
+    catalog=catalog if catalog is not None else (navcom_space.load_catalog(space_cache) or {})
     result=navcom_space.view(space_cache,action=action,kind=kind,within=within,query=query,limit=limit,offset=offset,catalog=catalog)
     if include_evidence and query:
         # History replay restores a query, not a new command. Classify only its
@@ -348,17 +337,36 @@ def view(api, conn, *, space_cache, source_cache, action='list', kind='', within
     db=conn.execute('PRAGMA database_list').fetchone()[2] if conn is not None else ''
     if db:command+=['--index',db]
     result['cli_command']=shlex.join(command)
-    for node in [result['center'], *result['nodes']]:
-        for name, value in node.get('commands',{}).items():
-            commands=value if value and isinstance(value[0],list) else [value]
-            for argv in commands:
-                if not argv or '--index' in argv or '--space-cache' in argv or '--cache' in argv:continue
-                if argv[1]=='sources':argv+=['--cache',str(source_cache)]
-                elif argv[1]=='atlas' and name!='conversation_search':
-                    argv+=['--space-cache',str(space_cache)]
-                    if argv[2]!='context':argv+=['--source-cache',str(source_cache)]
-                if db:argv+=['--index',db]
+    _place_commands([result['center'], *result['nodes']],space_cache,source_cache,db)
     return result
+
+
+def _place_commands(nodes, space_cache, source_cache, db):
+    """Every returned place offers the chart's current commands, pinned to these caches."""
+    import navcom_space
+    for node in {id(node):node for node in nodes}.values():
+        node['commands']=navcom_space.commands(node)
+        for name,value in node['commands'].items():
+            for argv in (value if value and isinstance(value[0],list) else [value]):
+                _pin_caches(argv,name,space_cache,source_cache,db)
+
+
+# The cache options each emitted command accepts (atlas, history and sources parsers);
+# everything else takes all three. Conversation collection searches take only --index.
+_CACHE_OPTIONS = {('sources','list'):('cache',),('sources','search'):('cache',),
+                  ('atlas','context'):('space','index'),('atlas','inspect'):('space','index'),
+                  ('atlas','ask'):('space','index'),('atlas','board'):('space','index'),
+                  ('history','conversations'):('space','index')}
+
+
+def _pin_caches(argv, name, space_cache, source_cache, db):
+    """Append this chart's caches so a copied command reads the same evidence."""
+    if not argv or '--index' in argv or '--space-cache' in argv or '--cache' in argv:return
+    accepted=('index',) if name=='conversation_search' else _CACHE_OPTIONS.get(tuple(argv[1:3]),('space','sources','index'))
+    if 'cache' in accepted:argv+=['--cache',str(source_cache)]
+    if 'space' in accepted:argv+=['--space-cache',str(space_cache)]
+    if 'sources' in accepted:argv+=['--source-cache',str(source_cache)]
+    if 'index' in accepted and db:argv+=['--index',db]
 
 
 def inspect(*, space_cache, within, refresh=False, observe=False):
@@ -413,55 +421,6 @@ def interact(api, *, space_cache, within, action, question='', launch=False, rev
     return dict(schema_version=1,center=center,interaction=result)
 
 
-def render_interaction(data):
-    result=data['interaction']; print(data['center']['label']+' · '+result['state'].replace('_',' '))
-    if result.get('reason'):print(result['reason'])
-    if result.get('question'):print('Question: '+result['question'])
-    spec=result.get('command') or result.get('handoff',{})
-    if spec.get('argv'):print('Command: '+shlex.join((['env']+[k+'='+v for k,v in sorted(spec.get('env',{}).items())] if spec.get('env') else [])+spec['argv']))
-    if spec.get('cwd'):print('Working directory: '+spec['cwd'])
-    for effect in result.get('effects',[]):print('• '+effect)
-    token=result.get('review_token') or result.get('fingerprint')
-    if token and result['state']!='dispatched' and result.get('handoff',{}).get('status')!='dispatched':print('Reviewed identity: '+token+'\nTo open this exact action in a terminal, repeat with --launch --review '+token)
-    if result.get('handoff',{}).get('status')=='dispatched':print('Terminal dispatched; visible captain takeover is not yet verified.')
-
-
-def render_inspection(data):
-    item=data['inspection']
-    if item.get('type')=='place':
-        from datetime import datetime, timezone
-        print(data['center']['label']+' · physical code locations')
-        observed=datetime.fromtimestamp(item['observed_at'],timezone.utc).isoformat(timespec='seconds')
-        print(('Cached observation' if item['cached'] else 'New observation')+' · '+observed)
-        for location in item['locations']:
-            print('\n'+location['path']+' · '+location['availability']+' · '+location.get('host','host unknown'))
-            git=location.get('git') or {}
-            for field in ('root','branch','commit','head_state','common_dir'):
-                if git.get(field):print('  '+field.replace('_',' ')+': '+git[field])
-        for relationship in item['relationships']:
-            print('\n'+relationship['kind'].replace('_',' ')+': '+relationship['left']+' ↔ '+relationship['right'])
-        for gap in item['gaps']:print('  Gap: '+gap)
-        print('\n'+item['policy']+'\n'+data['cli_command'])
-        return
-    if item.get('type')=='star':
-        print(data['center']['label']+' · living-expertise candidate')
-        print(item['qualification']+' · '+item['provider'])
-        print(item['description'])
-        for name in ('physical','observation','charter_refs','interfaces'):
-            print('\n'+name.replace('_',' ').capitalize()+': '+json.dumps(item[name],ensure_ascii=False))
-        for gap in item['gaps']:print('  Gap: '+str(gap))
-        print('\n'+item['capabilities_policy']+'\n'+data['cli_command'])
-        return
-    print(data['center']['label']+' · ship inspection')
-    print('Cached observation' if item['cached'] else 'New metadata observation')
-    for name in ('physical','integrity','receiving','captain','context'):
-        print('\n'+name.capitalize()+':')
-        for key,value in item[name].items():
-            print('  '+key.replace('_',' ')+': '+(json.dumps(value,ensure_ascii=False) if isinstance(value,(dict,list)) else str(value)))
-    for gap in item['gaps']:print('  Gap: '+gap)
-    print('\n'+data['cli_command'])
-
-
 def _destination_candidates(space_cache, query, within, catalog):
     """Reuse scoped catalog matching; prefer names over inherited path mentions."""
     import navcom_space
@@ -512,7 +471,7 @@ def navigate(api, conn, *, space_cache, source_cache, text, within='', local=Tru
     from navcom_navigation_intent import interpret
     import navcom_space
     intent = interpret(text, within, local)
-    catalog=(navcom_space._read(Path(space_cache).expanduser()) or {}) if intent['within'] or intent['action'] not in ('home','back') else None
+    catalog=(navcom_space.load_catalog(space_cache) or {}) if intent['within'] or intent['action'] not in ('home','back') else None
     if intent['within']:
         # Resolve/validate scope before any search; never fall back to global.
         intent['within'] = navcom_space.view(space_cache, action='show', within=intent['within'],catalog=catalog)['center']['id']
@@ -526,6 +485,8 @@ def navigate(api, conn, *, space_cache, source_cache, text, within='', local=Tru
         db = conn.execute('PRAGMA database_list').fetchone()[2] if conn is not None else ''
         if db: command += ['--index', db]
         result['cli_command'] = shlex.join(command)
+        _place_commands([node for node in (result.get('center'), *result['nodes'], *result.get('scope_candidates', [])) if node],
+                        space_cache, source_cache, db)
         if result.get('scope_status')=='choose':
             result['scope_choice_commands']={node['id']:shlex.join(command+['--choose',node['id']]) for node in result['scope_candidates']}
         if destination:
@@ -610,102 +571,3 @@ def navigate(api, conn, *, space_cache, source_cache, text, within='', local=Tru
     if target:
         result.update(scope_status='resolved', scope_target={k:target[k] for k in ('id','label','kind')}, scope_candidates=[])
     return finish(result, destination)
-
-
-def _coverage_lines(coverage):
-    """Keep ordinary navigation readable; --json retains the full diagnostics."""
-    counts = [(coverage.get(key), label) for key, label in (
-        ('indexed_conversations', 'conversations'), ('indexed_projects', 'indexed projects'),
-        ('harvested_sources', 'harvested sources')) if key in coverage]
-    lines = ['Coverage: '+(' · '.join(f'{count:,} {label}' for count, label in counts) or 'see detailed evidence with --json')]
-    gaps = []
-    for key, label in (('unavailable_roots', 'unavailable locations'),
-                       ('unknown_projects', 'projects with unknown identity'),
-                       ('missing_structure_sources', 'sources without structure'),
-                       ('warnings', 'warnings')):
-        value = coverage.get(key, 0)
-        count = len(value) if isinstance(value, (list, dict)) else value
-        if count: gaps.append(f'{count} {label}')
-    if coverage.get('bounded'): gaps.append('discovery reached a configured limit')
-    for key, label in (('stars', 'expert discovery'), ('fleet', 'fleet discovery')):
-        part = coverage.get(key, {})
-        status = part.get('status')
-        if key == 'fleet' and (part.get('available') is False or status in ('unavailable', 'partial')):
-            gaps.append(label+' is '+('unavailable' if part.get('available') is False or status == 'unavailable' else 'partial'))
-        elif part.get('complete') is False: gaps.append(label+' is partial')
-    if gaps: lines.append('  Gaps: '+' · '.join(gaps))
-    if coverage.get('history'): lines.append('  '+str(coverage['history']))
-    lines.append('  Full coverage and evidence: repeat with --json.')
-    return lines
-
-
-def render(data):
-    if data.get('intent'):
-        print('Navigator · '+data['intent']['engine'])
-        for step in data.get('steps',[]):
-            print('  '+step['status']+': '+step['description'])
-        if data.get('destination'):
-            print('Destination: '+data['destination'])
-            print(data.get('destination_command') or 'navcom atlas explore '+shlex.quote(data['destination']))
-    print(' / '.join(n['label'] for n in data.get('breadcrumbs',[])) or 'Your galaxy')
-    for node in data.get('nodes',[]):
-        display_kind=('ship archive' if node.get('form')=='archive' else
-                      'lab application' if node.get('form')=='application' and node['kind']=='district' else node['kind'])
-        print(f"\n{node['label']}  [{display_kind} · {node.get('status','observed')}]")
-        print('  '+node['id'])
-        if node.get('physical'):
-            print('  '+str(node['physical'].get('host') or 'Host unknown')+': '+str(node['physical'].get('path') or 'Location not recorded'))
-        for link in node.get('ship_links',[]):
-            print('  '+link['relation'].replace('_',' ')+': '+link['label']+' · '+link['id'])
-        if node.get('commands',{}).get('carried_context'):
-            print('  Read context: '+shlex.join(node['commands']['carried_context']))
-        if node['id'] in data.get('scope_choice_commands',{}):
-            print('  '+data['scope_choice_commands'][node['id']])
-        for location in node.get('locations',[])[:3]:
-            print('  '+str(location.get('path',location) if isinstance(location,dict) else location))
-        for group in node.get('contents',{}).get('groups',[]):
-            labels=', '.join(place['label'] for place in group['places'])
-            remainder=group['count']-len(group['places'])
-            print('  '+group['category'].capitalize()+': '+str(group['count'])+' · '+labels+
-                  (' · '+str(remainder)+' more' if remainder else ''))
-        for reason in node.get('evidence',[])[:2]:
-            if isinstance(reason,dict):
-                label=reason.get('description') or reason.get('basis') or str(reason.get('type') or 'Recorded evidence').replace('_',' ')
-                print('  '+str(label))
-                if reason.get('path'):print('    '+str(reason['path']))
-            else:print('  '+str(reason))
-    proof=data.get('evidence',{})
-    if proof.get('query_plan',{}).get('style')=='question':
-        print('\nDocument search terms: '+', '.join(proof['query_plan']['text_terms']))
-        print('  '+proof['query_plan']['text_policy'])
-    for place in proof.get('places',[]):
-        if not place['has_evidence']:continue
-        print('\n'+place['label']+' · '+place['state'].replace('_',' ')+' · '+place['id'])
-        print('  '+str(place['concept_hits'])+' conceptual clues · '+str(place['text_hits'])+' code/document matches · '+str(place['conversation_hits'])+' conversations')
-    if proof.get('places'):
-        unmatched=sum(place['state']=='no_matches_in_scanned_source_scope' for place in proof['places'])
-        unknown=sum(place['state']=='coverage_unknown' for place in proof['places'])
-        if unmatched or unknown:print('  Other places: '+str(unmatched)+' with no matches in scanned sources; '+str(unknown)+' with unknown coverage.')
-    for source in proof.get('sources',[]):
-        for field in ('concept_hits','text_hits'):
-            for hit in source.get(field,[]):print('  '+('['+', '.join(hit['place_labels'])+'] ' if hit.get('place_labels') else '')+hit['source_path']+(':'+str(hit['line']) if 'line' in hit else '')+'  '+str(hit.get('match') or hit.get('description','')))
-    if proof.get('conversation_basis',{}).get('type')=='project_query_context':
-        print('  Conversation basis: related project history matching '+repr(proof['conversation_basis']['query'])+'; a relationship to these exact district files is unproven.')
-    for node in proof.get('conversations',[]):print('  Conversation: '+node['label']+'\n    '+node.get('open_command',''))
-    if proof.get('carried'):
-        cargo = proof['carried']
-        print('\nCarried ship context · recorded snapshots')
-        for hit in cargo['hits']:
-            print('  '+hit['ship']['label']+' · '+str(hit.get('provider') or '')+' · original turn '+str(hit['index']))
-            print('    '+(hit.get('title') or 'Matched passage: '+next(iter(hit['text'].splitlines()), '')[:160]))
-            print('    '+hit['open_command'])
-        print('  Carried coverage: '+json.dumps(cargo['coverage']))
-        if cargo.get('next_ship_ids'):
-            print('  Repeat this search to check remaining ships; unchanged native results are cached.')
-    for error in proof.get('errors',[]):print('  '+error)
-    if data.get('scope_candidates_limited'):print('More places match; use a more specific name or exact place ID.')
-    if data.get('more'):print('More destinations available with --offset '+str(data['offset']+data['limit']))
-    if data.get('stored_copy_count'):
-        command=data.get('center',{}).get('commands',{}).get('stored_copies',['navcom','atlas','list','ships'])
-        print(str(data['stored_copy_count'])+' stored ship copies are linked from their ships; list them with '+shlex.join(command)+'.')
-    print('\n'+'\n'.join(_coverage_lines(data.get('coverage',{}))))

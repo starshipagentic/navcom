@@ -1,4 +1,8 @@
-"""Atlas command parsing and human/JSON output. Help never opens the index."""
+"""Atlas command parsing and human/JSON output. Help never opens the index.
+
+Constant help text imports nothing beyond the standard library; the discovery,
+navigation and chart services load only for the commands that use them.
+"""
 import argparse
 import json
 from pathlib import Path
@@ -7,8 +11,10 @@ import shutil
 import sqlite3
 import sys
 import textwrap
-from navcom_discovery import Discovery, EXPLAIN, GROUPS, refresh
-from navcom_navigation import KINDS as SPACE_KINDS
+
+# CLI routing only: these groupings and ID prefixes select the cached chart.
+SPACE_KINDS = {'galaxies','systems','planets','moons','cities','stars','bases','starbases','ships'}
+PREFIXES = ('galaxy:','system:','planet:','moon:','district:','star:','star-candidate:','starbase:','ship:','fleet:')
 
 OVERVIEW='''NavCom — find, understand and resume your coding conversations.
 
@@ -52,9 +58,9 @@ Examples:
   navcom atlas explore research:exp29
   navcom atlas search listener --within research:exp30 --json
 
-Leading atlas, sources, history and help are commands; voice status/transcribe
-select local speech tools. Other positional voice searches remain compatible. Search those literal words with
-navcom --query "atlas help". Existing flags and positional searches still work.
+A leading atlas, sources, history or voice word is a command only before one of
+its subcommands (or alone, or with --help); help only before a help subject.
+Anything else is an ordinary search: navcom history of the login fix.
 '''
 SUBJECTS={
  'browse':"""navcom --menu [--no-browser]    Local Galactic Bridge, Library and Conversation Atlas
@@ -82,7 +88,13 @@ Atlas search, classifications and display labels require no LLM.
  'maintenance':'navcom --where\nnavcom --maintain\nnavcom atlas refresh\nUpkeep indexes/archives conversations and refreshes discovery evidence. Atlas\nrefresh only refreshes metadata from the existing index; it never scans raw logs.\nRead-only discovery remains usable while another process indexes.\n'}
 
 
+def is_spatial(args):
+    return (getattr(args,'command','') in ('navigate','related','inspect','ask','board','files','context') or getattr(args,'space',False) or getattr(args,'grouping','') in SPACE_KINDS or
+            any(str(getattr(args,k,'') or '').startswith(PREFIXES) for k in ('collection','within','ref')))
+
+
 def parser():
+    from navcom_discovery import GROUPS
     p=argparse.ArgumentParser(prog='navcom atlas',description='Navigate cached places and collections; follow source, conversation and provider evidence. No web server or model required.',epilog='Start: navcom atlas list systems\nLearn: navcom help space\nLiteral search: navcom --query "atlas"',formatter_class=argparse.RawDescriptionHelpFormatter)
     subs=p.add_subparsers(dest='command')
     descriptions={'context':'Read a ship’s carried conversations and handover without resuming a captain.','files':'Browse the retained code and documents at a product, experiment or district.','ask':'Review a question for an exact Hermes expert; explicitly open it in its native terminal.','board':'Find and validate the native captain route for one local ship; explicitly reopen it.','list':'List places or conversation collections by grouping.','explore':'Show a place, collection branches or conversations.','search':'Search globally or within a place or collection.','navigate':'Interpret a destination or question and follow cached place, source and conversation evidence.','related':'Inspect cached native version-family suggestions and literal documented references to other projects.','inspect':'Inspect physical code locations, ship context or expertise; optionally observe an existing star provider process.','show':'Show a place or conversation context, ancestry and safe launch preview.','tree':'Show actual parent/child conversation hierarchy.','refresh':'Refresh indexed evidence, or rebuild current geography and provider metadata with --space.','help':'Explain a grouping or command.'}
@@ -301,10 +313,11 @@ Use navcom help history and navcom sources read --help for detailed parameters.
     if subject=='sources':
         import navcom_sources
         return navcom_sources.parser().format_help()
+    if subject in SUBJECTS and not atlas:return SUBJECTS[subject]
+    from navcom_discovery import EXPLAIN
     if subject in (None,'atlas'):return parser().format_help()+'\nGroupings:\n'+ '\n'.join('  '+k+' — '+v for k,v in EXPLAIN.items())
     if subject in EXPLAIN:return subject+'\n\n'+EXPLAIN[subject]+'\n\n'+('navcom atlas tree <ref>' if subject=='ancestry' else 'navcom atlas list '+subject)+'\nUse a printed collection ID with explore or search --within.\n'
     if subject=='all':return api.build_parser().format_help()+'\nSOURCE COMMAND REFERENCE\n'+help_text(api,'sources')+'\nHISTORY COMMAND REFERENCE\n'+help_text(api,'history')+'\nLOCAL VOICE COMMAND REFERENCE\n'+help_text(api,'voice')+'\nGALACTIC NAVIGATION\n'+help_text(api,'space')+'\nATLAS COMMAND REFERENCE\n'+help_text(api)+'\n'+ '\n'.join(parser()._subparsers._group_actions[0].choices[name].format_help() for name in ('list','explore','search','navigate','related','files','context','inspect','ask','board','show','tree','refresh'))
-    if subject in SUBJECTS and not atlas:return SUBJECTS[subject]
     sub=parser()._subparsers._group_actions[0].choices.get(subject)
     if sub:return sub.format_help()
     if subject in SUBJECTS:return SUBJECTS[subject]
@@ -349,19 +362,244 @@ def render(data):
     line(data['coverage'])
 
 
+# Terminal renderers for the shared service results (layer 3). --json prints the
+# same results unchanged; these only choose what a person reads first.
+
+def render_interaction(data):
+    result=data['interaction']; print(data['center']['label']+' · '+result['state'].replace('_',' '))
+    if result.get('reason'):print(result['reason'])
+    if result.get('question'):print('Question: '+result['question'])
+    spec=result.get('command') or result.get('handoff',{})
+    if spec.get('argv'):print('Command: '+shlex.join((['env']+[k+'='+v for k,v in sorted(spec.get('env',{}).items())] if spec.get('env') else [])+spec['argv']))
+    if spec.get('cwd'):print('Working directory: '+spec['cwd'])
+    for effect in result.get('effects',[]):print('• '+effect)
+    token=result.get('review_token') or result.get('fingerprint')
+    if token and result['state']!='dispatched' and result.get('handoff',{}).get('status')!='dispatched':print('Reviewed identity: '+token+'\nTo open this exact action in a terminal, repeat with --launch --review '+token)
+    if result.get('handoff',{}).get('status')=='dispatched':print('Terminal dispatched; visible captain takeover is not yet verified.')
+
+
+def render_inspection(data):
+    item=data['inspection']
+    if item.get('type')=='place':
+        from datetime import datetime, timezone
+        print(data['center']['label']+' · physical code locations')
+        observed=datetime.fromtimestamp(item['observed_at'],timezone.utc).isoformat(timespec='seconds')
+        print(('Cached observation' if item['cached'] else 'New observation')+' · '+observed)
+        for location in item['locations']:
+            print('\n'+location['path']+' · '+location['availability']+' · '+location.get('host','host unknown'))
+            git=location.get('git') or {}
+            for field in ('root','branch','commit','head_state','common_dir'):
+                if git.get(field):print('  '+field.replace('_',' ')+': '+git[field])
+        for relationship in item['relationships']:
+            print('\n'+relationship['kind'].replace('_',' ')+': '+relationship['left']+' ↔ '+relationship['right'])
+        for gap in item['gaps']:print('  Gap: '+gap)
+        print('\n'+item['policy']+'\n'+data['cli_command'])
+        return
+    if item.get('type')=='star':
+        print(data['center']['label']+' · living-expertise candidate')
+        print(item['qualification']+' · '+item['provider'])
+        print(item['description'])
+        for name in ('physical','observation','charter_refs','interfaces'):
+            print('\n'+name.replace('_',' ').capitalize()+': '+json.dumps(item[name],ensure_ascii=False))
+        for gap in item['gaps']:print('  Gap: '+str(gap))
+        print('\n'+item['capabilities_policy']+'\n'+data['cli_command'])
+        return
+    print(data['center']['label']+' · ship inspection')
+    print('Cached observation' if item['cached'] else 'New metadata observation')
+    for name in ('physical','integrity','receiving','captain','context'):
+        print('\n'+name.capitalize()+':')
+        for key,value in item[name].items():
+            print('  '+key.replace('_',' ')+': '+(json.dumps(value,ensure_ascii=False) if isinstance(value,(dict,list)) else str(value)))
+    for gap in item['gaps']:print('  Gap: '+gap)
+    print('\n'+data['cli_command'])
+
+
+def _coverage_lines(coverage):
+    """Keep ordinary navigation readable; --json retains the full diagnostics."""
+    counts = [(coverage.get(key), label) for key, label in (
+        ('indexed_conversations', 'conversations'), ('indexed_projects', 'indexed projects'),
+        ('harvested_sources', 'harvested sources')) if key in coverage]
+    lines = ['Coverage: '+(' · '.join(f'{count:,} {label}' for count, label in counts) or 'see detailed evidence with --json')]
+    gaps = []
+    for key, label in (('unavailable_roots', 'unavailable locations'),
+                       ('unknown_projects', 'projects with unknown identity'),
+                       ('missing_structure_sources', 'sources without structure'),
+                       ('warnings', 'warnings')):
+        value = coverage.get(key, 0)
+        count = len(value) if isinstance(value, (list, dict)) else value
+        if count: gaps.append(f'{count} {label}')
+    if coverage.get('bounded'): gaps.append('discovery reached a configured limit')
+    for key, label in (('stars', 'expert discovery'), ('fleet', 'fleet discovery')):
+        part = coverage.get(key, {})
+        status = part.get('status')
+        if key == 'fleet' and (part.get('available') is False or status in ('unavailable', 'partial')):
+            gaps.append(label+' is '+('unavailable' if part.get('available') is False or status == 'unavailable' else 'partial'))
+        elif part.get('complete') is False: gaps.append(label+' is partial')
+    if gaps: lines.append('  Gaps: '+' · '.join(gaps))
+    if coverage.get('history'): lines.append('  '+str(coverage['history']))
+    lines.append('  Full coverage and evidence: repeat with --json.')
+    return lines
+
+
+def render_space(data):
+    if data.get('intent'):
+        print('Navigator · '+data['intent']['engine'])
+        for step in data.get('steps',[]):
+            print('  '+step['status']+': '+step['description'])
+        if data.get('destination'):
+            print('Destination: '+data['destination'])
+            print(data.get('destination_command') or 'navcom atlas explore '+shlex.quote(data['destination']))
+    print(' / '.join(n['label'] for n in data.get('breadcrumbs',[])) or 'Your galaxy')
+    for node in data.get('nodes',[]):
+        display_kind=('ship archive' if node.get('form')=='archive' else
+                      'lab application' if node.get('form')=='application' and node['kind']=='district' else node['kind'])
+        print(f"\n{node['label']}  [{display_kind} · {node.get('status','observed')}]")
+        print('  '+node['id'])
+        if node.get('physical'):
+            print('  '+str(node['physical'].get('host') or 'Host unknown')+': '+str(node['physical'].get('path') or 'Location not recorded'))
+        for link in node.get('ship_links',[]):
+            print('  '+link['relation'].replace('_',' ')+': '+link['label']+' · '+link['id'])
+        if node.get('commands',{}).get('carried_context'):
+            print('  Read context: '+shlex.join(node['commands']['carried_context']))
+        if node['id'] in data.get('scope_choice_commands',{}):
+            print('  '+data['scope_choice_commands'][node['id']])
+        for location in node.get('locations',[])[:3]:
+            print('  '+str(location.get('path',location) if isinstance(location,dict) else location))
+        for group in node.get('contents',{}).get('groups',[]):
+            labels=', '.join(place['label'] for place in group['places'])
+            remainder=group['count']-len(group['places'])
+            print('  '+group['category'].capitalize()+': '+str(group['count'])+' · '+labels+
+                  (' · '+str(remainder)+' more' if remainder else ''))
+        for reason in node.get('evidence',[])[:2]:
+            if isinstance(reason,dict):
+                label=reason.get('description') or reason.get('basis') or str(reason.get('type') or 'Recorded evidence').replace('_',' ')
+                print('  '+str(label))
+                if reason.get('path'):print('    '+str(reason['path']))
+            else:print('  '+str(reason))
+    proof=data.get('evidence',{})
+    if proof.get('query_plan',{}).get('style')=='question':
+        print('\nDocument search terms: '+', '.join(proof['query_plan']['text_terms']))
+        print('  '+proof['query_plan']['text_policy'])
+    for place in proof.get('places',[]):
+        if not place['has_evidence']:continue
+        print('\n'+place['label']+' · '+place['state'].replace('_',' ')+' · '+place['id'])
+        print('  '+str(place['concept_hits'])+' conceptual clues · '+str(place['text_hits'])+' code/document matches · '+str(place['conversation_hits'])+' conversations')
+    if proof.get('places'):
+        unmatched=sum(place['state']=='no_matches_in_scanned_source_scope' for place in proof['places'])
+        unknown=sum(place['state']=='coverage_unknown' for place in proof['places'])
+        if unmatched or unknown:print('  Other places: '+str(unmatched)+' with no matches in scanned sources; '+str(unknown)+' with unknown coverage.')
+    for source in proof.get('sources',[]):
+        for field in ('concept_hits','text_hits'):
+            for hit in source.get(field,[]):print('  '+('['+', '.join(hit['place_labels'])+'] ' if hit.get('place_labels') else '')+hit['source_path']+(':'+str(hit['line']) if 'line' in hit else '')+'  '+str(hit.get('match') or hit.get('description','')))
+    if proof.get('conversation_basis',{}).get('type')=='project_query_context':
+        print('  Conversation basis: related project history matching '+repr(proof['conversation_basis']['query'])+'; a relationship to these exact district files is unproven.')
+    for node in proof.get('conversations',[]):print('  Conversation: '+node['label']+'\n    '+node.get('open_command',''))
+    if proof.get('carried'):
+        cargo = proof['carried']
+        print('\nCarried ship context · recorded snapshots')
+        for hit in cargo['hits']:
+            print('  '+hit['ship']['label']+' · '+str(hit.get('provider') or '')+' · original turn '+str(hit['index']))
+            print('    '+(hit.get('title') or 'Matched passage: '+next(iter(hit['text'].splitlines()), '')[:160]))
+            print('    '+hit['open_command'])
+        print('  Carried coverage: '+json.dumps(cargo['coverage']))
+        if cargo.get('next_ship_ids'):
+            print('  Repeat this search to check remaining ships; unchanged native results are cached.')
+    for error in proof.get('errors',[]):print('  '+error)
+    if data.get('scope_candidates_limited'):print('More places match; use a more specific name or exact place ID.')
+    if data.get('more'):print('More destinations available with --offset '+str(data['offset']+data['limit']))
+    if data.get('stored_copy_count'):
+        command=data.get('center',{}).get('commands',{}).get('stored_copies',['navcom','atlas','list','ships'])
+        print(str(data['stored_copy_count'])+' stored ship copies are linked from their ships; list them with '+shlex.join(command)+'.')
+    print('\n'+'\n'.join(_coverage_lines(data.get('coverage',{}))))
+
+
+def render_context(data):
+    """Human CLI output keeps provenance and native turn addresses visible."""
+    print((data.get('label') or data.get('ship_id') or 'Ship')+' · carried context · '+data['state'])
+    if data['state'] != 'available':
+        print(data.get('reason', 'Carried context is unavailable.'))
+        print(data['policy'])
+        return
+    if data.get('context_kind') == 'handover':
+        print('\n'+data['text'])
+        print('\nHandover file: '+data['provenance']['path'])
+    elif data['action'] == 'inspect':
+        print(str(data['total_sessions'])+' carried sessions')
+        for session in data.get('sessions', []):
+            print(session['id']+' · '+session['provider']+' · '+(session['title'] or session['project']))
+    else:
+        for message in data.get('messages', []):
+            print('\n'+message['id']+' · turn '+str(message['index'])+' · '+str(message.get('role','')))
+            print(message['text'])
+            if message.get('text_truncated'):
+                print('[Original message clipped to the requested character limit.]')
+        if not data.get('messages'):
+            print('No matching carried messages in this window.')
+    if data.get('next_offset') is not None:
+        print('\nContinue: '+data['continue_command'] if data.get('continue_command') else
+              '\nContinue with --offset '+str(data['next_offset']))
+    if data['provenance'].get('catalog_sha256'):
+        print('\nCarried catalog: '+data['provenance']['catalog_sha256'])
+    if data.get('cli_command'):
+        print('\nReplay: '+data['cli_command'])
+    print('\n'+data['policy'])
+
+
+def render_files(data):
+    print(data['center']['label']+' · retained files')
+    for file in data['files']:
+        print(file['relative_path']+' · '+str(file['bytes'])+' bytes\n  '+file['read_command'])
+    print(str(data['offset']+1 if data['files'] else 0)+'–'+str(data['offset']+len(data['files']))+' of '+str(data['total'])+' matching retained files.')
+    print('Published harvest only; current source files were not read. Coverage is bounded, not a full-repository inventory.')
+    for error in data['errors']: print(error['source_id']+': '+error['message'])
+    if not data['coverage']['complete']: print('Inventory coverage is incomplete: '+json.dumps(data['coverage']))
+    if data['next_command']: print('More: '+data['next_command'])
+
+
+def render_related(data):
+    print(data['center']['label'] + ' — related source evidence')
+    for family in data['families']:
+        print('\nSuggested version family: ' + family['label'])
+        for member in family['members']:
+            print('  ' + member['label'] + ' · ' + str(member['retained_files']) + ' retained files · ' + member['path'])
+            print('    ' + member['search_command'])
+    for reference in data['references']:
+        print('\nDocumented reference: ' + reference['target_root'])
+        print('  ' + reference['path'] + ':' + str(reference['line']) + ' — ' + reference['excerpt'])
+        print('  ' + reference['read_command'])
+    query_hits = 0
+    for evidence in data.get('evidence', []):
+        concepts, text = evidence.get('concept_hits', []), evidence.get('text_hits', [])
+        query_hits += len(concepts) + len(text)
+        print('\nSource query: ' + evidence['source_id'] + ' · ' + str(len(concepts)) + ' concept matches · ' + str(len(text)) + ' text matches')
+        for label, hits in [('concept', concepts), ('text', text)]:
+            for hit in hits[:5]:
+                location = hit.get('relative_path', '')
+                if hit.get('line') is not None:
+                    location += ':' + str(hit['line'])
+                print('  ' + label + ' · ' + location)
+        if len(concepts) > 5 or len(text) > 5 or evidence.get('potentially_truncated'):
+            print('  Bounded match preview; full returned evidence: ' + data['cli_command'] + ' --json')
+    if not data['families'] and not data['references'] and not query_hits:
+        print('No relationships found in the selected retained source scopes.')
+    print('\n' + data['meaning'])
+    if data.get('result_limits', {}).get('truncated'):
+        print('Relationship result limit reached; use --limit up to 100 to see more returned evidence.')
+    if data['next_offset'] is not None:
+        print('More source scopes remain: ' + data['continue_command'])
+
+
 def run(api,argv):
     p=parser()
     if not argv:print(help_text(api));return 0
     args=p.parse_args(argv)
     if args.command=='help':print(help_text(api,args.subject,atlas=True));return 0
-    if not args.command:p.print_help();return 0
     path=(args.index or api.default_index_path()).expanduser()
-    import navcom_navigation as navigation
-    if not path.is_file() and not navigation.is_spatial(args):raise ValueError('No index at '+str(path)+'. Run navcom --maintain first.')
+    if not path.is_file() and not is_spatial(args):raise ValueError('No index at '+str(path)+'. Run navcom --maintain first.')
     conn=sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True,timeout=.3) if path.is_file() else None
     try:
-        import navcom_navigation as navigation
-        if navigation.is_spatial(args):
+        if is_spatial(args):
+            import navcom_navigation as navigation
             import navcom_space
             space_cache,source_cache=navigation.paths(path,args.space_cache,getattr(args,'source_cache',None))
             if args.command=='context':
@@ -369,40 +607,38 @@ def run(api,argv):
                 action='search' if args.query is not None else 'open' if args.session else 'handover' if args.handover else 'inspect'
                 result=navigation.context(space_cache,args.ref,action=action,query=args.query or '',ref=args.session or '',turn=args.turn,offset=args.offset,limit=args.limit,max_chars=args.max_chars,expected_catalog=args.catalog)
                 if args.json:print(json.dumps(result,ensure_ascii=False))
-                else:
-                    import navcom_ship_context
-                    navcom_ship_context.render(result)
+                else:render_context(result)
                 return 0 if result['state']=='available' else 2
             if args.command=='files':
                 import navcom_place_files
                 result=navcom_place_files.files(space_cache,source_cache,args.ref,query=args.query,limit=args.limit,offset=args.offset,generation=args.generation)
                 if args.json:print(json.dumps(result,ensure_ascii=False))
-                else:navcom_place_files.render(result)
+                else:render_files(result)
                 return 0
             if args.command=='related':
                 import navcom_relationships
                 result=navcom_relationships.related(space_cache,source_cache,args.ref,
                     query=args.query,limit=args.limit,seconds=args.seconds,offset=args.offset)
                 if args.json:print(json.dumps(result,ensure_ascii=False))
-                else:navcom_relationships.render(result)
+                else:render_related(result)
                 return 0
             if args.command in ('ask','board'):
                 result=navigation.interact(api,space_cache=space_cache,within=args.ref,action=args.command,
                     question=getattr(args,'question',''),launch=args.launch,review_token=args.review,
                     route_path=getattr(args,'route',None),validate=getattr(args,'validate',False))
                 if args.json:print(json.dumps(result))
-                else:navigation.render_interaction(result)
+                else:render_interaction(result)
                 return 2 if result['interaction']['state']=='blocked' else 0
             if args.command=='inspect':
                 result=navigation.inspect(space_cache=space_cache,within=args.ref,refresh=args.refresh,observe=args.observe)
                 if args.json:print(json.dumps(result))
-                else:navigation.render_inspection(result)
+                else:render_inspection(result)
                 return 0
             if args.command=='refresh':
                 if args.harvest:
                     import navcom_chart_refresh
-                    result=navcom_chart_refresh.refresh(path,space_cache,source_cache,seconds=args.seconds,
-                        limit=args.limit,restart=args.restart,
+                    result=navcom_chart_refresh.drive(path,space_cache,source_cache,seconds=args.seconds,
+                        slice_seconds=args.seconds,passes=1,limit=args.limit,restart=args.restart,
                         progress=lambda message:print('NavCom chart ▸ '+message,file=sys.stderr,flush=True))
                     if args.json:print(json.dumps(result))
                     else:
@@ -422,7 +658,7 @@ def run(api,argv):
                 result=navigation.navigate(api,conn,space_cache=space_cache,source_cache=source_cache,
                     text=' '.join(args.words),within=args.within or '',local=not args.global_scope,limit=args.limit,scope_choice=args.choose)
                 if args.json:print(json.dumps(result))
-                else:navigation.render(result)
+                else:render_space(result)
                 return 0
             result=navigation.view(api,conn,space_cache=space_cache,source_cache=source_cache,
                 action=args.command,kind=getattr(args,'grouping','') or '',
@@ -430,7 +666,7 @@ def run(api,argv):
                 query=' '.join(args.words) if args.command=='search' else getattr(args,'query','') or '',
                 limit=args.limit,offset=args.offset,include_evidence=args.evidence)
             if args.json:print(json.dumps(result))
-            else:navigation.render(result)
+            else:render_space(result)
             return 0
         if args.command=='refresh':
             if args.harvest or args.restart:raise ValueError('--harvest and --restart require --space.')
@@ -438,6 +674,7 @@ def run(api,argv):
             def progress(done,total):
                 import time
                 if time.monotonic()-stamp[0]>1:print(f'Atlas evidence: {done}/{total} indexed conversations',file=sys.stderr);stamp[0]=time.monotonic()
+            from navcom_discovery import refresh
             result=refresh(conn,progress);print(json.dumps(dict(schema_version=1,**result)) if args.json else f"Atlas refreshed: {result['changed']} changed / {result['files']} indexed conversations.");return 0
         params={k:[str(v)] for k,v in vars(args).items() if v is not None and k in ('provider','since','until','limit','offset','start')}
         params['action']=[args.command]
@@ -446,6 +683,7 @@ def run(api,argv):
         for k,dest in [('grouping','grouping'),('collection','within'),('within','within'),('ref','ref'),('query','q')]:
             if getattr(args,k,None):params[dest]=[getattr(args,k)]
         if args.command=='search':params['q']=[' '.join(args.words)]
+        from navcom_discovery import Discovery
         data=Discovery(api).view(conn,params)
         if args.json:print(json.dumps(data,ensure_ascii=False))
         else:render(data)

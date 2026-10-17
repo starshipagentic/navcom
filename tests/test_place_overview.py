@@ -72,14 +72,14 @@ def test_public_cli_exposes_the_same_contents_without_rewriting_the_chart(tmp_pa
 
 
 def test_human_navigation_does_not_dump_unbounded_diagnostics(capsys):
-    import navcom_navigation
+    import navcom_atlas_cli
     data = dict(nodes=[place('editor', 'district', 'trial', form='application',
                             evidence=[dict(type='native_application', path='/repo/lab/package.json',
                                            entry_points=[{'file': 'private-detail'}] * 1000)])],
                 coverage=dict(indexed_conversations=6641, indexed_projects=331,
                               harvested_sources=145, unavailable_roots=['/missing/' + str(i) for i in range(1000)],
                               unknown_projects=82, stars=dict(complete=False, batches=[{}] * 1000)))
-    navcom_navigation.render(data)
+    navcom_atlas_cli.render_space(data)
     output = capsys.readouterr().out
     assert '[lab application' in output and '/repo/lab/package.json' in output
     assert '6,641 conversations' in output and '1000 unavailable locations' in output
@@ -90,7 +90,7 @@ def test_human_navigation_does_not_dump_unbounded_diagnostics(capsys):
 
 
 def test_human_coverage_preserves_native_fleet_gaps():
-    from navcom_navigation import _coverage_lines
+    from navcom_atlas_cli import _coverage_lines
     for fleet, expected in (({'status': 'partial', 'available': True}, 'partial'),
                             ({'status': 'unavailable', 'available': False}, 'unavailable')):
         assert 'fleet discovery is '+expected in '\n'.join(_coverage_lines({'fleet': fleet}))

@@ -16,6 +16,7 @@ import math
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import tempfile
 import time
@@ -34,6 +35,12 @@ LAB_DIRS = {"lab", "labs", "experiments"}
 MAX_JSON = 32 * 1024 * 1024
 STAR_BATCH_ROOTS = 10
 STAR_DISCOVERY_SECONDS = 30
+MAX_ROOTS = 1000
+MAX_BOUNDARIES = 200
+# Child kinds a place can list (navcom atlas list KIND --within PLACE).
+LIST_KINDS = {"galaxy": ("systems", "planets", "moons", "cities", "stars", "starbases", "ships"),
+              "system": ("planets", "moons", "cities"), "planet": ("moons", "cities"),
+              "moon": ("cities",), "starbase": ("ships",)}
 
 
 def _clean_clue(api, text, limit=180):
@@ -221,6 +228,32 @@ def _read(path, default=None, max_bytes=MAX_JSON):
         return default
 
 
+def load_catalog(cache_path, default=None):
+    """Read one published chart. Sprite names saved by older charts are dropped:
+    the view derives presentation from kind and form."""
+    data = _read(Path(cache_path).expanduser(), default)
+    entities = data.get("entities") if isinstance(data, dict) else None
+    for node in (entities.values() if isinstance(entities, dict) else entities or []):
+        if isinstance(node, dict):
+            node.pop("art_role", None)
+    return data
+
+
+def kill_group(process):
+    """Stop an isolated worker's whole process group if it still runs.
+
+    The group may exit (or be left only with zombies) between poll() and the
+    kill; macOS then reports ProcessLookupError or PermissionError. Either way
+    nothing remains to stop, so reap the leader and continue.
+    """
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        process.wait()
+
+
 def _atomic(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
@@ -334,6 +367,11 @@ def _relative(path, root):
 def _safe_relative(value):
     path = Path(str(value))
     return bool(str(value)) and not path.is_absolute() and ".." not in path.parts
+
+
+def in_scopes(path, scopes):
+    """A repository-relative path lies in one of these relative scopes ("." is all)."""
+    return any(scope == "." or path == scope or path.startswith(scope + "/") for scope in scopes)
 
 
 def _minimal_paths(paths):
@@ -800,7 +838,9 @@ def _reconcile_places(entities, edges, root_nodes, old_nodes, warnings):
     return dict(merged=reconciled, conflicts=conflicts)
 
 
-def _position(identity, kind, parent_position=None):
+def position(identity, kind, parent_position=None):
+    """Durable chart coordinates seeded by identity. The radii are frozen:
+    changing them would move every saved address. Layout belongs to the view."""
     if kind == "galaxy":
         return {"x": 0.0, "y": 0.0}
     digest = hashlib.sha256(identity.encode()).digest()
@@ -818,12 +858,12 @@ def _star_inventory(inventory, source_by_root, cache_path, previous):
     Metadata and provider inventory are the only operations here. The provider's
     callable interface templates are never executed. Chart reads never call this.
     """
+    from navcom_ship_inspection import commission_tools
     from navcom_stars import discover
 
     cache = cache_path.parent / (cache_path.name + ".stars")
     user_home = Path.home().resolve()
-    protected = [user_home / ".hermes/hermes-agent",
-                 user_home / ".codex/skills/ship-commission/scripts/borrowed", cache.resolve()]
+    protected = [user_home / ".hermes/hermes-agent", commission_tools(borrowed=True), cache.resolve()]
     excluded_roots = []
     eligible = []
     for root in inventory:
@@ -948,15 +988,13 @@ def _star_inventory(inventory, source_by_root, cache_path, previous):
     return list(records.values()), coverage
 
 
-def refresh(api, conn, cache_path, source_cache=None, progress=None, max_roots=1000, max_boundaries=200):
+def refresh(api, conn, cache_path, source_cache=None, progress=None):
     """Publish a bounded current catalog. Never harvest implicitly or modify originals.
 
     ``conn`` may be None for a source-only catalog. Git/manifests are inspected
     here; code grouping comes exclusively from Starforge's published artifacts.
     A busy writer cannot invalidate the last complete reader snapshot.
     """
-    if max_roots < 1 or max_boundaries < 1:
-        raise ValueError("Discovery limits must be positive")
     path = Path(cache_path).expanduser()
     with _writer(path):
         old = _read(path, {}) or {}
@@ -1018,8 +1056,8 @@ def refresh(api, conn, cache_path, source_cache=None, progress=None, max_roots=1
                 relative = _relative(Path(application["path"]), Path(ancestor["root"]).expanduser().resolve())
                 if relative is not None and _snapshot_contains(ancestor, relative) and ancestor not in owner_sources:
                     owner_sources.append(ancestor)
-        truncated = len(inventory) > max_roots
-        inventory = inventory[:max_roots]
+        truncated = len(inventory) > MAX_ROOTS
+        inventory = inventory[:MAX_ROOTS]
         entities = {}
         edges = []
         edge_keys = set()
@@ -1086,7 +1124,7 @@ def refresh(api, conn, cache_path, source_cache=None, progress=None, max_roots=1
             system = put(system_id, "system", system_label, status=system_status, evidence=system_evidence)
             edge(GALAXY, system_id, status=system["status"], evidence=system_evidence)
             if str(repository_root) not in boundaries_by_root:
-                package, boundaries, bounded = _boundaries(repository_root, warnings, max_boundaries, native_apps)
+                package, boundaries, bounded = _boundaries(repository_root, warnings, MAX_BOUNDARIES, native_apps)
                 truncated |= bounded
                 boundaries_by_root[str(repository_root)] = (package, boundaries)
             package, boundaries = boundaries_by_root[str(repository_root)]
@@ -1312,7 +1350,7 @@ def refresh(api, conn, cache_path, source_cache=None, progress=None, max_roots=1
             node = put(record["id"], record["kind"], record["label"], parent=parent,
                        status="recorded", evidence=dict(type="fleet_snapshot", **record.get("provenance", {})),
                        description=record.get("description", ""))
-            for field in ("physical", "readiness", "provenance", "gaps", "art_role", "source_roots", "record_id", "unresolved_source_references", "form", "related_ship_id", "integrity", "native_observation"):
+            for field in ("physical", "readiness", "provenance", "gaps", "source_roots", "record_id", "unresolved_source_references", "form", "related_ship_id", "integrity", "native_observation"):
                 if field in record:
                     node[field] = record[field]
             node["evidence"].extend(record.get("evidence", []))
@@ -1354,7 +1392,7 @@ def refresh(api, conn, cache_path, source_cache=None, progress=None, max_roots=1
                 parent = entities.get(node["parent_id"])
                 if parent:
                     place(parent, seen | {node["id"]})
-                node["position"] = positions.get(node["id"]) or _position(node["id"], node["kind"], parent["position"] if parent else None)
+                node["position"] = positions.get(node["id"]) or position(node["id"], node["kind"], parent["position"] if parent else None)
             positions[node["id"]] = node["position"]
         # Parent scopes are unions of exact child collections, never title similarity.
         def aggregate(node, seen=None):
@@ -1396,30 +1434,13 @@ def refresh(api, conn, cache_path, source_cache=None, progress=None, max_roots=1
                                                    description="Related conversations in the exact implementation product, matched by query; not proven to discuss this expert.")
         for node in entities.values():
             place(node)
-            source_commands = []
-            by_source = defaultdict(set)
-            for scope in node["source_scopes"]:
-                by_source[scope["source_id"]].update(scope["paths"])
-            for source_id, paths in sorted(by_source.items()):
-                paths = _minimal_paths(paths)
-                command = ["navcom", "sources", "search", "<query>", "--within", source_id]
-                if "." not in paths:
-                    for relative in sorted(paths):
-                        command.extend(["--path", relative])
-                source_commands.append(command)
-            node["commands"] = dict(explore=["navcom", "atlas", "explore", node["id"]],
-                                    source_search=source_commands,
-                                    conversation_search=[["navcom", "atlas", "search", node.get("suggested_query") or "<query>", "--within", cid] for cid in node["conversation_collections"]])
-            if node["kind"] == "ship":
-                node["commands"]["carried_context"] = ["navcom", "atlas", "context", node["id"]]
-            if node.get("stored_copies"):
-                node["commands"]["stored_copies"] = ["navcom", "atlas", "list", "ships"]
+            node["commands"] = commands(node)
         data = dict(schema_version=SCHEMA_VERSION, published=time.time(), entities=list(entities.values()), edges=edges,
                     positions=positions, coverage=dict(indexed_projects=len(indexed), indexed_conversations=sum(map(len, indexed.values())),
                     unknown_projects=unknown_projects, harvested_sources=len(sources), source_published=state.get("published") if state else None,
                     metadata_fallbacks=metadata_fallbacks,
                     inspected_roots=len(inventory), unavailable_roots=unavailable, bounded=truncated,
-                    limits=dict(max_roots=max_roots, max_boundaries_per_repository=max_boundaries),
+                    limits=dict(max_roots=MAX_ROOTS, max_boundaries_per_repository=MAX_BOUNDARIES),
                     missing_structure_sources=sorted(set(missing_structure)), rejected_token_groups=rejected_groups,
                     native_applications=dict(candidates=len(native_apps),
                         dependency_components=dependency_components,
@@ -1434,9 +1455,83 @@ def refresh(api, conn, cache_path, source_cache=None, progress=None, max_roots=1
         return data
 
 
+def commands(node):
+    """Exact CLI argv for each read-only or review-first verb this place accepts.
+
+    These are the CLI's own commands, shared by its output and the view.
+    Angle-bracket words (<query>, <question>, <commit>, <YYYY-MM-DD>) are for
+    the caller to fill. Launch, refresh and other writing commands are never
+    listed here: they follow from a printed review or are explicit upkeep.
+    """
+    identity, kind = node["id"], node["kind"]
+    application = kind == "district" and node.get("form") == "application"
+    atlas = ["navcom", "atlas"]
+    by_source = defaultdict(set)
+    for scope in node.get("source_scopes", []):
+        if scope.get("source_id") and scope.get("paths"):  # A scope without paths is never widened.
+            by_source[scope["source_id"]].update(scope["paths"])
+    source_search = []
+    for source_id, paths in sorted(by_source.items()):
+        paths = _minimal_paths(paths)
+        command = ["navcom", "sources", "search", "<query>", "--within", source_id]
+        if "." not in paths:
+            for relative in sorted(paths):
+                command.extend(["--path", relative])
+        source_search.append(command)
+    result = dict(explore=atlas + ["explore", identity], source_search=source_search,
+                  conversation_search=[atlas + ["search", node.get("suggested_query") or "<query>", "--within", cid]
+                                       for cid in node.get("conversation_collections", [])],
+                  show=atlas + ["show", identity],
+                  search=atlas + ["search", "<query>", "--within", identity, "--space", "--evidence"],
+                  navigate=atlas + ["navigate", "<query>", "--within", identity])
+    if kind in LIST_KINDS:
+        result["list"] = [atlas + ["list", grouping, "--within", identity] for grouping in LIST_KINDS[kind]]
+    if kind in ("galaxy", "system", "planet", "moon", "district", "star"):
+        result["related"] = atlas + ["related", identity]
+        result["history_conversations"] = ["navcom", "history", "conversations", identity, "--at", "<YYYY-MM-DD>"]
+    if kind in ("galaxy", "system"):
+        result["history_system"] = ["navcom", "history", "system", identity, "--at", "<YYYY-MM-DD>"]
+    if kind in ("planet", "moon", "district"):
+        result["files"] = atlas + ["files", identity]
+    if kind in ("planet", "moon", "district", "star"):
+        result["history_timeline"] = ["navcom", "history", "timeline", identity]
+        result["history_explore"] = ["navcom", "history", "explore", identity, "<commit>"]
+    if kind in ("planet", "moon", "star", "ship") or application:
+        result["inspect"] = atlas + ["inspect", identity]
+        result["inspect_refresh"] = atlas + ["inspect", identity, "--refresh"]
+    if kind == "star":
+        result["inspect_observe"] = atlas + ["inspect", identity, "--observe"]
+        result["ask"] = atlas + ["ask", identity, "<question>"]
+    if kind == "ship":
+        result["carried_context"] = atlas + ["context", identity]
+        result["carried_search"] = atlas + ["context", identity, "--query", "<query>"]
+        result["handover"] = atlas + ["context", identity, "--handover"]
+        if node.get("form") != "archive":
+            result["board_validate"] = atlas + ["board", identity, "--validate"]
+    if node.get("stored_copies"):
+        result["stored_copies"] = atlas + ["list", "ships"]
+    if kind == "galaxy":
+        result["sources_list"] = ["navcom", "sources", "list"]
+    return result
+
+
+def subtree(entities, root_id):
+    """IDs of one place and everything it contains through parent_id."""
+    children = defaultdict(list)
+    for node in entities:
+        children[node.get("parent_id")].append(node["id"])
+    found, pending = {root_id}, [root_id]
+    while pending:
+        for child in children[pending.pop()]:
+            if child not in found:
+                found.add(child)
+                pending.append(child)
+    return found
+
+
 def destination_matches(cache_path, reference, within="", *, catalog=None):
     """Find exact names/IDs inside a place across all result pages."""
-    data = catalog if catalog is not None else (_read(Path(cache_path).expanduser()) or {})
+    data = catalog if catalog is not None else (load_catalog(cache_path) or {})
     center = view(cache_path, action="show", within=within, catalog=data)["center"]["id"]
     nodes = {node["id"]: node for node in data["entities"]}
     candidates = []
@@ -1453,12 +1548,6 @@ def destination_matches(cache_path, reference, within="", *, catalog=None):
     return candidates
 
 
-def resolve_destination(cache_path, reference, within=""):
-    """Resolve only an exact unique name/ID within the selected place."""
-    candidates = destination_matches(cache_path, reference, within)
-    return candidates[0]["id"] if len(candidates) == 1 else None
-
-
 def view(cache_path, action="list", kind="", within="", query="", limit=50, offset=0, *, catalog=None):
     """Query one published catalog; exact containment scope precedes matching."""
     if action not in ("list", "explore", "search", "show"):
@@ -1468,7 +1557,7 @@ def view(cache_path, action="list", kind="", within="", query="", limit=50, offs
     kind = KINDS.get(kind, kind)
     if kind and kind not in {"galaxy", "system", "planet", "moon", "district", "star", "starbase", "ship"}:
         raise ValueError("Unknown spatial kind: " + kind)
-    data = catalog if catalog is not None else _read(Path(cache_path).expanduser(), None)
+    data = catalog if catalog is not None else load_catalog(cache_path)
     if not data or data.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("Spatial catalog unavailable. Run navcom atlas refresh --space first.")
     nodes = {node["id"]: node for node in data["entities"]}
@@ -1481,13 +1570,7 @@ def view(cache_path, action="list", kind="", within="", query="", limit=50, offs
     children = defaultdict(list)
     for node in nodes.values():
         children[node["parent_id"]].append(node["id"])
-    descendants = set()
-    pending = list(children[within])
-    while pending:
-        identity = pending.pop()
-        if identity not in descendants:
-            descendants.add(identity)
-            pending.extend(children[identity])
+    descendants = subtree(nodes.values(), within) - {within}
     eligible = {within} if action == "show" else descendants if action == "search" or kind else set(children[within])
     # Exploration is a conceptual overview. Stored copies are exposed in its
     # explicit catalog and through linked ships; search and typed lists retain
@@ -1512,7 +1595,8 @@ def view(cache_path, action="list", kind="", within="", query="", limit=50, offs
     output = [node for _, node in scored[int(offset):int(offset) + int(limit)]]
     from navcom_place_overview import previews
     contents = previews(nodes.values(), [within, *[node["id"] for node in output]])
-    output = [{**node, "contents": contents[node["id"]]} for node in output]
+    # Commands are rebuilt on read, so charts published earlier offer current verbs.
+    output = [{**node, "contents": contents[node["id"]], "commands": commands(node)} for node in output]
     breadcrumbs = []
     cursor = within
     visited = set()
@@ -1523,7 +1607,7 @@ def view(cache_path, action="list", kind="", within="", query="", limit=50, offs
     shown = {n["id"] for n in output} | {within}
     edges = [edge for edge in data["edges"] if edge["source"] in shown and edge["target"] in shown]
     return dict(schema_version=SCHEMA_VERSION, published=data["published"], action=action, kind=kind, within=within,
-                query=query, center={**nodes[within], "contents": contents[within]}, breadcrumbs=list(reversed(breadcrumbs)), nodes=output, entities=output,
+                query=query, center={**nodes[within], "contents": contents[within], "commands": commands(nodes[within])}, breadcrumbs=list(reversed(breadcrumbs)), nodes=output, entities=output,
                 edges=edges, coverage=data["coverage"], total=total, more=int(offset) + len(output) < total,
                 stored_copy_count=len(stored_copies) if action == "explore" and not kind and not query else 0,
                 offset=int(offset), limit=int(limit), search_scope="Cached place metadata; use destination commands for source and conversation contents.")

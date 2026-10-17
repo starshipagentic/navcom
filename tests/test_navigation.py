@@ -328,3 +328,15 @@ print(json.dumps(worker.batch_search({'query':'x','scopes':[{'source_id':str(i)}
     assert result["coverage"]["unsearched_source_ids"]==["2"]
     assert result["coverage"]["query_cache_hits"]==2
     assert not result["coverage"]["complete"]
+
+
+def test_one_cache_resolver_for_chart_sources_and_history(tmp_path, monkeypatch):
+    import navcom_navigation
+    index = tmp_path / "index.sqlite"
+    for name in ("NAVCOM_SPACE_CACHE", "NAVCOM_SOURCES_CACHE", "NAVCOM_HISTORY_CACHE"):
+        monkeypatch.delenv(name, raising=False)
+    assert navcom_navigation.paths(index) == (tmp_path / "index.sqlite.space.json", tmp_path / "navcom-sources")
+    assert navcom_navigation.history_cache(index) == tmp_path / "navcom-history"
+    monkeypatch.setenv("NAVCOM_HISTORY_CACHE", str(tmp_path / "elsewhere"))
+    assert navcom_navigation.history_cache(index) == tmp_path / "elsewhere"
+    assert navcom_navigation.paths(index, sources=tmp_path / "explicit")[1] == tmp_path / "explicit"

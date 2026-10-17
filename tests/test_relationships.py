@@ -1,5 +1,6 @@
 """Native, unfamiliar source fixtures; no production catalogs or model calls."""
 import json
+import os
 from pathlib import Path
 import shlex
 import shutil
@@ -8,6 +9,7 @@ import sys
 
 import pytest
 
+import navcom_atlas_cli
 import navcom_relationships as relationships
 from navcom_sources import runtime
 
@@ -61,9 +63,11 @@ def example(tmp_path):
 
 
 def cli(example, *extra):
-    result = subprocess.run([sys.executable, '-m', 'navcom_relationships', 'planet:orchard',
-        '--space-cache', str(example['chart']), '--source-cache', str(example['cache']), '--json', *extra],
-        cwd=ROOT, capture_output=True, text=True, timeout=20)
+    """The public `navcom atlas related` command; no conversation index is opened."""
+    result = subprocess.run([sys.executable, str(ROOT / 'navcom.py'), 'atlas', 'related', 'planet:orchard',
+        '--space-cache', str(example['chart']), '--source-cache', str(example['cache']),
+        '--index', str(example['chart'].parent / 'absent.sqlite'), '--json', *extra],
+        cwd=ROOT, capture_output=True, text=True, timeout=30, env=dict(os.environ, NAVCOM_NO_SKILLS='1'))
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 
@@ -107,7 +111,7 @@ def test_scoped_query_never_widens_and_query_does_not_match_generated_commands(e
 
 def test_plain_scoped_search_shows_both_native_paths(example, capsys):
     data = relationships.related(example['chart'], example['cache'], 'moon:v2', query='calibration')
-    relationships.render(data)
+    navcom_atlas_cli.render_related(data)
     text = capsys.readouterr().out
     assert 'concept matches' in text and 'text matches' in text
     assert 'concept · engines/v2/calibration.py' in text and 'text · engines/v2/calibration.py:' in text

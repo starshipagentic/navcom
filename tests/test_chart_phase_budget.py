@@ -191,3 +191,42 @@ def test_real_chart_worker_pause_terminates_and_preserves_saved_cursor(tmp_path,
     assert time.monotonic()-began < 2
     assert result['paused'] and result['visited'] == 1 and result['chart_pending']
     assert json.loads(path.read_text())['next'] == 1
+
+
+def _pass_result(**extra):
+    return dict(dict(complete=False, paused=False, more=True, cached=False, visited=1, total=4,
+                     failures=[], skipped=[], stop_reason='page_limit'), **extra)
+
+
+def test_drive_repeats_slices_until_the_total_budget_then_discloses_time_budget(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(refresh, 'time', SimpleNamespace(monotonic=lambda: clock[0], time=lambda: clock[0]))
+    seen, observed = [], []
+    def bounded(*args, **kwargs):
+        seen.append(kwargs)
+        clock[0] += 50
+        return _pass_result()
+    monkeypatch.setattr(refresh, 'refresh', bounded)
+    result = refresh.drive('index', 'chart', 'sources', automatic=True, sync_index=True, on_pass=observed.append)
+    # Slices of at most a minute inside two minutes: 60, then the 70 s remainder clamps to 60, then 20.
+    assert [call['seconds'] for call in seen] == [60, 60, 20]
+    assert all(call['automatic'] and call['sync_index'] for call in seen)
+    assert result['stop_reason'] == 'time_budget' and len(observed) == 3
+    assert observed[-1]['stop_reason'] == 'page_limit'  # the pass itself is reported unchanged
+
+
+@pytest.mark.parametrize('stop', [dict(complete=True, more=False), dict(paused=True),
+                                  dict(runtime_error='Starforge unavailable'), dict(index_error='busy')])
+def test_drive_stops_on_completion_pause_or_unavailable_runtime(monkeypatch, stop):
+    calls = []
+    monkeypatch.setattr(refresh, 'refresh', lambda *a, **k: calls.append(k) or _pass_result(**stop))
+    result = refresh.drive('index', 'chart', 'sources')
+    assert len(calls) == 1 and result['stop_reason'] == 'page_limit'
+
+
+def test_cli_single_pass_is_one_ordinary_refresh(monkeypatch):
+    calls = []
+    monkeypatch.setattr(refresh, 'refresh', lambda *a, **k: calls.append(k) or _pass_result())
+    result = refresh.drive('index', 'chart', 'sources', seconds=90, slice_seconds=90, passes=1, limit=7)
+    assert calls == [dict(seconds=90, limit=7)]
+    assert result == _pass_result()  # no invented stop_reason for one pass

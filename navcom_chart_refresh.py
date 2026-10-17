@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import shlex
-import signal
 import sqlite3
 import subprocess
 import sys
@@ -89,8 +88,8 @@ def _worker(request):
                              project_boundaries=request['boundaries'])
         result = dict(skipped=selection['coverage']['skipped'], sources=0)
         if selection['sources']:
-            worker = Path(__file__).with_name('navcom_sources_worker.py')
-            process = subprocess.run([request['runtime'], str(worker)],
+            import navcom_sources
+            process = subprocess.run(navcom_sources.worker_argv(request['runtime']),
                 input=json.dumps(dict(action='harvest', cache=request['sources'], sources=selection['sources'])),
                 text=True, stdout=subprocess.PIPE, check=True)
             result.update(json.loads(process.stdout))
@@ -166,9 +165,7 @@ def _run(request, seconds, cancel=None, progress=None):
                 raise ValueError(result.get('error', 'Refresh worker unavailable'))
             return result['value']
         finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+            space.kill_group(process)
 
 
 def state_path(source_cache, *, index_path=None, space_cache=None):
@@ -381,6 +378,32 @@ def refresh(index_path, space_cache, source_cache, *, seconds=60, limit=20,
         finally:
             space._atomic(path, state)
         return _result(state, context, started)
+
+
+def drive(index_path, space_cache, source_cache, *, seconds=120, slice_seconds=60, passes=None,
+          on_pass=None, **options):
+    """Repeat bounded refresh passes until complete, paused, unavailable or out of time.
+
+    Each pass gets at most slice_seconds of the total budget; the result says
+    stop_reason='time_budget' when the budget, not the work, ended the run.
+    passes=1 is exactly one ordinary refresh (the CLI); the browser's Continue
+    chart keeps going for two minutes. on_pass(result) observes every pass;
+    options (limit, restart, automatic, sync_index, cancel, progress) go to refresh().
+    """
+    deadline = time.monotonic() + seconds
+    done = 0
+    while True:
+        budget = min(slice_seconds, seconds) if not done else max(1, min(slice_seconds, deadline - time.monotonic()))
+        result = refresh(index_path, space_cache, source_cache, seconds=budget, **options)
+        done += 1
+        if on_pass:
+            on_pass(result)
+        if result['complete'] or result['paused'] or result.get('runtime_error') or result.get('index_error'):
+            return result
+        if passes is not None and done >= passes:
+            return result
+        if time.monotonic() >= deadline - 2:
+            return dict(result, stop_reason='time_budget')
 
 
 def _result(state, context, started, cached=False):

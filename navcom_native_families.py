@@ -4,10 +4,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import signal
 import subprocess
 import sys
 import tempfile
+
+from navcom_space import kill_group
 
 ENGINE = 'starforge.lineage.LineageDetector.detect_repo_lineages'
 MAX_DIRECTORIES = 2000
@@ -124,6 +125,5 @@ def analyze(directories, label, cache_path=None, seconds=3):
             return dict(status='unavailable', engine=ENGINE, families=[],
                         omitted=['Native version-family sampling unavailable: ' + type(exc).__name__ + '. Existing app sampling retained.'])
         finally:
-            if process and process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+            if process:
+                kill_group(process)

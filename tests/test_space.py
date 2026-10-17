@@ -1,9 +1,12 @@
 """Real metadata fixtures for cached spatial navigation, without client-name rules."""
 import fcntl
 import json
+import os
 from pathlib import Path
+import signal
 import sqlite3
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -849,3 +852,16 @@ def test_native_unfamiliar_expert_falls_out_of_normal_spatial_refresh(tmp_path):
     assert star["availability"]["state"] == "unknown" and not data["coverage"]["stars"]["live_checks"]
     refreshed = space.refresh(API, None, cache, source_cache=sources)
     assert refreshed["coverage"]["stars"]["batches"][0]["cache_hit"]
+
+
+@pytest.mark.parametrize("race", [ProcessLookupError, PermissionError])
+def test_kill_group_tolerates_a_group_that_exits_first(monkeypatch, race):
+    """macOS reports EPERM (zombie-only group) or ESRCH when the worker wins the race."""
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+    def raced(pid, sig):
+        os.kill(pid, signal.SIGKILL)  # the group dies just before our kill
+        raise race()
+    monkeypatch.setattr(space.os, "killpg", raced)
+    space.kill_group(process)
+    assert process.returncode is not None
+    space.kill_group(process)  # already reaped: nothing to do

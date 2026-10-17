@@ -12,11 +12,12 @@ from pathlib import Path
 import re
 import shlex
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
 import time
+
+from navcom_space import kill_group
 
 
 class StarChatError(ValueError):
@@ -29,6 +30,7 @@ EFFECTS = [
     "Hermes may save the conversation and update its native session or skill files.",
     "NavCom does not enforce time or output limits after the command opens in a native terminal; use that terminal to interrupt it.",
 ]
+PREPARE_SECONDS = 15  # Metadata preparation budget; reported as preparation_bounds.seconds.
 
 # The installed Python entry point, with its import location pinned before any
 # Hermes module loads. -I ignores ambient PYTHONPATH/PYTHONHOME and user sites.
@@ -250,22 +252,19 @@ def _run(request, seconds):
                     raise StarChatError(result.get("error", "Expert preparation failed"))
                 return result["value"]
             finally:
-                if process.poll() is None:
-                    os.killpg(process.pid, signal.SIGKILL); process.wait()
+                kill_group(process)
 
 
-def _prepare(center, question, cache_path, *, seconds, observe):
+def _prepare(center, question, cache_path, *, observe):
     if not isinstance(question, str) or not question.strip() or len(question) > 4000 or any((ord(c) < 32 and c not in "\n\t") or 127 <= ord(c) <= 159 for c in question):
         raise StarChatError("Supply a question of 1–4,000 characters without terminal control characters")
-    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool) or not 0 < seconds <= 30:
-        raise StarChatError("Preparation time must be positive and at most 30 seconds")
     candidate = center.get("star")
     if center.get("kind") != "star" or not isinstance(candidate, dict) or center.get("id") != candidate.get("id"):
         raise StarChatError("Select one star with recorded provider identity")
     if len(json.dumps(candidate)) > 256 * 1024:
         raise StarChatError("Selected expert metadata exceeds the review budget")
     cache = str(Path(cache_path).expanduser().resolve())
-    result = _run(dict(candidate=candidate, question=question, cache=cache, seconds=seconds, observe=observe), seconds)
+    result = _run(dict(candidate=candidate, question=question, cache=cache, seconds=PREPARE_SECONDS, observe=observe), PREPARE_SECONDS)
     fresh = result["candidate"]
     # Observed runtime state and clock times are not part of consent identity;
     # metadata, configured runtime, exact question and local provider bytes are.
@@ -277,22 +276,22 @@ def _prepare(center, question, cache_path, *, seconds, observe):
     return dict(schema_version=1, action="ask_agent", mode="native_handoff", state="review_required",
                 star_id=center["id"], provider=fresh["provider"], provider_identity=fresh["provider_identity"],
                 label=fresh["name"], description=fresh["description"], qualification=fresh["qualification"],
-                question=question, review_token=review_token, handoff=dict(argv=result["argv"], cwd=result["cwd"], env=environment, environment=environment, command=command),
+                question=question, review_token=review_token, handoff=dict(argv=result["argv"], cwd=result["cwd"], env=environment, command=command),
                 effects=EFFECTS, execution=dict(question_sent=False, agent_started=False, navcom_executes_chat=False,
                     tools_disabled=False, inference_only_verified=False, native_time_limit=None, native_output_limit=None),
                 readiness="unverified", observation=result["observation"], metadata_observed_at=result["metadata_observed_at"],
                 metadata_fingerprint=result["metadata_fingerprint"], coverage=result["coverage"],
-                preparation_bounds=dict(seconds=seconds, output_bytes=2 * 1024 * 1024),
+                preparation_bounds=dict(seconds=PREPARE_SECONDS, output_bytes=2 * 1024 * 1024),
                 gaps=["Native chat is agentic; no supported inference-only CLI contract was verified",
                       "Container Hermes flags and loaded context have not been inspected" if fresh["provider"] == "hermes-compose" else "The installed provider reads its own private configuration when launched"])
 
 
-def prepare(center, question, cache_path, *, seconds=15):
+def prepare(center, question, cache_path):
     """Build a review without contacting Docker, a gateway or any model."""
-    return _prepare(center, question, cache_path, seconds=seconds, observe=False)
+    return _prepare(center, question, cache_path, observe=False)
 
 
-def handoff(center, question, cache_path, *, review_token, seconds=15):
+def handoff(center, question, cache_path, *, review_token):
     """Revalidate an explicitly reviewed handoff; return it without launching it.
 
     A review token detects stale inputs; it is not an authorization credential.
@@ -300,7 +299,7 @@ def handoff(center, question, cache_path, *, review_token, seconds=15):
     """
     if not isinstance(review_token, str) or not re.fullmatch(r"[a-f0-9]{64}", review_token):
         raise StarChatError("Review this question and expert before opening Hermes")
-    result = _prepare(center, question, cache_path, seconds=seconds, observe=True)
+    result = _prepare(center, question, cache_path, observe=True)
     if result["review_token"] != review_token:
         raise StarChatError("The question, expert metadata or runtime changed; review the handoff again")
     return dict(result, state="ready_for_native_handoff")

@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import shlex
-import signal
 import subprocess
 import sys
 import tempfile
@@ -137,9 +136,7 @@ def _run(request, seconds):
                 raise history.HistoryError(result.get("error", "Historical worker unavailable"), result.get("coverage"))
             return result["value"]
         finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+            space.kill_group(process)
 
 
 def _chart(plan, completed):
@@ -154,7 +151,7 @@ def _chart(plan, completed):
             if result.get("error"):
                 row["historical_gap"] = result["error"]; continue
             data = result["data"]; scopes = pin["include"]
-            files = [f["path"] for f in data["snapshot"]["files"] if any(p == "." or f["path"] == p or f["path"].startswith(p + "/") for p in scopes)]
+            files = [f["path"] for f in data["snapshot"]["files"] if space.in_scopes(f["path"], scopes)]
             if not files:
                 row["historical_gap"] = "Selected current address has no supported files at this commit; renamed paths are not followed"; continue
             manifests = [m for m in data["manifests"] if str(Path(m["path"]).parent) in scopes]
@@ -185,7 +182,7 @@ def _chart(plan, completed):
                        evidence=[dict(type="committed_tree", repository=data["repository"], commit=data["commit"], tree=data["tree"],
                                       authored_at=data["authored_at"], committed_at=data["committed_at"], include=scopes)],
                        commit=data["commit"],tree=data["tree"],committed_at=data["committed_at"],authored_at=data["authored_at"],
-                       structure=dict(data["structure"],token_groups=[g for g in data["structure"].get("token_groups",[]) if all(any(p=="." or f==p or f.startswith(p+"/") for p in scopes) for f in g.get("paths",[]))]), snapshot_path=data["snapshot"]["snapshot_path"])
+                       structure=dict(data["structure"],token_groups=[g for g in data["structure"].get("token_groups",[]) if all(space.in_scopes(f, scopes) for f in g.get("paths",[]))]), snapshot_path=data["snapshot"]["snapshot_path"])
         nodes.append(row)
     shown={n["id"] for n in nodes}
     return dict(nodes=nodes, entities=nodes, edges=[dict(source=n["parent_id"], target=n["id"], relation="current_navigation_address") for n in nodes if n.get("parent_id") in shown])

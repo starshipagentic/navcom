@@ -7,7 +7,6 @@ project-carried code, credential files and current host conversations are absent
 """
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import os
@@ -19,7 +18,7 @@ import tempfile
 import time
 
 from navcom_ship_boarding import BoardingError, _installed_path, _selection
-from navcom_ship_inspection import _text
+from navcom_ship_inspection import _text, commission_tools
 from navcom_source_reader import _open
 
 
@@ -101,7 +100,7 @@ def _catalog(root):
 
 
 def _tool(root, tool_root):
-    directory = Path(tool_root or Path.home() / '.codex/skills/ship-commission/scripts').expanduser()
+    directory = Path(tool_root or commission_tools()).expanduser()
     if not directory.is_absolute() or '.starship' in directory.parts:
         raise ContextError('Use independently installed ship-commission tools.')
     value, identity = _installed_path(str(directory / 'navcom.py'), root)
@@ -262,72 +261,3 @@ def read_context(entity, *, action='search', query='', ref='', turn=None, offset
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return _unavailable(result, exc)
     return result
-
-
-def render(data):
-    """Human CLI output keeps provenance and native turn addresses visible."""
-    print((data.get('label') or data.get('ship_id') or 'Ship')+' · carried context · '+data['state'])
-    if data['state'] != 'available':
-        print(data.get('reason', 'Carried context is unavailable.'))
-        print(data['policy'])
-        return
-    if data.get('context_kind') == 'handover':
-        print('\n'+data['text'])
-        print('\nHandover file: '+data['provenance']['path'])
-    elif data['action'] == 'inspect':
-        print(str(data['total_sessions'])+' carried sessions')
-        for session in data.get('sessions', []):
-            print(session['id']+' · '+session['provider']+' · '+(session['title'] or session['project']))
-    else:
-        for message in data.get('messages', []):
-            print('\n'+message['id']+' · turn '+str(message['index'])+' · '+str(message.get('role','')))
-            print(message['text'])
-            if message.get('text_truncated'):
-                print('[Original message clipped to the requested character limit.]')
-        if not data.get('messages'):
-            print('No matching carried messages in this window.')
-    if data.get('next_offset') is not None:
-        print('\nContinue: '+data['continue_command'] if data.get('continue_command') else
-              '\nContinue with --offset '+str(data['next_offset']))
-    if data['provenance'].get('catalog_sha256'):
-        print('\nCarried catalog: '+data['provenance']['catalog_sha256'])
-    if data.get('cli_command'):
-        print('\nReplay: '+data['cli_command'])
-    print('\n'+data['policy'])
-
-
-def main(argv=None):
-    """Small CLI proof surface; the main atlas CLI can call this shared API."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--space-cache', required=True, type=Path)
-    parser.add_argument('--within', required=True, help='Exact catalog ship ID or unique name.')
-    parser.add_argument('--offset', type=int, default=0)
-    parser.add_argument('--limit', type=int, default=10)
-    parser.add_argument('--max-chars', type=int, default=2000)
-    parser.add_argument('--expected-catalog', default='', help='Keep the exact catalog generation from a prior search.')
-    sub = parser.add_subparsers(dest='action', required=True)
-    sub.add_parser('inspect')
-    sub.add_parser('search').add_argument('query')
-    opening = sub.add_parser('open')
-    opening.add_argument('ref')
-    opening.add_argument('--turn', type=int)
-    sub.add_parser('handover')
-    args = parser.parse_args(argv)
-    try:
-        import navcom_space
-        entity = navcom_space.view(args.space_cache, action='show', within=args.within)['center']
-        if args.action == 'inspect':
-            result = inspect_context(entity, offset=args.offset, limit=args.limit, expected_catalog=args.expected_catalog)
-        else:
-            result = read_context(entity, action=args.action, query=getattr(args, 'query', ''),
-                                  ref=getattr(args, 'ref', ''), turn=getattr(args, 'turn', None),
-                                  offset=args.offset, limit=args.limit, max_chars=args.max_chars,
-                                  expected_catalog=args.expected_catalog)
-        print(json.dumps(result, ensure_ascii=False))
-        return 0 if result['state'] == 'available' else 2
-    except (OSError, ValueError) as exc:
-        parser.error(str(exc))
-
-
-if __name__ == '__main__':
-    raise SystemExit(main())

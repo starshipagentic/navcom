@@ -17,7 +17,7 @@ import sys
 import time
 
 from navcom_ship_context import _read
-from navcom_ship_inspection import _safe_path, _tool_identity, _write, _writer
+from navcom_ship_inspection import _safe_path, _tool_identity, _write, _writer, commission_tools
 from navcom_source_reader import _open
 
 
@@ -121,7 +121,7 @@ def discover(entities, snapshot_path, *, cache_path=None, tool_root=None, limit=
         return dict(entities=[], coverage=coverage)
     project = snapshot.parent.parent
     commission = project / '.starship' / 'commission'
-    selected_tool = Path(tool_root or Path.home()/'.codex/skills/ship-commission/scripts').expanduser()
+    selected_tool = Path(tool_root or commission_tools()).expanduser()
     cache = Path(cache_path or os.environ.get('NAVCOM_FLEET_CACHE', '~/.cache/navcom/fleet-archives.json')).expanduser().absolute()
     # Caller-configured cache folders can use the OS /tmp alias; its leaf still
     # must be an ordinary file and is never followed through a symlink.
@@ -249,7 +249,7 @@ def discover(entities, snapshot_path, *, cache_path=None, tool_root=None, limit=
         observation=value['observation'];record=candidate['record'];observed_at=value['observed_at']
         next_cache[str(root)]=dict(signature=candidate['signature'],**value)
         archive_id=_key('ship',record['id'],'archive',hostname,str(root))
-        output.append(dict(id=archive_id,kind='ship',form='archive',art_role='archive',
+        output.append(dict(id=archive_id,kind='ship',form='archive',
             label=record.get('label',record['id'])+' · archive',parent_id=None,related_ship_id=record['id'],
             record_id=record.get('record_id'),source_roots=list(record.get('source_roots',[])),
             description='Local commission archive; separate from its recorded working ship.',

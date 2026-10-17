@@ -6,7 +6,6 @@ classify products, implement search, copy files, or change the source projects.
 
 import contextlib
 import fnmatch
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,6 +17,7 @@ import time
 from collections import Counter, deque
 
 from navcom_discovery import Discovery
+from navcom_sources import source_id
 
 
 MAX_METADATA_FILES = 160
@@ -425,324 +425,319 @@ class _GitIgnoreTree:
 
 def _metadata(root, max_files=10000, max_bytes=64 * 1024 * 1024, max_file_bytes=2 * 1024 * 1024,
               *, project_boundaries=(), container=False, family_cache=None):
-    with _GitIgnoreTree(root) as ignore:
-        return _select_metadata(root, ignore, max_files, max_bytes, max_file_bytes,
-                                project_boundaries, container, family_cache)
-
-
-def _select_metadata(root, ignore, max_files, max_bytes, max_file_bytes, project_boundaries, container, family_cache):
     """Select metadata first, then code fairly across declared workspace roots.
 
-    The historical private name is retained for callers. Only metadata is read
-    here; code bytes, native grouping and search belong to the harvest worker.
-    Budgets describe observed omissions, never a claim about unvisited folders.
+    Only metadata is read here; code bytes, native grouping and search belong
+    to the harvest worker. Budgets describe observed omissions, never a claim
+    about unvisited folders.
     """
-    selected = set()
-    selected_kinds = Counter()
-    selected_bytes = Counter()
-    attempted = set()
-    excluded = []
-    excluded_counts = Counter()
-    limited = []
-    total_bytes = 0
-    inspected_dirs = 0
-    inspected_entries = 0
-    directory_cache = {}
+    with _GitIgnoreTree(root) as ignore:
+        selected = set()
+        selected_kinds = Counter()
+        selected_bytes = Counter()
+        attempted = set()
+        excluded = []
+        excluded_counts = Counter()
+        limited = []
+        total_bytes = 0
+        inspected_dirs = 0
+        inspected_entries = 0
+        directory_cache = {}
 
-    def reject(path, reason):
-        item = {"path": str(path.relative_to(root)), "reason": reason}
-        # A directory can be reached through metadata and code traversal.
-        key = (item["path"], reason)
-        if key in rejected:
-            return
-        rejected.add(key)
-        excluded_counts[reason] += 1
-        if len(excluded) < 500:
-            excluded.append(item)
+        def reject(path, reason):
+            item = {"path": str(path.relative_to(root)), "reason": reason}
+            # A directory can be reached through metadata and code traversal.
+            key = (item["path"], reason)
+            if key in rejected:
+                return
+            rejected.add(key)
+            excluded_counts[reason] += 1
+            if len(excluded) < 500:
+                excluded.append(item)
 
-    rejected = set()
+        rejected = set()
 
-    def needs_ignore_policy(path):
-        """Do not ask Git about bytes this intake can never select or traverse."""
-        relative = path.relative_to(root)
-        if any(part.startswith(".") or part.casefold() in EXCLUDED_DIRS for part in relative.parts) or path.is_symlink():
-            return False
-        return (path.is_dir() or path.name in METADATA_NAMES or _expertise_document(path)
-                or path.suffix.lower() in CODE_SUFFIXES | {".md"})
-
-    def children(folder):
-        nonlocal inspected_dirs, inspected_entries
-        if folder in directory_cache:
-            return directory_cache[folder]
-        inspected_dirs += 1
-        if inspected_dirs > MAX_DIRECTORIES:
-            limited.append("directory budget exceeded")
-            reject(folder, "directory budget; subtree unvisited")
-            directory_cache[folder] = []
-            return []
-        try:
-            entries = []
-            with os.scandir(folder) as items:
-                for item in items:
-                    inspected_entries += 1
-                    if inspected_entries > MAX_ENTRIES:
-                        limited.append("directory entry budget exceeded")
-                        # Do not choose an arbitrary OS-order prefix. Omit this
-                        # folder altogether when it cannot be enumerated safely.
-                        entries = []
-                        reject(folder, "directory entry budget; folder unvisited")
-                        break
-                    entries.append(folder / item.name)
-            entries.sort(key=lambda p: p.name)
-            ignore.register(folder)
-            ignore.check([path for path in entries if needs_ignore_policy(path)])
-            directory_cache[folder] = entries
-        except OSError as exc:
-            reject(folder, type(exc).__name__)
-            directory_cache[folder] = []
-        return directory_cache[folder]
-
-    def safe(path):
-        relative = path.relative_to(root)
-        if any(part.startswith(".") or part.casefold() in EXCLUDED_DIRS for part in relative.parts):
-            reject(path, "hidden, secret or generated path")
-            return False
-        if any((root.joinpath(*relative.parts[:i])).is_symlink()
-               for i in range(1, len(relative.parts) + 1)):
-            reject(path, "symlink")
-            return False
-        if container:
-            if any(path == boundary or boundary in path.parents for boundary in project_boundaries):
-                reject(path, "indexed child project delegated to its own source")
+        def needs_ignore_policy(path):
+            """Do not ask Git about bytes this intake can never select or traverse."""
+            relative = path.relative_to(root)
+            if any(part.startswith(".") or part.casefold() in EXCLUDED_DIRS for part in relative.parts) or path.is_symlink():
                 return False
-            if path.is_dir() and (path / ".git").exists():
-                reject(path, "nested Git repository omitted from container scope")
-                return False
-            if path.is_dir() and _has_project_manifest(path):
-                reject(path, "nested product manifest omitted from container scope")
-                return False
-        # Unsupported assets are rejected by the existing selection rules;
-        # their Git policy cannot turn them into automatic source inputs.
-        if not needs_ignore_policy(path):
-            return True
-        ignore.check([path])
-        if ignore.decisions.get(path):
-            reject(path, ignore.reasons.get(path, "Git ignore policy unavailable"))
-            return False
-        return True
+            return (path.is_dir() or path.name in METADATA_NAMES or _expertise_document(path)
+                    or path.suffix.lower() in CODE_SUFFIXES | {".md"})
 
-    def add(path, kind="metadata"):
-        nonlocal total_bytes
-        if path in attempted or not safe(path) or not path.is_file():
-            return
-        attempted.add(path)
-        try:
-            size = path.stat().st_size
-        except OSError as exc:
-            reject(path, type(exc).__name__)
-            return
-        file_limit = min(max_file_bytes, MAX_METADATA_FILE_BYTES if kind == "metadata" else MAX_CODE_FILE_BYTES)
-        count_limit = MAX_METADATA_FILES if kind == "metadata" else MAX_CODE_FILES
-        byte_limit = MAX_METADATA_BYTES if kind == "metadata" else MAX_CODE_BYTES
-        if size > file_limit:
-            reject(path, kind + " file size limit")
-            return
-        if selected_kinds[kind] >= count_limit or selected_bytes[kind] + size > byte_limit:
-            limited.append(kind + " file/byte budget exceeded")
-            reject(path, kind + " file/byte budget")
-            return
-        if len(selected) >= max_files or total_bytes + size > max_bytes:
-            limited.append("registered source file/byte budget exceeded")
-            reject(path, "registered source file/byte budget")
-            return
-        selected.add(path)
-        selected_kinds[kind] += 1
-        selected_bytes[kind] += size
-        total_bytes += size
-
-    def patterns(folder):
-        found = []
-        package = folder / "package.json"
-        if package in selected:
-            try:
-                data = json.loads(package.read_text())
-                workspace = data.get("workspaces", [])
-                if isinstance(workspace, dict):
-                    workspace = workspace.get("packages", [])
-                if isinstance(workspace, list):
-                    found.extend(p for p in workspace if isinstance(p, str))
-            except (OSError, ValueError, AttributeError):
-                reject(package, "invalid package manifest")
-        for filename, parent in (("pyproject.toml", "tool"), ("Cargo.toml", "workspace")):
-            manifest = folder / filename
-            if manifest not in selected:
-                continue
-            try:
-                import tomllib
-                data = tomllib.loads(manifest.read_text())
-                workspace = (data.get("tool", {}).get("uv", {}).get("workspace", {})
-                             if parent == "tool" else data.get("workspace", {}))
-                members = workspace.get("members", [])
-                if isinstance(members, list):
-                    found.extend(p for p in members if isinstance(p, str))
-            except ImportError:
-                reject(manifest, "workspace TOML requires Python 3.11 or newer")
-            except (OSError, ValueError, AttributeError):
-                reject(manifest, "invalid workspace manifest")
-        # pnpm's YAML is retained for Starforge, but not partially parsed here.
-        if folder / "pnpm-workspace.yaml" in selected and not found:
-            limited.append("pnpm workspace retained; YAML membership was not parsed")
-        return found
-
-    def expand(folder, pattern):
-        parts = Path(pattern).parts
-        if not parts or Path(pattern).is_absolute() or ".." in parts or pattern.startswith("!"):
-            limited.append("unsupported workspace pattern: " + pattern)
-            return []
-        candidates = [folder]
-        for component in parts:
-            if component == ".":
-                continue
-            if component == "**":
-                limited.append("recursive workspace glob omitted: " + pattern)
+        def children(folder):
+            nonlocal inspected_dirs, inspected_entries
+            if folder in directory_cache:
+                return directory_cache[folder]
+            inspected_dirs += 1
+            if inspected_dirs > MAX_DIRECTORIES:
+                limited.append("directory budget exceeded")
+                reject(folder, "directory budget; subtree unvisited")
+                directory_cache[folder] = []
                 return []
-            next_candidates = []
-            for current in candidates:
-                for child in children(current):
-                    if fnmatch.fnmatchcase(child.name, component) and safe(child) and child.is_dir():
-                        if len(child.relative_to(root).parts) > MAX_DEPTH:
-                            limited.append("workspace depth budget exceeded")
-                        else:
-                            next_candidates.append(child)
-            candidates = next_candidates
-        return candidates
+            try:
+                entries = []
+                with os.scandir(folder) as items:
+                    for item in items:
+                        inspected_entries += 1
+                        if inspected_entries > MAX_ENTRIES:
+                            limited.append("directory entry budget exceeded")
+                            # Do not choose an arbitrary OS-order prefix. Omit this
+                            # folder altogether when it cannot be enumerated safely.
+                            entries = []
+                            reject(folder, "directory entry budget; folder unvisited")
+                            break
+                        entries.append(folder / item.name)
+                entries.sort(key=lambda p: p.name)
+                ignore.register(folder)
+                ignore.check([path for path in entries if needs_ignore_policy(path)])
+                directory_cache[folder] = entries
+            except OSError as exc:
+                reject(folder, type(exc).__name__)
+                directory_cache[folder] = []
+            return directory_cache[folder]
 
-    pending = [root]
-    application_roots = set()
-    while pending:
-        folder = pending.pop(0)
-        if folder in application_roots:
-            continue
-        application_roots.add(folder)
-        for path in children(folder):
-            if path.name in METADATA_NAMES or _expertise_document(path):
-                add(path)
-        for pattern in patterns(folder):
-            pending.extend(expand(folder, pattern))
-        docs = folder / "docs"
-        if docs.is_dir() and safe(docs):
-            doc_folders = [(docs, 0)]
-            while doc_folders:
-                current, depth = doc_folders.pop(0)
-                for path in children(current):
+        def safe(path):
+            relative = path.relative_to(root)
+            if any(part.startswith(".") or part.casefold() in EXCLUDED_DIRS for part in relative.parts):
+                reject(path, "hidden, secret or generated path")
+                return False
+            if any((root.joinpath(*relative.parts[:i])).is_symlink()
+                   for i in range(1, len(relative.parts) + 1)):
+                reject(path, "symlink")
+                return False
+            if container:
+                if any(path == boundary or boundary in path.parents for boundary in project_boundaries):
+                    reject(path, "indexed child project delegated to its own source")
+                    return False
+                if path.is_dir() and (path / ".git").exists():
+                    reject(path, "nested Git repository omitted from container scope")
+                    return False
+                if path.is_dir() and _has_project_manifest(path):
+                    reject(path, "nested product manifest omitted from container scope")
+                    return False
+            # Unsupported assets are rejected by the existing selection rules;
+            # their Git policy cannot turn them into automatic source inputs.
+            if not needs_ignore_policy(path):
+                return True
+            ignore.check([path])
+            if ignore.decisions.get(path):
+                reject(path, ignore.reasons.get(path, "Git ignore policy unavailable"))
+                return False
+            return True
+
+        def add(path, kind="metadata"):
+            nonlocal total_bytes
+            if path in attempted or not safe(path) or not path.is_file():
+                return
+            attempted.add(path)
+            try:
+                size = path.stat().st_size
+            except OSError as exc:
+                reject(path, type(exc).__name__)
+                return
+            file_limit = min(max_file_bytes, MAX_METADATA_FILE_BYTES if kind == "metadata" else MAX_CODE_FILE_BYTES)
+            count_limit = MAX_METADATA_FILES if kind == "metadata" else MAX_CODE_FILES
+            byte_limit = MAX_METADATA_BYTES if kind == "metadata" else MAX_CODE_BYTES
+            if size > file_limit:
+                reject(path, kind + " file size limit")
+                return
+            if selected_kinds[kind] >= count_limit or selected_bytes[kind] + size > byte_limit:
+                limited.append(kind + " file/byte budget exceeded")
+                reject(path, kind + " file/byte budget")
+                return
+            if len(selected) >= max_files or total_bytes + size > max_bytes:
+                limited.append("registered source file/byte budget exceeded")
+                reject(path, "registered source file/byte budget")
+                return
+            selected.add(path)
+            selected_kinds[kind] += 1
+            selected_bytes[kind] += size
+            total_bytes += size
+
+        def patterns(folder):
+            found = []
+            package = folder / "package.json"
+            if package in selected:
+                try:
+                    data = json.loads(package.read_text())
+                    workspace = data.get("workspaces", [])
+                    if isinstance(workspace, dict):
+                        workspace = workspace.get("packages", [])
+                    if isinstance(workspace, list):
+                        found.extend(p for p in workspace if isinstance(p, str))
+                except (OSError, ValueError, AttributeError):
+                    reject(package, "invalid package manifest")
+            for filename, parent in (("pyproject.toml", "tool"), ("Cargo.toml", "workspace")):
+                manifest = folder / filename
+                if manifest not in selected:
+                    continue
+                try:
+                    import tomllib
+                    data = tomllib.loads(manifest.read_text())
+                    workspace = (data.get("tool", {}).get("uv", {}).get("workspace", {})
+                                 if parent == "tool" else data.get("workspace", {}))
+                    members = workspace.get("members", [])
+                    if isinstance(members, list):
+                        found.extend(p for p in members if isinstance(p, str))
+                except ImportError:
+                    reject(manifest, "workspace TOML requires Python 3.11 or newer")
+                except (OSError, ValueError, AttributeError):
+                    reject(manifest, "invalid workspace manifest")
+            # pnpm's YAML is retained for Starforge, but not partially parsed here.
+            if folder / "pnpm-workspace.yaml" in selected and not found:
+                limited.append("pnpm workspace retained; YAML membership was not parsed")
+            return found
+
+        def expand(folder, pattern):
+            parts = Path(pattern).parts
+            if not parts or Path(pattern).is_absolute() or ".." in parts or pattern.startswith("!"):
+                limited.append("unsupported workspace pattern: " + pattern)
+                return []
+            candidates = [folder]
+            for component in parts:
+                if component == ".":
+                    continue
+                if component == "**":
+                    limited.append("recursive workspace glob omitted: " + pattern)
+                    return []
+                next_candidates = []
+                for current in candidates:
+                    for child in children(current):
+                        if fnmatch.fnmatchcase(child.name, component) and safe(child) and child.is_dir():
+                            if len(child.relative_to(root).parts) > MAX_DEPTH:
+                                limited.append("workspace depth budget exceeded")
+                            else:
+                                next_candidates.append(child)
+                candidates = next_candidates
+            return candidates
+
+        pending = [root]
+        application_roots = set()
+        while pending:
+            folder = pending.pop(0)
+            if folder in application_roots:
+                continue
+            application_roots.add(folder)
+            for path in children(folder):
+                if path.name in METADATA_NAMES or _expertise_document(path):
+                    add(path)
+            for pattern in patterns(folder):
+                pending.extend(expand(folder, pattern))
+            docs = folder / "docs"
+            if docs.is_dir() and safe(docs):
+                doc_folders = [(docs, 0)]
+                while doc_folders:
+                    current, depth = doc_folders.pop(0)
+                    for path in children(current):
+                        if not safe(path):
+                            continue
+                        if path.is_file() and path.suffix.lower() == ".md":
+                            add(path)
+                        elif path.is_dir() and depth < 1:
+                            doc_folders.append((path, depth + 1))
+                        elif path.is_dir():
+                            limited.append("docs beyond two directory levels omitted")
+                            reject(path, "docs depth budget; subtree unvisited")
+        # This same bounded walk finds nested manifests and expertise documents.
+        # Collect code paths (not bytes) until boundaries are known, then sample each
+        # manifest root fairly. A repository without workspaces must not exhaust its
+        # code budget before an independently runnable nested app gets a turn.
+        def code_files(app_root):
+            folders = deque([(app_root, 0)])
+            while folders:
+                folder, depth = folders.popleft()
+                for path in children(folder):
                     if not safe(path):
                         continue
-                    if path.is_file() and path.suffix.lower() == ".md":
-                        add(path)
-                    elif path.is_dir() and depth < 1:
-                        doc_folders.append((path, depth + 1))
-                    elif path.is_dir():
-                        limited.append("docs beyond two directory levels omitted")
-                        reject(path, "docs depth budget; subtree unvisited")
-    # This same bounded walk finds nested manifests and expertise documents.
-    # Collect code paths (not bytes) until boundaries are known, then sample each
-    # manifest root fairly. A repository without workspaces must not exhaust its
-    # code budget before an independently runnable nested app gets a turn.
-    def code_files(app_root):
-        folders = deque([(app_root, 0)])
-        while folders:
-            folder, depth = folders.popleft()
-            for path in children(folder):
-                if not safe(path):
-                    continue
-                if path.is_dir():
-                    if path in application_roots and path != app_root:
-                        continue
-                    if depth >= MAX_DEPTH:
-                        limited.append("code depth budget exceeded")
-                        reject(path, "code depth budget; subtree unvisited")
-                    else:
-                        folders.append((path, depth + 1))
-                elif path.is_file() and path not in attempted:
-                    if path.name in NESTED_MANIFESTS or _expertise_document(path):
-                        yield path, "metadata"
-                    elif path.suffix.lower() not in CODE_SUFFIXES:
-                        reject(path, "not an automatic code or metadata input")
-                    elif any(marker in path.name.lower() for marker in (".min.", ".generated.", ".gen.", "_pb2.")):
-                        reject(path, "generated code file")
-                    else:
-                        yield path, "code"
+                    if path.is_dir():
+                        if path in application_roots and path != app_root:
+                            continue
+                        if depth >= MAX_DEPTH:
+                            limited.append("code depth budget exceeded")
+                            reject(path, "code depth budget; subtree unvisited")
+                        else:
+                            folders.append((path, depth + 1))
+                    elif path.is_file() and path not in attempted:
+                        if path.name in NESTED_MANIFESTS or _expertise_document(path):
+                            yield path, "metadata"
+                        elif path.suffix.lower() not in CODE_SUFFIXES:
+                            reject(path, "not an automatic code or metadata input")
+                        elif any(marker in path.name.lower() for marker in (".min.", ".generated.", ".gen.", "_pb2.")):
+                            reject(path, "generated code file")
+                        else:
+                            yield path, "code"
 
-    streams = deque(iter(code_files(app)) for app in sorted(application_roots))
-    code_candidates = []
-    while streams:
-        stream = streams.popleft()
-        item = next(stream, None)
-        if item is not None:
-            if item[1] == "metadata":
-                add(*item)
-            else:
-                code_candidates.append(item[0])
-            streams.append(stream)
-    manifest_roots = {path.parent for path in selected if path.name in NESTED_MANIFESTS}
-    # Reuse the same native family adapter as the relationship view. Its inputs
-    # are already accepted paths from this bounded walk, never an extra scan.
-    directories = {parent.relative_to(root) for file in code_candidates for parent in file.parents
-                   if parent != root and root in parent.parents}
-    from navcom_native_families import analyze
-    family_analysis = analyze(directories, root.name, family_cache) if len(directories) > 1 else dict(
-        status="not-needed", families=[], omitted=[])
-    # Runtime cache hits are telemetry, not source metadata: toggling them must
-    # not invalidate an otherwise unchanged harvest receipt.
-    family_analysis.pop("cached", None)
-    limited.extend(family_analysis.get("omitted", []))
-    version_roots = {root / member["path"] for family in family_analysis["families"] for member in family["members"]}
-    sampling_roots = application_roots | manifest_roots | version_roots
-    by_root = {folder: deque() for folder in sorted(sampling_roots)}
-    for candidate in code_candidates:
-        owner = max((folder for folder in sampling_roots if folder == candidate.parent or folder in candidate.parents),
-                    key=lambda folder: len(folder.parts))
-        by_root[owner].append(candidate)
-    pending_code = deque(files for files in by_root.values() if files)
-    while pending_code:
-        files = pending_code.popleft()
-        add(files.popleft(), "code")
-        if files:
-            pending_code.append(files)
-    ignore_policy = ignore.coverage()
-    if ignore_policy["unknown_paths"]:
-        limited.append("Git ignore policy unavailable; unchecked automatic paths omitted")
-    if any("declaration_error" in owner for owner in ignore_policy["owners"]):
-        limited.append("Git submodule declaration metadata unavailable; native path decisions remain authoritative")
-    return sorted(str(p.relative_to(root)) for p in selected), {
-        "metadata_files": selected_kinds["metadata"], "metadata_bytes": selected_bytes["metadata"],
-        "code_files": selected_kinds["code"], "code_bytes": selected_bytes["code"],
-        "selected_files": len(selected), "selected_bytes": total_bytes,
-        "inspected_directories": min(inspected_dirs, MAX_DIRECTORIES),
-        "inspected_entries": min(inspected_entries, MAX_ENTRIES),
-        "application_roots": sorted(str(p.relative_to(root)) for p in application_roots),
-        "manifest_roots": sorted(str(p.relative_to(root)) for p in manifest_roots),
-        "version_sampling": family_analysis,
-        "version_roots": sorted(str(p.relative_to(root)) for p in version_roots),
-        "code_sampling": "Round-robin across declared workspaces, retained manifest roots and native version-family members; sampling buckets do not establish products or ancestry.",
-        "excluded": sorted(excluded, key=lambda e: (e["path"], e["reason"])),
-        "excluded_counts": dict(sorted(excluded_counts.items())),
-        "excluded_details_truncated": len(rejected) > len(excluded),
-        "git_ignore": ignore_policy,
-        "limits": sorted(set(limited)),
-        "budgets": dict(metadata_files=MAX_METADATA_FILES, metadata_bytes=MAX_METADATA_BYTES,
-                        code_files=MAX_CODE_FILES, code_bytes=MAX_CODE_BYTES, code_file_bytes=MAX_CODE_FILE_BYTES,
-                        git_ignore_seconds=MAX_IGNORE_SECONDS, git_ignore_batch_bytes=MAX_IGNORE_BATCH_BYTES,
-                        git_ignore_owners=MAX_IGNORE_OWNERS, git_ignore_restarts_per_owner=MAX_IGNORE_RESTARTS,
-                        native_family_seconds=3,
-                        directories=MAX_DIRECTORIES, entries=MAX_ENTRIES, code_depth=MAX_DEPTH),
-        "omissions_meaning": "Counts cover observed files or directory roots; unvisited descendants are not counted.",
-        "full_repository": False,
-        "container_policy": dict(enabled=container,
-                                 basis="No native Git root or bounded project manifest" if container else
-                                       "Normal automatic source scope",
-                                 indexed_boundaries=[str(path.relative_to(root)) for path in project_boundaries] if container else []),
-    }
+        streams = deque(iter(code_files(app)) for app in sorted(application_roots))
+        code_candidates = []
+        while streams:
+            stream = streams.popleft()
+            item = next(stream, None)
+            if item is not None:
+                if item[1] == "metadata":
+                    add(*item)
+                else:
+                    code_candidates.append(item[0])
+                streams.append(stream)
+        manifest_roots = {path.parent for path in selected if path.name in NESTED_MANIFESTS}
+        # Reuse the same native family adapter as the relationship view. Its inputs
+        # are already accepted paths from this bounded walk, never an extra scan.
+        directories = {parent.relative_to(root) for file in code_candidates for parent in file.parents
+                       if parent != root and root in parent.parents}
+        from navcom_native_families import analyze
+        family_analysis = analyze(directories, root.name, family_cache) if len(directories) > 1 else dict(
+            status="not-needed", families=[], omitted=[])
+        # Runtime cache hits are telemetry, not source metadata: toggling them must
+        # not invalidate an otherwise unchanged harvest receipt.
+        family_analysis.pop("cached", None)
+        limited.extend(family_analysis.get("omitted", []))
+        version_roots = {root / member["path"] for family in family_analysis["families"] for member in family["members"]}
+        sampling_roots = application_roots | manifest_roots | version_roots
+        by_root = {folder: deque() for folder in sorted(sampling_roots)}
+        for candidate in code_candidates:
+            owner = max((folder for folder in sampling_roots if folder == candidate.parent or folder in candidate.parents),
+                        key=lambda folder: len(folder.parts))
+            by_root[owner].append(candidate)
+        pending_code = deque(files for files in by_root.values() if files)
+        while pending_code:
+            files = pending_code.popleft()
+            add(files.popleft(), "code")
+            if files:
+                pending_code.append(files)
+        ignore_policy = ignore.coverage()
+        if ignore_policy["unknown_paths"]:
+            limited.append("Git ignore policy unavailable; unchecked automatic paths omitted")
+        if any("declaration_error" in owner for owner in ignore_policy["owners"]):
+            limited.append("Git submodule declaration metadata unavailable; native path decisions remain authoritative")
+        return sorted(str(p.relative_to(root)) for p in selected), {
+            "metadata_files": selected_kinds["metadata"], "metadata_bytes": selected_bytes["metadata"],
+            "code_files": selected_kinds["code"], "code_bytes": selected_bytes["code"],
+            "selected_files": len(selected), "selected_bytes": total_bytes,
+            "inspected_directories": min(inspected_dirs, MAX_DIRECTORIES),
+            "inspected_entries": min(inspected_entries, MAX_ENTRIES),
+            "application_roots": sorted(str(p.relative_to(root)) for p in application_roots),
+            "manifest_roots": sorted(str(p.relative_to(root)) for p in manifest_roots),
+            "version_sampling": family_analysis,
+            "version_roots": sorted(str(p.relative_to(root)) for p in version_roots),
+            "code_sampling": "Round-robin across declared workspaces, retained manifest roots and native version-family members; sampling buckets do not establish products or ancestry.",
+            "excluded": sorted(excluded, key=lambda e: (e["path"], e["reason"])),
+            "excluded_counts": dict(sorted(excluded_counts.items())),
+            "excluded_details_truncated": len(rejected) > len(excluded),
+            "git_ignore": ignore_policy,
+            "limits": sorted(set(limited)),
+            "budgets": dict(metadata_files=MAX_METADATA_FILES, metadata_bytes=MAX_METADATA_BYTES,
+                            code_files=MAX_CODE_FILES, code_bytes=MAX_CODE_BYTES, code_file_bytes=MAX_CODE_FILE_BYTES,
+                            git_ignore_seconds=MAX_IGNORE_SECONDS, git_ignore_batch_bytes=MAX_IGNORE_BATCH_BYTES,
+                            git_ignore_owners=MAX_IGNORE_OWNERS, git_ignore_restarts_per_owner=MAX_IGNORE_RESTARTS,
+                            native_family_seconds=3,
+                            directories=MAX_DIRECTORIES, entries=MAX_ENTRIES, code_depth=MAX_DEPTH),
+            "omissions_meaning": "Counts cover observed files or directory roots; unvisited descendants are not counted.",
+            "full_repository": False,
+            "container_policy": dict(enabled=container,
+                                     basis="No native Git root or bounded project manifest" if container else
+                                           "Normal automatic source scope",
+                                     indexed_boundaries=[str(path.relative_to(root)) for path in project_boundaries] if container else []),
+        }
 
 
 def discover(api, index_path, cache_path, limit=200, offset=0, within=None, progress=None, *, projects=None,
@@ -815,7 +810,7 @@ def discover(api, index_path, cache_path, limit=200, offset=0, within=None, prog
             continue
         source = {k: v for k, v in old.items() if k not in ("artifact", "signature", "extractor", "coverage")}
         source.update(
-            id=hashlib.sha256(str(root).encode()).hexdigest()[:16], root=str(root),
+            id=source_id(root), root=str(root),
             label=old.get("label", root.name),
             include=list(dict.fromkeys(explicit + metadata)),
             discovery_include=metadata, discovery_coverage=scope,

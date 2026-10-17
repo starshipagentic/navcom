@@ -63,7 +63,7 @@ def test_native_archive_is_separate_cached_ship_with_unknown_readiness(tmp_path)
     assert remote['physical']['host']=='remote.example'
     assert remote['physical']['path']=='/remote/fleet/orchard/working'
     assert archive['id']!=remote['id'] and archive['related_ship_id']==remote['id']
-    assert archive['form']=='archive' and archive['art_role']=='archive'
+    assert archive['form']=='archive' and 'art_role' not in archive
     assert archive['parent_id'] is None
     assert archive['physical']['host']==socket.gethostname()
     assert archive['physical']['path']==str(project/'.starship/commission/orchard/archive')

@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 
-from navcom_ship_inspection import _absolute, _contains, _safe_path
+from navcom_ship_inspection import _absolute, _contains, _safe_path, commission_tools
 
 
 VERSION = 1
@@ -297,7 +297,7 @@ def _prepare(entity, route_path, tool_root, trusted_runtime):
                             coverage=coverage, candidates=[dict(path=p["path"], thread=r["thread"], cwd=r["cwd"])
                                                           for r, p in matched])
     route, provenance = matched[0]
-    tool_path = Path(tool_root or Path.home() / ".codex/skills/ship-commission/scripts").expanduser()
+    tool_path = Path(tool_root or commission_tools()).expanduser()
     tool = _tool_identity(tool_path, root)
     runtime, identity = _runtime(root, tool_path, trusted_runtime)
     for key in ("codex", "node", "ws_module"):

@@ -5,9 +5,9 @@ turns remain unavailable rather than borrowing a file mtime or a neighboring dat
 """
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import json
 from pathlib import Path
 import re
+import shlex
 import sqlite3
 import time
 
@@ -61,9 +61,8 @@ def _reader(connection):
 
 
 def _scope(cache, within):
-    path = Path(cache).expanduser()
     try:
-        data = navcom_space._read(path)
+        data = navcom_space.load_catalog(cache)
     except (OSError, ValueError) as error:
         raise HistoricalConversationError("Spatial catalog unavailable: " + str(error)) from error
     if not isinstance(data, dict) or data.get("schema_version") != navcom_space.SCHEMA_VERSION:
@@ -79,12 +78,7 @@ def _scope(cache, within):
         if len(matches) != 1:
             raise HistoricalConversationError("Spatial scope is ambiguous or unavailable; use an exact place ID")
         selected = matches[0]
-    selected_ids = {selected["id"]}
-    while True:
-        more = selected_ids | {n["id"] for n in nodes if n.get("parent_id") in selected_ids}
-        if more == selected_ids:
-            break
-        selected_ids = more
+    selected_ids = navcom_space.subtree(nodes, selected["id"])
     collections = {c for n in nodes if n["id"] in selected_ids for c in n.get("conversation_collections", [])}
     return selected, collections, data.get("published")
 
@@ -202,11 +196,12 @@ def _matches(api, conn, eligible, query, deadline, coverage):
 
 
 def view(api, conn, *, within="", as_of, space_cache, query="", limit=20,
-         max_turns=100000, seconds=5):
+         max_turns=100000, seconds=5, index_path=None):
     """Return bounded dated-turn evidence for a saved current place (read only).
 
     Date-only cutoffs mean midnight UTC, consistently with system history. The
     returned current place label is navigation metadata, never historical text.
+    cli_command repeats this read; index_path defaults to the open index.
     """
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
         raise HistoricalConversationError("limit must be an integer between 1 and 200")
@@ -311,6 +306,14 @@ def view(api, conn, *, within="", as_of, space_cache, query="", limit=20,
         gaps.append("Some saved conversation collections could not be resolved from indexed project metadata.")
     if coverage["unresolved_project_sessions"]:
         gaps.append("Some indexed sessions lack a resolved current project address; their membership in this place is unknown.")
+    index = str(index_path) if index_path else (conn.execute("PRAGMA database_list").fetchone()[2] if conn is not None else "")
+    command = ["navcom", "history", "conversations", selected["id"], "--at", as_of]
+    if index:
+        command += ["--index", index]
+    command += ["--space-cache", str(space_cache), "--limit", str(limit),
+                "--max-turns", str(max_turns), "--seconds", str(seconds)]
+    if query:
+        command.append("--query=" + query)
     return dict(schema_version=1, action="conversations", as_of=as_of, query=query, cooked_query=cooked,
                 selected_place={k:selected[k] for k in ("id", "kind", "label")},
                 address_basis="Current navigation catalog", catalog_published=published,
@@ -318,4 +321,4 @@ def view(api, conn, *, within="", as_of, space_cache, query="", limit=20,
                                         file_relationship="unproven", commit_relationship="unproven"),
                 attribution_policy=ATTRIBUTION, timestamp_policy=TIMESTAMPS, ancestry_policy=ANCESTRY,
                 search_policy="Native NavCom text-only FTS5 query and rank; matching dated turns only, no current titles or summaries. Current index corpus statistics may affect ranking.",
-                conversations=nodes, nodes=nodes, coverage=coverage, gaps=gaps)
+                conversations=nodes, nodes=nodes, coverage=coverage, gaps=gaps, cli_command=shlex.join(command))

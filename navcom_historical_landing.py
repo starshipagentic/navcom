@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import re
 import shlex
-import signal
 import subprocess
 import sys
 import tempfile
@@ -50,10 +49,6 @@ def _path(value):
     return value
 
 
-def _inside(path, scopes):
-    return any(scope == "." or path == scope or path.startswith(scope + "/") for scope in scopes)
-
-
 def _command(request, group=None):
     argv = ["navcom", "history", "land", request["place_id"], "--cursor", request["cursor"],
             "--result-key", request["result_key"], "--cache", request["cache_path"],
@@ -65,8 +60,8 @@ def _command(request, group=None):
     return shlex.join(argv)
 
 
-def _reference(snapshot, artifact, published, path, line=1):
-    return dict(source_id=snapshot["id"], relative_path=path, line=line,
+def _reference(snapshot, artifact, published, path):
+    return dict(source_id=snapshot["id"], relative_path=path, line=1,
                 snapshot=artifact, published=published, history=snapshot["id"])
 
 
@@ -134,7 +129,7 @@ def _execute(request):
         scopes = plan["pins"][product["id"]]["include"]
         if not scopes or not all(_path(scope) for scope in scopes):
             raise history.HistoryError("Saved product scope is empty")
-        product_files = sorted(path for path in file_records if _inside(path, scopes))
+        product_files = sorted(path for path in file_records if space.in_scopes(path, scopes))
         if set(product_files) != set(product["files"]):
             raise history.HistoryError("Saved product files do not match its original scope")
         groups, seen = [], set()
@@ -154,7 +149,7 @@ def _execute(request):
             seen.add(identity)
             label, basis, terms = space._district_label(native.get("shared_tokens", []), paths)
             groups.append(dict(id=identity, kind="district", form="native_group_suggestion", label=label,
-                parent_id=product["id"], position=space._position(identity, "district", product["position"]),
+                parent_id=product["id"], position=space.position(identity, "district", product["position"]),
                 historical_state="committed", commit=product["commit"], committed_at=product["committed_at"],
                 files=paths, allowed_paths=paths, file_count=len(paths), group_id=identity,
                 description="Existing native Starforge group in the selected committed product.",
@@ -187,11 +182,10 @@ def _execute(request):
         evidence = None
         if request["query"].strip():
             import navcom_sources
-            worker = Path(navcom_sources.__file__).with_name("navcom_sources_worker.py")
             query = dict(action="search", cache=snapshot["source_cache"], query=request["query"], mode="both",
                          within=snapshot["id"], paths=allowed, limit=request["limit"])
             with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
-                process = subprocess.Popen([navcom_sources.runtime(), str(worker)], stdin=subprocess.PIPE,
+                process = subprocess.Popen(navcom_sources.worker_argv(), stdin=subprocess.PIPE,
                                            stdout=output, stderr=errors)
                 try:
                     process.stdin.write(json.dumps(query).encode()); process.stdin.close()
@@ -294,6 +288,4 @@ def landing(cursor, place_id, *, result_key, group_id=None, query="", cache_path
                 raise history.HistoryError(result.get("error", "Saved historical landing unavailable"))
             return result["value"]
         finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+            space.kill_group(process)

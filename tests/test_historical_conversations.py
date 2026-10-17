@@ -279,3 +279,15 @@ def test_naive_cutoff_rejected(archive, navcom):
     conn, _, _, cache, _ = archive
     with pytest.raises(ValueError, match="offset"):
         history.view(navcom, conn, within="planet:aurora", space_cache=cache, as_of="2025-05-01T01:00:00")
+
+
+def test_service_builds_the_replay_command_for_cli_and_api(archive, tmp_path):
+    import shlex
+    _, add, read, cache, _ = archive
+    add("old", [("2025-01-01T00:00:00Z", "login")])
+    argv = shlex.split(read(query="login")["cli_command"])
+    assert argv[:6] == ["navcom", "history", "conversations", "planet:aurora", "--at", "2025-05-01T00:00:00Z"]
+    assert Path(argv[argv.index("--index") + 1]).resolve() == (tmp_path / "index.sqlite").resolve()
+    assert argv[argv.index("--space-cache") + 1] == str(cache) and argv[-1] == "--query=login"
+    explicit = shlex.split(read(index_path=tmp_path / "chosen.sqlite")["cli_command"])
+    assert explicit[explicit.index("--index") + 1] == str(tmp_path / "chosen.sqlite") and "--query=" not in " ".join(explicit)

@@ -8,7 +8,7 @@ import shlex
 import tempfile
 import time
 
-from navcom_atlas import Atlas, COLORS, identity, tokens
+from navcom_atlas import Atlas, identity, tokens
 import navcom_research as research
 
 GROUPS = {'topics':'topics','research':'research','projects':'project','districts':'district','time':'month','starships':'fleet'}
@@ -260,7 +260,6 @@ class Discovery:
                 nodes.append(node)
         total=len(nodes);page=nodes[offset:offset+limit]
         for n in page:
-            n['color']=COLORS[int(identity(n['label'])[:6],16)%len(COLORS)]
             if n.get('key'):
                 n['ref']=self.api.session_ref(n['key']);n['open_command']=shlex.join(['navcom','--open',self.api.session_ref(n.get('open_key',n['key']))+':'+str(n.get('start',1))]);n['next_command']=shlex.join(['navcom','atlas','show',n['ref']])
         fresh=bool(cache) and all(cache.get('files',{}).get(k,{}).get('signature')==[mtime,size,last] for k,mtime,size,last in conn.execute('SELECT file,mtime,size,msg_index FROM file_state'))

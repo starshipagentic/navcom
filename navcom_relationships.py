@@ -3,16 +3,13 @@
 These are evidence about retained source paths, never ownership, ancestry, or
 historical succession. All analysis runs against immutable harvest snapshots.
 """
-import argparse
 from collections import defaultdict
-import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shlex
 import subprocess
-import sys
 import tempfile
 import time
 
@@ -215,7 +212,7 @@ def related(space_cache, source_cache, within, *, query='', limit=20, seconds=15
         raise ValueError('Query must be text of at most 500 characters.')
     if not 1 <= int(limit) <= 100 or not 1 <= float(seconds) <= 30 or int(offset) < 0:
         raise ValueError('Use limit 1–100, seconds 1–30 and a nonnegative source offset.')
-    chart = space._read(Path(space_cache).expanduser())
+    chart = space.load_catalog(space_cache)
     selected = space.view(space_cache, action='show', within=within, catalog=chart)['center']
     scopes = defaultdict(set)
     for scope in selected.get('source_scopes', []):
@@ -293,61 +290,3 @@ def related(space_cache, source_cache, within, *, query='', limit=20, seconds=15
         else: command += ['--offset', str(result['next_offset'])]
         result['continue_command'] = shlex.join(command)
     return result
-
-
-def render(data):
-    print(data['center']['label'] + ' — related source evidence')
-    for family in data['families']:
-        print('\nSuggested version family: ' + family['label'])
-        for member in family['members']:
-            print('  ' + member['label'] + ' · ' + str(member['retained_files']) + ' retained files · ' + member['path'])
-            print('    ' + member['search_command'])
-    for reference in data['references']:
-        print('\nDocumented reference: ' + reference['target_root'])
-        print('  ' + reference['path'] + ':' + str(reference['line']) + ' — ' + reference['excerpt'])
-        print('  ' + reference['read_command'])
-    query_hits = 0
-    for evidence in data.get('evidence', []):
-        concepts, text = evidence.get('concept_hits', []), evidence.get('text_hits', [])
-        query_hits += len(concepts) + len(text)
-        print('\nSource query: ' + evidence['source_id'] + ' · ' + str(len(concepts)) + ' concept matches · ' + str(len(text)) + ' text matches')
-        for label, hits in [('concept', concepts), ('text', text)]:
-            for hit in hits[:5]:
-                location = hit.get('relative_path', '')
-                if hit.get('line') is not None:
-                    location += ':' + str(hit['line'])
-                print('  ' + label + ' · ' + location)
-        if len(concepts) > 5 or len(text) > 5 or evidence.get('potentially_truncated'):
-            print('  Bounded match preview; full returned evidence: ' + data['cli_command'] + ' --json')
-    if not data['families'] and not data['references'] and not query_hits:
-        print('No relationships found in the selected retained source scopes.')
-    print('\n' + data['meaning'])
-    if data.get('result_limits', {}).get('truncated'):
-        print('Relationship result limit reached; use --limit up to 100 to see more returned evidence.')
-    if data['next_offset'] is not None:
-        print('More source scopes remain: ' + data['continue_command'])
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('place')
-    parser.add_argument('--space-cache', type=Path, required=True)
-    parser.add_argument('--source-cache', type=Path, required=True)
-    parser.add_argument('--query', default='')
-    parser.add_argument('--limit', type=int, default=20)
-    parser.add_argument('--seconds', type=float, default=15)
-    parser.add_argument('--offset', type=int, default=0)
-    parser.add_argument('--json', action='store_true')
-    args = parser.parse_args(argv)
-    try:
-        result = related(args.space_cache, args.source_cache, args.place, query=args.query,
-                         limit=args.limit, seconds=args.seconds, offset=args.offset)
-        print(json.dumps(result, indent=2)) if args.json else render(result)
-        return 0
-    except (OSError, ValueError, TimeoutError) as exc:
-        print('navcom: ' + str(exc), file=sys.stderr)
-        return 2
-
-
-if __name__ == '__main__':
-    raise SystemExit(main())

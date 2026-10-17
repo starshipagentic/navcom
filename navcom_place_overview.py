@@ -1,9 +1,12 @@
 """Small, factual previews of the places already present in a published chart.
 
-This is presentation metadata, not another analyzer or ownership classifier.
+This is shared summary data for the CLI and the view (factual counts and exact
+child IDs), not another analyzer or ownership classifier.
 Only direct children are summarized; searching never changes these previews.
 """
 from collections import defaultdict
+
+PREVIEW_PLACES = 4  # Named direct children per category.
 
 
 def _category(node):
@@ -16,10 +19,8 @@ def _category(node):
             "ship": "ships"}.get(node.get("kind"), "places")
 
 
-def previews(entities, identities, limit=4):
+def previews(entities, identities):
     """Return bounded direct-child clues for selected IDs from one publication."""
-    if not 1 <= limit <= 8:
-        raise ValueError("Preview limit must be between 1 and 8")
     wanted = set(identities)
     groups = {identity: defaultdict(list) for identity in wanted}
     descriptions = {}
@@ -45,7 +46,7 @@ def previews(entities, identities, limit=4):
                 continue
             members.sort(key=lambda node: (str(node.get("label", "")).casefold(), node["id"]))
             samples = []
-            for node in members[:limit]:
+            for node in members[:PREVIEW_PLACES]:
                 item = {key: node[key] for key in ("id", "label", "kind", "form") if key in node}
                 # Native groups retain their exact member paths. Their count is
                 # useful context without pretending that it measures importance.

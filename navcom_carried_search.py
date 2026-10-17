@@ -12,9 +12,7 @@ import json
 import math
 import os
 from pathlib import Path
-import signal
 import socket
-import stat
 import subprocess
 import sys
 import tempfile
@@ -23,6 +21,7 @@ import uuid
 
 import navcom_ship_context as context
 from navcom_ship_inspection import _text
+from navcom_space import kill_group
 
 
 VERSION = 1
@@ -202,8 +201,7 @@ def _run_native(entity, query, pin, *, limit, max_chars, max_record_bytes, max_t
         try:
             process.communicate(json.dumps(request).encode(), timeout=seconds)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
+            kill_group(process)
             raise _Deferred('Native carried search reached the sweep time budget.') from None
         if process.returncode or os.fstat(output.fileno()).st_size > CACHE_BYTES:
             raise ValueError('Native carried search could not complete within its output bound.')

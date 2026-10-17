@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 
+import navcom_atlas_cli
 import navcom_fleet
 import navcom_navigation
 import navcom_space as space
@@ -29,7 +30,8 @@ def test_archive_links_preserve_locations_scopes_and_cached_navigation(tmp_path,
     assert calls == [dict(archive_cache=tmp_path / 'chart.json.fleet-archives.json')]
     nodes = {node['id']: node for node in data['entities']}
     saved = nodes[archive['id']]
-    assert saved['form'] == 'archive' and saved['art_role'] == 'archive'
+    # A sprite name from an older fleet record never enters the chart; the view derives art from form.
+    assert saved['form'] == 'archive' and 'art_role' not in saved
     assert saved['parent_id'] == space.GALAXY  # not physically inside a remote working ship
     assert saved['physical'] == archive['physical'] and saved['integrity'] == archive['integrity']
     assert nodes[working['id']]['physical'] == working['physical']
@@ -55,7 +57,7 @@ def test_archive_links_preserve_locations_scopes_and_cached_navigation(tmp_path,
                                   action='show', within=saved['id'])
     command = shown['center']['commands']['carried_context']
     assert '--space-cache' in command and '--source-cache' not in command
-    navcom_navigation.render(shown)
+    navcom_atlas_cli.render_space(shown)
     output = capsys.readouterr().out
     assert '[ship archive' in output and 'working copy: Orchard vessel' in output
     assert str(tmp_path / 'commission' / 'archive') in output

@@ -14,12 +14,11 @@ import re
 import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 from urllib.parse import urlsplit, urlunsplit
 
-from navcom_ship_inspection import _text
+from navcom_ship_inspection import _text, commission_tools
 
 COMPOSE_NAMES = {"compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml"}
 METADATA_NAMES = COMPOSE_NAMES | {"Dockerfile", "SOUL.md", "profile.yaml", "distribution.yaml"}
@@ -138,7 +137,7 @@ def _metadata(roots, profile_home, max_dirs, max_files, max_bytes, seconds):
 
 def _build_tools(tool_root):
     """Use Starship's existing borrowed Starforge detectors; no algorithm copy."""
-    root = Path(tool_root or Path.home() / ".codex/skills/ship-commission/scripts/borrowed").expanduser().resolve()
+    root = Path(tool_root or commission_tools(borrowed=True)).expanduser().resolve()
     modules = {}; signatures = {}
     for name in ("build_systems", "config_files"):
         path = root / (name + ".py")
@@ -296,7 +295,7 @@ def discover(roots=(), cache_path=None, *, profile_home=None, hermes_source=None
     if any(native_root.is_relative_to(Path(p["root"])) for p in projects) or (home and native_root.is_relative_to(home) and native_root != Path.home()/".hermes/hermes-agent"):
         raise ValueError("Use the installed Hermes provider, never code inside an inspected project or custom profile")
     interpreter = str(hermes_python or native_root/"venv/bin/python")
-    selected_tools = Path(tool_root or Path.home()/".codex/skills/ship-commission/scripts/borrowed").expanduser().resolve()
+    selected_tools = Path(tool_root or commission_tools(borrowed=True)).expanduser().resolve()
     if any(selected_tools.is_relative_to(Path(p["root"])) for p in projects):
         raise ValueError("Use installed build/config detectors, never code inside an inspected project")
     tools, tool_signatures, tool_gap = _build_tools(tool_root)

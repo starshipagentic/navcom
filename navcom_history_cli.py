@@ -1,12 +1,10 @@
 """CLI for exact Git revision navigation through the shared historical service."""
 import argparse
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys
 import sqlite3
-import shlex
 
 import navcom_history
 
@@ -222,12 +220,12 @@ def run(api, argv):
     if args.action == 'system' and args.retry_larger and not args.cursor:
         p.error('--retry-larger requires --cursor from a journey with a snapshot-size failure')
     index = (args.index or api.default_index_path()).expanduser()
-    from navcom_navigation import paths
+    from navcom_navigation import history_cache, paths
     space, sources = (None,None) if args.action=='land' else paths(index, args.space_cache, getattr(args,'source_cache',None))
     kwargs = dict(action=args.action, repo=getattr(args,'repo',None), space_cache=space, source_cache=sources,
                   include=getattr(args,'include',None), limit=args.limit)
     if args.action == "explore":
-        kwargs.update(cache_path=args.cache or Path(os.environ.get("NAVCOM_HISTORY_CACHE", str(index.parent / "navcom-history"))),
+        kwargs.update(cache_path=args.cache or history_cache(index),
                       query=args.query, max_files=args.max_files, max_bytes=args.max_bytes, max_file_bytes=args.max_file_bytes)
     try:
         message=("reading committed timeline" if args.action=="timeline" else
@@ -242,23 +240,19 @@ def run(api, argv):
             import navcom_historical_landing
             result=navcom_historical_landing.landing(args.cursor,args.place,result_key=args.result_key,
                 group_id=args.group,query=args.query,limit=args.limit,seconds=args.seconds,
-                cache_path=args.cache or Path(os.environ.get('NAVCOM_HISTORY_CACHE',str(index.parent/'navcom-history'))))
+                cache_path=args.cache or history_cache(index))
         elif args.action=='conversations':
             import navcom_historical_conversations
             conn=sqlite3.connect(index.resolve().as_uri()+'?mode=ro',uri=True,timeout=1)
             try:
                 result=navcom_historical_conversations.view(api,conn,within=args.place,as_of=args.at,
-                    space_cache=space,query=args.query,limit=args.limit,max_turns=args.max_turns,seconds=args.seconds)
+                    space_cache=space,query=args.query,limit=args.limit,max_turns=args.max_turns,seconds=args.seconds,
+                    index_path=index)
             finally:conn.close()
-            command=['navcom','history','conversations',result['selected_place']['id'],'--at',result['as_of'],
-                     '--index',str(index),'--space-cache',str(space),'--limit',str(args.limit),
-                     '--max-turns',str(args.max_turns),'--seconds',str(args.seconds)]
-            if args.query:command.append('--query='+args.query)
-            result['cli_command']=shlex.join(command)
         elif args.action=='system':
             import navcom_system_history
             result=navcom_system_history.view(args.place,args.at,space_cache=space,source_cache=sources,
-                cache_path=args.cache or Path(os.environ.get('NAVCOM_HISTORY_CACHE',str(index.parent/'navcom-history'))),
+                cache_path=args.cache or history_cache(index),
                 query=args.query,limit=args.limit,cursor=args.cursor,seconds=args.seconds,max_commits=args.max_commits,
                 max_files=args.max_files,max_bytes=args.max_bytes,max_file_bytes=args.max_file_bytes,search_limit=args.search_limit,progress=progress,
                 retry_larger=args.retry_larger)

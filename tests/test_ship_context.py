@@ -3,11 +3,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import subprocess
-import sys
 
 import pytest
 
+import navcom_atlas_cli
 import navcom_ship_context as context
 
 
@@ -175,26 +174,10 @@ def test_open_can_pin_the_catalog_from_prior_search(ship):
 def test_human_render_exposes_original_turn_and_continuation(ship,capsys):
     require_native()
     result=context.read_context(ship[0],query='amber',limit=1)
-    context.render(result)
+    navcom_atlas_cli.render_context(result)
     output=capsys.readouterr().out
     assert 'session-0 · turn 3' in output and '--offset 1' in output
     assert 'not current host history' in output and 'amber storage' in output
-
-
-def test_module_cli_runs_search_and_exact_turn_open_with_native_reader(ship,tmp_path):
-    require_native()
-    entity,root,_=ship
-    galaxy=dict(id='galaxy:owner',kind='galaxy',label='Galaxy',parent_id=None,position={},locations=[],evidence=[],examples=[])
-    chart=tmp_path/'space.json';chart.write_text(json.dumps(dict(schema_version=1,published=123,entities=[galaxy,entity],edges=[],coverage={})))
-    argv=[sys.executable,str(Path(context.__file__)),'--space-cache',str(chart),'--within',entity['id']]
-    found=subprocess.run([*argv,'search','amber'],capture_output=True,text=True)
-    assert found.returncode==0,found.stderr
-    first=json.loads(found.stdout)['messages'][0]
-    opened=subprocess.run([*argv,'open',first['id'],'--turn',str(first['index'])],capture_output=True,text=True)
-    assert opened.returncode==0,opened.stderr
-    data=json.loads(opened.stdout)
-    assert len(data['messages'])==1 and data['messages'][0]['index']==3
-    assert data['provenance']['root']==str(root)
 
 
 @pytest.mark.parametrize('kwargs',[dict(query=''),dict(query='x'*501),dict(query='x',offset=-1),

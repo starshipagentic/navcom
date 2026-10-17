@@ -55,7 +55,7 @@ def _path(value, base=""):
     return str(p)
 
 
-def read_fleet(snapshot_path=None, config_path=None, *, archive_cache=None, archive_limit=128, archive_seconds=5):
+def read_fleet(snapshot_path=None, config_path=None, *, archive_cache=None, archive_limit=128):
     """Return ``{schema_version, entities, coverage}`` from optional local records.
 
     Paths may be supplied explicitly, through NAVCOM_FLEET_SNAPSHOT and
@@ -93,7 +93,7 @@ def read_fleet(snapshot_path=None, config_path=None, *, archive_cache=None, arch
                  "message": "Current availability and boarding have not been checked."}
     if base_id:
         entities.append({"id": base_id, "kind": "starbase", "label": _text(data.get("destination")) or f"Starbase at {base}",
-                         "parent_id": None, "source_roots": [], "art_role": "starbase",
+                         "parent_id": None, "source_roots": [],
                          "physical": {"host": host, "path": base, "volume_uuid": volume, "availability": "unobserved"},
                          "readiness": dict(readiness), "provenance": dict(provenance),
                          "gaps": ["Storage availability has not been observed."], "evidence": []})
@@ -135,7 +135,7 @@ def read_fleet(snapshot_path=None, config_path=None, *, archive_cache=None, arch
         evidence_path = _path(evidence, str(snapshot.parent.parent)) if snapshot.parent.name == "bridge" else _path(evidence)
         entities.append({"id": ship_id, "kind": "ship", "label": name,
                          "record_id": record_id, "parent_id": base_id, "source_roots": roots,
-                         "unresolved_source_references": unresolved_roots, "art_role": "ship",
+                         "unresolved_source_references": unresolved_roots,
                          "physical": {"host": host, "path": location, "volume_uuid": volume, "availability": "unobserved"},
                          "readiness": dict(readiness, recorded_state=_text(row.get("state")) or "not recorded"),
                          "description": _text(row.get("detail")),
@@ -149,8 +149,7 @@ def read_fleet(snapshot_path=None, config_path=None, *, archive_cache=None, arch
                 "notes": ["Fleet metadata is historical evidence, not current readiness.",
                           "Conceptual product locations are separate from physical hosting."]}
     from navcom_commission_archives import discover
-    archives = discover(entities, snapshot, cache_path=archive_cache,
-                        limit=archive_limit, seconds=archive_seconds)
+    archives = discover(entities, snapshot, cache_path=archive_cache, limit=archive_limit)
     entities.extend(archives['entities'])
     coverage['archives'] = archives['coverage']
     coverage['recorded_ships'] = coverage['ships']
