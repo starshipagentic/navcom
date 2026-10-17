@@ -1,6 +1,6 @@
 # Starforge history: verified contract
 
-2026-10-16. This is a bounded lab result, not an implemented NavCom time slider. No Starforge or production NavCom code changed.
+2026-10-16. Written as a bounded lab result before NavCom had a time slider; the adapter it proposed is now implemented (see [Historical adapter](#historical-adapter-implemented)). The lab itself changed no Starforge or production NavCom code.
 
 ## What can be reused
 
@@ -49,7 +49,9 @@ Live inspection of the published NavCom source cache found:
 
 There is no recorded commit, tree identity, authored/committed timestamp, or link to a historical branch. Existing artifact directories preserve bytes, but their names and timestamps cannot reconstruct when those bytes were the project's real state. Their `published` time can support “observed by NavCom at this time,” not “this product existed exactly like this on that date.”
 
-## Narrow next adapter
+## Historical adapter (implemented)
+
+Now implemented by `navcom_history.py`, `navcom_system_history.py` and `navcom_historical_conversations.py` (`navcom history timeline/explore/system/land/conversations`); the steps below remain its contract. Do not rebuild them. Only step 4's optional `trace_file_evolution` change evidence is not used yet.
 
 1. Resolve a selected Git ref to an immutable full SHA. Record both author and committer timestamps, selected ref/tip, tree SHA, and observation time. A calendar selection must name its rule—for example, a recorded commit on the selected branch before the cutoff. Commit dates are editable metadata, not proof of real-world availability.
 2. Materialize bounded selected paths from that **one commit tree** using Git's existing object/archive interfaces. Inspect historical manifests to select historical app roots; never fill missing old files from the current working tree. Reject/disclose missing objects, oversized material, shallow history and unsupported object types.

@@ -99,6 +99,10 @@ record, not from a transcript or copied receipt. See
 
 ## Small NavCom adapter, without a competing ship system
 
+Now implemented: `navcom_ship_inspection.py` (`navcom atlas inspect`) and
+`navcom_ship_boarding.py` (`navcom atlas board`), shared with the bridge. The
+steps below remain the boundary contract; do not rebuild them.
+
 1. Keep `navcom_fleet`'s existing snapshot inventory. Add a bounded whitelist of
    historical dossier fields from each recorded receipt: mission, working root,
    thread/harness identity, evidence time, context coverage and explicit gaps.
@@ -119,6 +123,10 @@ record, not from a transcript or copied receipt. See
    not implement credential projection, service restoration or captain dispatch.
 
 ## Stars: a real remaining inventory gap
+
+Superseded: [living-star discovery](living-star-discovery-contract.md) now finds
+declared expertise through native Hermes profiles (`navcom_stars.py`). The
+finding below records the state before that adapter; its rules still apply.
 
 The current Starship first-voyage
 [decisions](/Users/t/dev/starship/plans/first-voyage/DECISIONS.md) explicitly reserve

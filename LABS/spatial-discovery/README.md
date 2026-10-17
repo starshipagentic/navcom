@@ -1,5 +1,7 @@
 # Spatial discovery moon — lab 01
 
+**Superseded:** this lab's prototype harvest path (`harvest_flow.py` and its proof scripts) now lives in `navcom_sources_worker.py` and `navcom_history.py` (`navcom sources …`, `navcom history …`); do not revive it. `private/` holds machine-derived snapshots and stays untracked (gitignored); never commit or package it.
+
 Follow-up: [Starforge reuse survey and Starship alignment](STARFORGE-FINDINGS.md) tests substantially more existing capabilities and corrects the initial narrow assessment. [Ranked investigation checklist](STARFORGE-PLAN.md).
 
 **Result: useful partial discovery, not a proven automatic universe.** This is a runnable experiment inside NavCom. No NavCom production modules, Starforge code, Starship code, or client repositories were changed.

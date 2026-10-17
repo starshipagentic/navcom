@@ -802,9 +802,7 @@ Do not copy private source bodies/catalogs into Git merely to preserve a screens
 - [Owner direction](2026-10-15-a-universe-you-can-return-to.md) and
   [spatial vision](../docs/spatial-navigation-vision.md): authoritative analogy;
   supersede earlier literal or chat-centered mappings.
-- [Original CLI gap audit](../docs/cli-spatial-gap-audit.md): explains why renaming
-  old Atlas groups was insufficient. Its unsupported-command verdict is historical;
-  many proposed commands are now implemented.
+- Original CLI gap audit: removed as superseded (its proposed commands now ship); text kept at `git show 4e18553:docs/cli-spatial-gap-audit.md`.
 - [Ranked Starforge investigation](../LABS/spatial-discovery/STARFORGE-PLAN.md),
   [findings](../LABS/spatial-discovery/STARFORGE-FINDINGS.md),
   [harvest results](../LABS/spatial-discovery/HARVEST-RESULTS.md), and

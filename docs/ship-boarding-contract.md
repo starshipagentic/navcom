@@ -1,7 +1,8 @@
 # Native captain boarding adapter
 
 2026-10-16. This checkpoint implements the shared service in
-`navcom_ship_boarding.py`; CLI/UI integration is a separate step. No actual
+`navcom_ship_boarding.py`; it is now wired as `navcom atlas board` and the
+bridge's `POST /api/space/board`. No actual
 captain was resumed, messaged or reassigned during this work. No ship was
 restored, commissioned or moved.
 
