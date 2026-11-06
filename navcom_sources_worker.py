@@ -5,6 +5,7 @@ import contextlib, fcntl, hashlib, json, os, shutil, sys, tempfile, time
 from pathlib import Path
 
 sys.dont_write_bytecode = True
+import navcom_source_policy
 import starforge
 
 SF = Path(starforge.__file__).resolve().parent.parent
@@ -84,13 +85,15 @@ def source_bytes(source):
         rel = Path(item)
         if rel.is_absolute() or ".." in rel.parts:
             raise ValueError("Scope must stay inside its source")
-        if any(part.startswith(".") or part in SKIP for part in rel.parts):
+        target = root / rel
+        if (not navcom_source_policy.permitted_path(rel, directory=target.is_dir()) or
+                any(part in SKIP for part in rel.parts)):
             excluded.append(str(rel))
             continue
-        target = root / rel
         if not target.exists():
             raise ValueError("Selected scope missing: " + str(target))
-        if target.is_symlink() or not target.resolve().is_relative_to(root.resolve()):
+        if (any(root.joinpath(*rel.parts[:i]).is_symlink() for i in range(1, len(rel.parts) + 1)) or
+                not target.resolve().is_relative_to(root.resolve())):
             raise ValueError("Scope escapes source")
         if target.is_file():
             paths.add(target)
@@ -98,13 +101,14 @@ def source_bytes(source):
             for folder, dirs, names in os.walk(target, followlinks=False):
                 parent = Path(folder)
                 for d in dirs:
-                    if d in SKIP or d.startswith(".") or (parent / d).is_symlink():
+                    if (d in SKIP or not navcom_source_policy.permitted_path((parent / d).relative_to(root), directory=True)
+                            or (parent / d).is_symlink()):
                         excluded.append(str((parent / d).relative_to(root)))
                 dirs[:] = sorted(
                     d
                     for d in dirs
                     if d not in SKIP
-                    and not d.startswith(".")
+                    and navcom_source_policy.permitted_path((parent / d).relative_to(root), directory=True)
                     and not (parent / d).is_symlink()
                 )
                 paths.update(parent / name for name in names)
@@ -115,7 +119,7 @@ def source_bytes(source):
         if path.is_symlink():
             excluded.append(rel)
             continue
-        if path.name.startswith(".") or (
+        if not navcom_source_policy.permitted_path(rel) or (
             path.suffix.lower() not in EXT
             and path.name not in SOURCE_FILENAMES
         ):
@@ -202,7 +206,8 @@ def extractor_signature():
     This intentionally replaces the legacy whole-worker fingerprint once, when
     each selected source next refreshes. Existing artifacts remain readable.
     """
-    return _component_signature(("refresh",))
+    return digest(json.dumps([_component_signature(("refresh",)),
+                             digest(Path(navcom_source_policy.__file__).read_bytes())]).encode())
 
 
 def query_signature():
@@ -907,6 +912,24 @@ def batch_search(request, cache):
     identities = [scope["source_id"] for scope in scopes]
     if len(identities) != len(set(identities)):
         raise ValueError("Duplicate search scope")
+    if request.get("include_published_sources"):
+        if request["include_published_sources"] is not True:
+            raise ValueError("Published source selection must be a boolean")
+        published = state.get("sources")
+        if not isinstance(published, list) or any(
+            not isinstance(source, dict) or not isinstance(source.get("id"), str)
+            or not source["id"] for source in published
+        ):
+            raise ValueError("Published source inventory is unavailable or malformed")
+        published_ids = [source["id"] for source in published]
+        if len(published_ids) != len(set(published_ids)):
+            raise ValueError("Duplicate published source identity")
+        # Select from the same immutable publication used by both engines and
+        # their source refs; a chart refresh is not a prerequisite for searching.
+        selected = {scope["source_id"]: scope for scope in scopes}
+        selected.update({sid: dict(source_id=sid, paths=[]) for sid in published_ids})
+        identities = sorted(selected)
+        scopes = [selected[sid] for sid in identities]
     seconds = min(30.0, max(0.01, float(request.get("time_budget_seconds", 20))))
     started = time.monotonic()
     results, errors, attempted = [], [], []

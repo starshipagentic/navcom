@@ -68,6 +68,8 @@ and the CLI and the view both branch on it.
 | Annotations | `navcom.annotate()` | One merge rule (one line, at most 240 characters; a blank name or note restores the default) for the Recents keys `e`/`d`/`f` and `POST /api/annotation`. |
 | Dashboard snapshot | `navcom.dashboard_snapshot()` | Read the saved snapshot while fresh, else compute and save it. The TUI passes its local setup as `prepare`; `GET /api/status` calls it plainly. |
 | Local-model suggestion | `navcom_intelligence.suggest_for()` | Builds the excerpt (first three and last ten turns) and asks an already-running local model. |
+| Place briefing | `navcom_place_briefing`, orchestrated by `navcom_navigation` | Current explore/show and scoped questions share saved descriptions, bounded source evidence and exact-membership indexed conversation excerpts. Missing code stays explicit; dated views do not acquire current context. |
+| Grounded local answer | `navcom_intelligence.answer_grounded()` | Questions may use the existing resident-model route. Every generated claim cites supplied evidence IDs. Successful answers are cached by scope, question, evidence and model; arrival itself performs no inference. |
 | Source listing and search | `navcom_sources.sources_list()`, `navcom_sources.search()` | `navcom sources list/search` and `GET /api/sources`, `/api/sources/search`. Without a terminal, `search` captures the worker's own reason as its error. |
 
 ## Modules whose own bytes are cache keys

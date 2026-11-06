@@ -75,7 +75,7 @@ const heading={},caption={},navigatorStatus={},refresh={disabled:true};
 const actionDialog={open:false},sourceDialog={open:false},reducedMotion={matches:true};
 const destinationPager=element(),places={children:[]},names={galaxy:'Galaxy',planet:'Product'};
 const voiceInput={cancel(){},active:()=>false};
-const no=()=>{},hideSource=no,loadSource=no,cancelFlight=no,renderCrumbs=no,renderMap=no,
+const no=()=>{},hideSource=no,hideCarriedReader=no,loadSource=no,cancelFlight=no,renderCrumbs=no,renderMap=no,
  renderDestinationPager=no,renderFooter=no,renderTimeBar=no,arrive=no,applySystemTime=no,
  loadSystemTime=no,message=no,setTime=no,refreshChart=no,rendered=[];
 const fail=error=>{throw error},carriedState=x=>x;

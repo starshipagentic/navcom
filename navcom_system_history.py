@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shlex
 import subprocess
 import sys
@@ -22,6 +22,8 @@ POLICY = "Pinned HEAD first-parent ancestry: select the first commit at or befor
 DEFAULT_BUDGETS = dict(max_files=2000, max_bytes=16 * 1024 * 1024, max_file_bytes=2 * 1024 * 1024)
 RECOVERY_BUDGETS = dict(max_files=10000, max_bytes=64 * 1024 * 1024)
 BUDGET_ERROR = "Historical snapshot exceeds its file/byte budget at "
+MAX_DERIVED_APPLICATIONS = 2000
+APPLICATION_ID = "historical-app"
 
 
 def _utc(value):
@@ -139,22 +141,126 @@ def _run(request, seconds):
             space.kill_group(process)
 
 
+def _relative_path(value):
+    return (isinstance(value, str) and bool(value) and len(value) <= 4096
+            and "\\" not in value and "\x00" not in value
+            and not PurePosixPath(value).is_absolute() and ".." not in PurePosixPath(value).parts
+            and str(PurePosixPath(value)) == value)
+
+
+def _application_job(plan, identity):
+    """Locate an original pinned job, never a caller-supplied path or new scope."""
+    parts = identity.split(":")
+    if (len(parts) != 3 or parts[0] != APPLICATION_ID or len(parts[1]) != 64 or len(parts[2]) != 24
+            or any(c not in "0123456789abcdef" for c in parts[1] + parts[2])):
+        return None
+    return next((job for job in plan["jobs"] if job["id"] == parts[1]), None)
+
+
+def _derived_applications(plan, completed):
+    """Use existing native candidates only inside each pinned result's file set.
+
+    These are committed application addresses, not product identity, rename or
+    succession claims. The original plan and its scopes are never rewritten.
+    """
+    derived, omitted = [], []
+    anchors = {node["id"]: node for node in plan["anchors"]}
+    observed = 0
+    for job in plan.get("jobs", []):
+        outcome = completed.get(job["id"])
+        if not outcome or not _compatible_success(outcome, job):
+            continue
+        data = outcome["data"]
+        structure = data.get("structure", {})
+        candidates = structure.get("application_candidates")
+        if not isinstance(candidates, list) or len(candidates) > 64:
+            omitted.append(dict(job_id=job["id"], reason="Bounded native application metadata is unavailable"))
+            continue
+        observed += 1
+        if not structure.get("application_coverage", {}).get("complete", False):
+            omitted.append(dict(job_id=job["id"], reason="Native application inspection was incomplete"))
+        includes = job["include"]
+        if not includes or not all(_relative_path(path) for path in includes):
+            omitted.append(dict(job_id=job["id"], reason="Invalid original repository scope"))
+            continue
+        files = {row["path"] for row in data["snapshot"]["files"]
+                 if _relative_path(row.get("path")) and space.in_scopes(row["path"], includes)}
+        saved = [(anchors[sid], plan["pins"][sid]["include"]) for sid in job["scope_ids"]
+                 if sid in anchors and sid in plan["pins"]]
+        represented = {scope for _, paths in saved for scope in paths}
+        seen = set()
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            root, manifest = candidate.get("root"), candidate.get("manifest")
+            if (not _relative_path(root) or root == "." or root in represented or root in seen
+                    or not _relative_path(manifest) or manifest not in files
+                    or str(PurePosixPath(manifest).parent) != root):
+                continue
+            seen.add(root)
+            if candidate.get("dependency_evidence") and candidate.get("local_declaration") not in {"workspace_member", "private_package"}:
+                continue  # Same native dependency-only qualification as current geography.
+            scopes = ([root] if space.in_scopes(root, includes) else
+                      [path for path in includes if space.in_scopes(path, [root])])
+            scoped_files = {path for path in files if space.in_scopes(path, scopes)}
+            if manifest not in scoped_files:
+                continue
+            containing = [(node, paths) for node, paths in saved
+                          if any(space.in_scopes(path, paths) for path in scoped_files)]
+            if not containing:
+                continue
+            # A current address is a navigation reference, not historic ownership.
+            containing.sort(key=lambda item: (-max(len(PurePosixPath(path).parts) for path in item[1]), item[0]["id"]))
+            address = containing[0][0]
+            moon = next((node for node, paths in containing
+                         if node["kind"] == "moon" and space.in_scopes(root, paths)), None)
+            historical_lab = any(boundary.get("kind") == "moon" and _relative_path(boundary.get("relative"))
+                                 and root != boundary["relative"] and space.in_scopes(root, [boundary["relative"]])
+                                 for boundary in data.get("boundaries", []) if isinstance(boundary, dict))
+            if historical_lab and moon is None:
+                omitted.append(dict(job_id=job["id"], root=root,
+                                    reason="Historical lab application has no saved experiment address; not promoted to an independent product"))
+                continue
+            if len(derived) >= MAX_DERIVED_APPLICATIONS:
+                omitted.append(dict(job_id=job["id"], reason="Derived application count limit reached"))
+                break
+            identity = APPLICATION_ID + ":" + job["id"] + ":" + _hash([data["commit"], data["tree"], root])[:24]
+            kind = "district" if moon else "planet"
+            parent = moon["id"] if moon else address["parent_id"]
+            parent_node = moon or next((node for node in plan["parents"] if node["id"] == parent), address)
+            position_key = APPLICATION_ID + "-position:" + _hash([job["repository"], root])
+            derived.append(dict(id=identity, kind=kind, form="application", status="candidate", parent_id=parent,
+                position=space.position(position_key, kind, parent_node["position"]), historical_scope=scopes,
+                application_root=root, origin_scope_ids=[node["id"] for node, _ in containing],
+                present_day_address=dict(id=address["id"], kind=address["kind"], label=address.get("current_label") or address["id"]),
+                identity_basis="committed_native_application", historical_identity=dict(
+                    kind="derived_application", job_id=job["id"], repository=job["repository"],
+                    commit=data["commit"], tree=data["tree"], manifest=manifest,
+                    engine=structure.get("application_coverage", {}).get("engine"),
+                    meaning="Native runnable application in this committed scope; no current product identity, rename, succession or historical ownership is inferred.")))
+    return derived, dict(derived=len(derived), repositories_observed=observed, max_applications=MAX_DERIVED_APPLICATIONS,
+                         complete=not omitted, omissions=omitted)
+
+
 def _chart(plan, completed):
     nodes = [dict(n, historical_state="navigation_anchor", evidence_basis="Current navigation address, not historical ownership") for n in plan["parents"]]
-    for anchor in plan["anchors"]:
+    derived, application_coverage = _derived_applications(plan, completed)
+    for anchor in [*plan["anchors"], *derived]:
         row = dict(anchor, label="Historical content unknown", historical_state="unknown", description="", clues=[], evidence=[])
         pin = plan["pins"].get(anchor["id"], {})
         row["historical_gap"] = pin.get("error", "Repository page not visited in this pinned session")
-        for result in completed.values():
-            if anchor["id"] not in result["scope_ids"]:
+        for job_id, result in completed.items():
+            derived_job = anchor.get("historical_identity", {}).get("job_id")
+            if (derived_job and job_id != derived_job) or (not derived_job and anchor["id"] not in result["scope_ids"]):
                 continue
             if result.get("error"):
                 row["historical_gap"] = result["error"]; continue
-            data = result["data"]; scopes = pin["include"]
+            data = result["data"]; scopes = anchor["historical_scope"] if derived_job else pin["include"]
             files = [f["path"] for f in data["snapshot"]["files"] if space.in_scopes(f["path"], scopes)]
             if not files:
                 row["historical_gap"] = "Selected current address has no supported files at this commit; renamed paths are not followed"; continue
-            manifests = [m for m in data["manifests"] if str(Path(m["path"]).parent) in scopes]
+            manifests = [m for m in data["manifests"] if str(Path(m["path"]).parent) in scopes
+                         or (derived_job and m["path"] in scopes)]
             clues = [c for c in data["product_clues"] if c.get("relative_root") in scopes]
             # An analyzer's summary may use the isolated snapshot directory as
             # its project name. Only committed authored identity can name a
@@ -176,16 +282,25 @@ def _chart(plan, completed):
                         break
             label_source.update(repository=data["repository"], commit=data["commit"])
             description = next((m["metadata"].get("description") for m in manifests if isinstance(m["metadata"].get("description"), str)), "")
+            structure = data["structure"]
+            if derived_job:
+                # Application candidates are input evidence, not repeated
+                # inventories in every child. Keep the landing's minimal DTO.
+                structure = {key: structure[key] for key in ("schema_version", "engine", "coverage", "meaning") if key in structure}
+            structure = dict(structure, token_groups=[g for g in data["structure"].get("token_groups", [])
+                                                      if all(space.in_scopes(f, scopes) for f in g.get("paths", []))])
             row.update(label=label, label_source=label_source,
                        description=space._clean_clue(None, description, 320), clues=clues, manifests=manifests,
                        historical_state="committed", historical_gap=None, files=files,
                        evidence=[dict(type="committed_tree", repository=data["repository"], commit=data["commit"], tree=data["tree"],
                                       authored_at=data["authored_at"], committed_at=data["committed_at"], include=scopes)],
                        commit=data["commit"],tree=data["tree"],committed_at=data["committed_at"],authored_at=data["authored_at"],
-                       structure=dict(data["structure"],token_groups=[g for g in data["structure"].get("token_groups",[]) if all(space.in_scopes(f, scopes) for f in g.get("paths",[]))]), snapshot_path=data["snapshot"]["snapshot_path"])
+                       structure=structure, snapshot_path=data["snapshot"]["snapshot_path"])
         nodes.append(row)
     shown={n["id"] for n in nodes}
-    return dict(nodes=nodes, entities=nodes, edges=[dict(source=n["parent_id"], target=n["id"], relation="current_navigation_address") for n in nodes if n.get("parent_id") in shown])
+    return dict(nodes=nodes, entities=nodes, application_coverage=application_coverage,
+                edges=[dict(source=n["parent_id"], target=n["id"], relation="committed_application_address" if n.get("historical_identity") else "current_navigation_address")
+                       for n in nodes if n.get("parent_id") in shown])
 
 
 def _saved_results(cache, session, plan, query_key):
@@ -217,9 +332,12 @@ def _larger_retry(plan, completed):
 def _compatible_success(outcome, job):
     data = outcome.get("data") or {}
     snapshot = data.get("snapshot") or {}
+    def same_scope(value):
+        return (isinstance(value, list) and bool(value) and all(_relative_path(path) for path in value)
+                and set(value) == set(job["include"]))
     return (not outcome.get("error") and outcome.get("scope_ids") == job["scope_ids"]
             and data.get("repository") == job["repository"] and data.get("pinned_tip") == job["tip"]
-            and data.get("include") == job["include"] and snapshot.get("include") == job["include"]
+            and same_scope(data.get("include")) and same_scope(snapshot.get("include"))
             and snapshot.get("repository") == job["repository"]
             and snapshot.get("commit") == data.get("commit") and snapshot.get("tree") == data.get("tree"))
 
@@ -394,7 +512,7 @@ def view(place="", as_of="", *, space_cache, source_cache=None, cache_path, quer
             break
         visited=index+1
     chart=_chart(plan,completed)
-    done=[n["id"] for n in chart["nodes"] if n["historical_state"]=="committed"]
+    done=[n["id"] for n in chart["nodes"] if n["historical_state"]=="committed" and not n.get("historical_identity")]
     unknown=[n["id"] for n in chart["nodes"] if n["historical_state"]=="unknown"]
     more=visited<len(plan["jobs"])
     dates=sorted({date for outcome in completed.values() for date in (outcome.get("data",{}).get("available_dates",[]) or outcome.get("coverage",{}).get("available_dates",[]))})
@@ -415,8 +533,8 @@ def view(place="", as_of="", *, space_cache, source_cache=None, cache_path, quer
                     + (" Older failure records do not identify the exact exhausted limit; recovery is not guaranteed."
                        if any(not job["exact_failure"] for job in retry_jobs) else "")) if retry_jobs else None
     return dict(schema_version=1,action="system",session_id=session,selected_place=plan["selected"],as_of=plan["as_of"],selection_policy=POLICY,
-                identity_policy="Current catalog supplies address IDs, containment and positions only; labels, files and groups come from the selected committed trees. This is not a historical ownership reconstruction.",
-                chart=chart,**chart,completed_scope_ids=done,repositories=list(completed.values()),query=query,
+                identity_policy="Current catalog supplies saved navigation addresses; additional committed application candidates come only from native analysis inside the pinned snapshot scope. Derived IDs are exact historical addresses, not current products or inferred successors. Neither reconstructs historical ownership.",
+                chart=chart,**chart,completed_scope_ids=done,repositories=[dict(row,job_id=job_id) for job_id,row in completed.items()],query=query,
                 center=center,breadcrumbs=[plan["selected"]],available_dates=dates,date_coverage=dict(repositories_observed=len(date_records),pinned_repositories=len(plan["jobs"]),complete=len(date_records)==len(plan["jobs"]) and not any(r.get("truncated") or r.get("shallow") for r in date_records) and not any(p.get("error") for p in plan["pins"].values()),records=date_records),
                 conversations=[],conversation_policy="No historical conversation attribution has been established; no current conversations are joined.",
                 next_cursor=next_cursor,cursor=f"{session}:{offset}",result_key=query_key,offset=offset,limit=limit,
@@ -425,8 +543,9 @@ def view(place="", as_of="", *, space_cache, source_cache=None, cache_path, quer
                 retry_larger_command=(_command(plan,f"{session}:{offset}",**command_args)+" --retry-larger") if retry_jobs else None,
                 cli_command=_command(plan,f"{session}:{offset}",**command_args),
                 continue_command=_command(plan,next_cursor,**command_args) if next_cursor else None,
-                coverage=dict(complete=not unknown and not more and all(c.get("complete") for c in snapshot_coverage),reconstruction_complete=not unknown and not more,eligible_scopes=len(plan["anchors"]),completed_scopes=len(done),unknown_scope_ids=unknown,
+                coverage=dict(complete=not unknown and not more and all(c.get("complete") for c in snapshot_coverage) and chart["application_coverage"]["complete"],reconstruction_complete=not unknown and not more,eligible_scopes=len(plan["anchors"]),completed_scopes=len(done),unknown_scope_ids=unknown,
                               pinned_repositories=len(plan["jobs"]),visited_repositories=len(completed),more=more,seconds=round(time.monotonic()-started,4),
                               retry_larger_job_ids=[row["job_id"] for row in retry_jobs],
                               reused_repositories=sum(bool(row.get("reused_from_session_id")) for row in completed.values()),
-                              source="Current cached product/moon addresses only; deleted or unindexed products cannot be inferred",snapshot_coverage=snapshot_coverage))
+                              source="Saved current addresses plus native application candidates within retained committed scopes; no historical ownership or succession inferred",
+                              derived_applications=chart["application_coverage"],snapshot_coverage=snapshot_coverage))

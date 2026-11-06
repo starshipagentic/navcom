@@ -197,6 +197,7 @@ def test_sources_panel_searches_the_exact_source_and_paths_of_the_service_comman
 def test_conversation_panel_explores_then_searches_the_listed_collection():
     rail_panel(r"""
 (async()=>{
+ for(const name of ['system','district']){delete places[name].commands.conversation_explore;places[name].commands.conversation_search=places[name].conversation_collections.map(id=>['navcom','atlas','search',places[name].suggested_query||'<query>','--within',id]);}
  replies['/api/atlas']=(path)=>{const q=new URL(path,'http://x').searchParams;return {nodes:[{key:'/k1'},{id:'group'}],total:1,offset:0,query:q.get('q')||'',cli_command:'navcom atlas exact',effective_scope:{collection:q.get('within'),label:'~/w/'+q.get('within').slice(9)}};};
  const box=open({...places.system,conversation_count:1400},'conversations');await tick();await tick();
  assert.deepEqual([...new URL(calls[0].path,'http://x').searchParams],[['action','explore'],['within','projects:a'],['limit','12']]);
@@ -224,6 +225,40 @@ def test_conversation_panel_explores_then_searches_the_listed_collection():
  assert.equal(walk(district).filter(n=>n.tag==='input').length,0,'no words box when the command takes no <query>');
  assert.equal(buttons(district,'Search conversations').length,0);
  assert.ok(words(district).includes('Searched with this place’s own words: “login policy”.'));
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+
+def test_place_conversation_panel_searches_all_collections_pages_and_keeps_child_filter():
+    rail_panel(r"""
+(async()=>{
+ const place={...places.system,commands:{...places.system.commands,
+  conversation_explore:['navcom','atlas','explore','system:coast','--conversations'],
+  conversation_search:[['navcom','atlas','search','<query>','--within','system:coast','--conversations']]}};
+ replies['/api/space']=path=>{const p=new URL(path,'http://x').searchParams,offset=Number(p.get('offset'));return {
+  nodes:[{key:offset?'/other-project':'/first-project'}],total:41,offset,limit:40,more:offset===0,
+  query:p.get('q')||'',cli_command:'navcom atlas exact place scope',
+  conversation_scope:{label:'Coast work',collection_count:31,missing_collection_ids:[]}};};
+ const box=open(place,'conversations');await tick();await tick();
+ let params=new URL(calls[0].path,'http://x').searchParams;
+ assert.equal(params.get('within'),'system:coast');assert.equal(params.get('conversations'),'1');assert.equal(params.get('action'),'explore');
+ assert.equal(walk(box).filter(n=>n.tag==='select').length,0,'place-wide reading needs no opaque collection picker');
+ assert.ok(words(box).includes('Across all 31 recorded project collections in this place.'));
+ assert.ok(words(box).includes('conversation /first-project'));
+ press(box,'More conversations →');await tick();await tick();
+ assert.equal(new URL(calls[1].path,'http://x').searchParams.get('offset'),'40');assert.ok(words(box).includes('conversation /other-project'));
+ assert.equal(route.railPanel.offset,40);
+ const field=walk(box).find(n=>n.tag==='input'&&n.attrs.type==='search'),form=walk(box).find(n=>n.tag==='form');
+ field.value='solve2';field.fire('input');assert.match(walk(box).find(n=>n.tag==='code').textContent,/search solve2 --within system:coast --conversations/);
+ form.fire('submit');await tick();await tick();params=new URL(calls[2].path,'http://x').searchParams;
+ assert.equal(params.get('q'),'solve2');assert.equal(params.get('offset'),'0');assert.equal(params.get('action'),'search');
+ const toggle=walk(box).find(n=>n.attrs?.type==='checkbox');toggle.checked=true;toggle.fire('change');await tick();await tick();
+ params=new URL(calls[3].path,'http://x').searchParams;assert.equal(params.get('children'),'1');assert.equal(params.get('q'),'solve2');
+ assert.equal(route.railPanel.children,true);assert.equal(route.railPanel.offset,0);
+ const saved={...route.railPanel},before=calls.length,again=open(place,'conversations',saved);await tick();await tick();
+ assert.equal(calls.length,before,'restoring the same scoped request uses the existing read cache');
+ assert.ok(walk(again).find(n=>n.attrs?.type==='checkbox').checked);assert.ok(words(again).includes('matching “solve2”'));
+ assert.equal(walk(again).find(n=>n.tag==='code').textContent,'navcom atlas exact place scope');
 })().catch(e=>{console.error(e);process.exitCode=1});
 """)
 
@@ -345,6 +380,53 @@ systemViews.clear();assert.equal(systemOf({id:'moon:m',kind:'moon',parent_id:'pl
 """)
 
 
+def test_ship_hull_art_is_cosmetic_stable_and_independent_of_catalog_order():
+    run_js(DOM + helpers("art") + r"""
+const roles={district:'city',moon:'lab',starbase:'starbase',ship:'ship'},systemViews=new Map();
+let view={breadcrumbs:[],nodes:[]},route={},timeData=null;
+let NAVCOM_SHIP_ART=Array.from({length:33},(_,i)=>({id:'hull:'+i,file:'ship-hull-'+i+'.png',title:'Hull '+i,culture:'Fixture culture '+i%5}));
+const ships=Array.from({length:107},(_,i)=>({id:'fleet:ship:'+i,kind:'ship',label:'Original name '+i,position:{x:i,y:i*2}}));
+const original=JSON.stringify(ships),map=new Map(ships.map(n=>[n.id,art(n).attrs.src]));
+assert.ok(new Set(map.values()).size>=20,'The actual selection should distribute a fleet across many hull illustrations');
+NAVCOM_SHIP_ART.reverse();
+view={breadcrumbs:[{id:'system:other',kind:'system'}],nodes:[...ships].reverse()};route={selected:ships[2].id};
+for(const node of [...ships].reverse()){
+ const changed={...node,label:'Renamed',berth:{id:'different'},status:'ready',art_role:'archive',sprite:'https://example.invalid/other.png'};
+ const small=art(changed),large=art(changed,true),chosen=shipArtwork(node.id);
+ assert.equal(small.attrs.src,map.get(node.id));assert.equal(large.attrs.src,map.get(node.id),'Inspector and map use the same hull');
+ assert.equal(small.attrs.title,'Hull artwork: '+chosen.culture+' · '+chosen.title);
+ assert.equal(small.attrs.alt,'','Artwork makes no additional ship-type or readiness claim');
+ assert.equal(small.attrs.class,'space-art');assert.equal(large.attrs.class,'space-art large','Existing CSS geometry is retained');
+}
+assert.equal(JSON.stringify(ships),original,'Art selection cannot write semantic positions or metadata');
+const initial=ships.map(n=>shipArtwork(n.id).id);
+NAVCOM_SHIP_ART.push({id:'new-hull',file:'ship-new.png',title:'New hull',culture:'New culture'});
+let remapped=0;
+ships.forEach((n,i)=>{const now=shipArtwork(n.id).id;if(now!==initial[i]){remapped++;assert.equal(now,'new-hull','Adding one hull cannot reshuffle between old hulls');}});
+assert.ok(remapped>0&&remapped<ships.length/4);
+// A fresh render after selection/history changes remains a pure stable-ID lookup.
+route={};view={breadcrumbs:[],nodes:[]};
+for(const node of ships)assert.equal(art(JSON.parse(JSON.stringify(node))).attrs.src,'/assets/starship/'+shipArtwork(node.id).file);
+""")
+
+
+def test_ship_art_catalog_fallback_archives_and_image_failure_stay_local():
+    run_js(DOM + helpers("art") + r"""
+const roles={district:'city',moon:'lab',starbase:'starbase',ship:'ship'},systemViews=new Map();
+let view=null,route={},timeData=null,NAVCOM_SHIP_ART=[];
+const ship={id:'ship:fixture',kind:'ship',art_role:'starbase',sprite:'/private/image.png'};
+for(const catalog of [[],null,{},[{id:'x',file:'../ship-other.png',title:'x',culture:'x'}],[{id:'x',file:'ship-evil.svg',title:'x',culture:'x'}]]){
+ NAVCOM_SHIP_ART=catalog;const image=art(ship);
+ assert.equal(image.attrs.src,'/assets/starship/ship.png');assert.ok(!image.hasAttribute('title'));
+}
+NAVCOM_SHIP_ART=[{id:'valid',file:'ship-valid.png',title:'Example hull',culture:'Example culture'}];
+assert.equal(art({...ship,form:'archive'}).attrs.src,'/assets/starship/archive.png');
+assert.equal(art({id:'base',kind:'starbase',sprite:'ship-valid.png'}).attrs.src,'/assets/starship/starbase.png');
+const image=art(ship);assert.equal(image.attrs.src,'/assets/starship/ship-valid.png');
+image.fire('error');assert.equal(image.attrs.src,'/assets/starship/ship.png');assert.ok(!image.hasAttribute('title'));
+""")
+
+
 def test_reader_names_the_commit_date_only_when_the_response_has_one():
     run_js(DOM + helpers("reader") + r"""
 const recordedTime=value=>'T'+value;
@@ -373,6 +455,8 @@ def test_rail_panel_state_is_validated_when_history_restores_it():
 assert.deepEqual(railPanelState({place:'planet:p',panel:'list',choice:2,q:'x',at:'2026-01-02',offset:45}),{place:'planet:p',panel:'list',choice:2,q:'x',at:'2026-01-02',offset:40});
 for(const bad of [null,{place:'',panel:'list'},{place:'p',panel:'launch'},{place:'x'.repeat(201),panel:'list'}])assert.equal(railPanelState(bad),null);
 assert.deepEqual(railPanelState({place:'p',panel:'dated',choice:-1,at:'2026-1-2',q:7}),{place:'p',panel:'dated',choice:0,q:'',at:'',offset:0});
+assert.equal(railPanelState({place:'system:s',panel:'conversations',children:true,offset:45}).children,true);
+assert.equal(railPanelState({place:'system:s',panel:'conversations',children:'true'}).children,false);
 """)
 
 
@@ -475,7 +559,7 @@ def test_reading_from_the_bridge_leaves_the_library_selection_and_saved_state_al
     select = page[page.index("async function select("):page.index("function renderDetail(")]
     run_js("const assert=require('node:assert/strict');\n" + select + r"""
 const classes=new Set(),document={body:{classList:{contains:name=>classes.has(name)}}};
-let detailSeq=0,currentDetail=null,saves=0,renders=0;const state={selected:'/library/own',start:3};
+let detailSeq=0,currentDetail=null,detailOwner='library',saves=0,renders=0;const state={selected:'/library/own',start:3};
 const saveState=()=>saves++,renderList=()=>renders++,renderDetail=()=>{},fail=()=>{},el=()=>({});
 const box={replaceChildren(){},scrollTop:0},$=()=>box,requests=[];
 const api=async path=>{requests.push(path);return {key:'/bridge/read'}};

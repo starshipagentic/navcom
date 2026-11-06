@@ -17,7 +17,7 @@ import time
 
 import navcom_space as space
 
-VERSION = 2
+VERSION = 3
 FRESH_SECONDS = 600
 MAX_PROJECTS = 2000
 INDEX_SESSION_LIMIT = 100
@@ -94,22 +94,15 @@ def _worker(request):
                 text=True, stdout=subprocess.PIPE, check=True)
             result.update(json.loads(process.stdout))
         return result
+    if action == 'inventory':
+        from navcom_source_discovery import group_projects, project_inventory
+        inventory = project_inventory(navcom, request['index'])
+        projects = inventory['nodes']
+        grouped = group_projects(projects)
+        grouped['coverage']['inventory_origins'] = inventory['coverage']
+        return dict(projects=projects, jobs=grouped['jobs'], grouping=grouped['coverage'],
+                    truncated=bool(inventory.get('more')))
     with sqlite3.connect(Path(request['index']).as_uri() + '?mode=ro', uri=True, timeout=.3) as conn:
-        if action == 'inventory':
-            from navcom_discovery import Discovery
-            conn.execute('BEGIN')  # One read snapshot for every inventory page.
-            discovery = Discovery(navcom)
-            projects = []
-            for offset in range(0, MAX_PROJECTS, 200):
-                page = discovery.view(conn, dict(action=['list'], grouping=['projects'],
-                                                offset=[str(offset)], limit=['200']))
-                projects.extend(dict(label=n['label'], collection=n['collection']) for n in page['nodes'])
-                if not page.get('more'):
-                    break
-            from navcom_source_discovery import group_projects
-            grouped = group_projects(projects)
-            return dict(projects=projects, jobs=grouped['jobs'], grouping=grouped['coverage'],
-                        truncated=bool(page.get('more')))
         if action == 'chart':
             result = space.refresh(navcom, conn, Path(request['space']), source_cache=Path(request['sources']),
                 progress=lambda done,total: print(f'Charting destinations {done}/{total}', file=sys.stderr, flush=True))
@@ -226,11 +219,15 @@ def refresh(index_path, space_cache, source_cache, *, seconds=60, limit=20,
         state = space._read(path, {})
         if not path.exists():
             legacy = space._read(state_path(sources), {})
-            if legacy and legacy.get('version') == VERSION and legacy.get('context') == context:
+            if legacy and (legacy.get('version') == VERSION or legacy.get('paused')) and legacy.get('context') == context:
                 state = legacy
                 # Leave legacy bytes intact for another context or an older
                 # reader. Only this matching context may adopt its saved cursor.
                 space._atomic(path, state)
+        # Updating inventory policy must not silently resume a captain's Pause.
+        # The next explicit continuation can repin the upgraded inventory.
+        if automatic and state.get('paused') and state.get('context') == context and not restart:
+            return _result(state, context, started)
         if state and (state.get('version') != VERSION or state.get('context') != context):
             state = {}
         # A browser reload is not consent to undo an explicit Pause. Continue
@@ -432,4 +429,4 @@ def _result(state, context, started, cached=False):
         runtime_error=state.get('runtime_error'),
         indexing=state.get('indexing'), index_error=state.get('index_error'),
         destinations=state.get('destinations'), next_command=shlex.join(command) if more else None,
-        coverage='Pinned indexed projects; bounded source scopes, not a full disk inventory')
+        coverage='Pinned indexed projects and existing Starforge catalog; bounded source scopes, not a full disk inventory')

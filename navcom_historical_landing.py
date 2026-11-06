@@ -25,7 +25,7 @@ CURSOR = re.compile(r"([0-9a-f]{64}):(\d{1,6})\Z")
 MAX_OUTPUT = 32 * 1024 * 1024
 MAX_FILES = 10000
 MAX_BYTES = 64 * 1024 * 1024
-IDENTITY = "Saved navigation addresses and native code-group suggestions at one verified committed tree. Group membership is not historical ownership or a newly inferred product."
+IDENTITY = "Saved navigation addresses, committed native application candidates and code-group suggestions at one verified tree. Derived applications have no asserted current product identity or successor; grouping is not historical ownership."
 CONVERSATIONS = "No conversation is attributed to this commit or code group; current conversations are excluded."
 
 
@@ -77,7 +77,10 @@ def _execute(request):
             raise history.HistoryError("Saved historical address set exceeds the landing bound")
         selected = [node for node in anchors if node.get("id") == request["place_id"]]
         matching = [job for job in jobs if request["place_id"] in job.get("scope_ids", [])]
-        if len(selected) != 1 or len(matching) != 1:
+        derived_job = system._application_job(plan, request["place_id"]) if not selected and not matching else None
+        if derived_job is not None:
+            matching = [derived_job]
+        if (len(selected) != 1 and derived_job is None) or len(matching) != 1:
             raise history.HistoryError("The selected product has no unique pinned repository in this journey")
         job = matching[0]
         if not KEY.fullmatch(job["id"]):
@@ -123,10 +126,17 @@ def _execute(request):
         with reader._open(fd, prefix + "/harvest", directory=True) as harvest_fd:
             reader._source_record(harvest_fd, cache / prefix / "harvest", cache / prefix / "harvest",
                                   snapshot["id"], artifact.name, state["published"])
-        product = next(node for node in system._chart(plan, {job["id"]: outcome})["nodes"] if node["id"] == request["place_id"])
+        if derived_job is not None:
+            native_structure = _record(fd, str(artifact.relative_to(cache)) + "/structure.json")
+            if data.get("structure") != native_structure:
+                raise history.HistoryError("Saved derived application no longer matches its native snapshot analysis")
+        chart = system._chart(plan, {job["id"]: outcome})
+        product = next((node for node in chart["nodes"] if node["id"] == request["place_id"]), None)
+        if product is None:
+            raise history.HistoryError("The derived application is not in this pinned native result")
         if product["historical_state"] != "committed":
             raise history.HistoryError(product.get("historical_gap") or "Historical product is unavailable")
-        scopes = plan["pins"][product["id"]]["include"]
+        scopes = product["historical_scope"] if derived_job is not None else plan["pins"][product["id"]]["include"]
         if not scopes or not all(_path(scope) for scope in scopes):
             raise history.HistoryError("Saved product scope is empty")
         product_files = sorted(path for path in file_records if space.in_scopes(path, scopes))
@@ -166,12 +176,16 @@ def _execute(request):
         # Only saved parent metadata is used; older system pins may not record
         # ancestors above their selected system, so no current chart is consulted.
         parent_map = {node["id"]: node for node in parents}
+        if derived_job is not None:
+            # A lab application's parent may be a saved moon. Keep its dated
+            # row and the original system chain; never resolve today's chart.
+            parent_map.update({node["id"]: node for node in chart["nodes"] if node["id"] != product["id"]})
         breadcrumbs, visited = [], set()
         parent_id = product.get("parent_id")
         while parent_id in parent_map and parent_id not in visited:
             visited.add(parent_id)
             node = parent_map[parent_id]
-            breadcrumbs.insert(0, dict(node, historical_state="navigation_anchor"))
+            breadcrumbs.insert(0, dict(node, historical_state=node.get("historical_state", "navigation_anchor")))
             parent_id = node.get("parent_id")
         structure = product.get("structure", {})
         product = dict(product, land_command=_command(request), file_count=len(product_files), allowed_paths=product_files,
@@ -219,7 +233,9 @@ def _execute(request):
                                        history=snapshot["id"], history_cache=cache, snapshot=artifact.name)
                     hit["source_ref"] = dict(reference, history=snapshot["id"])
             evidence["history"] = snapshot["id"]
-        nodes = [group] if group else [product, *groups]
+        applications = [dict(node, land_command=_command(dict(request, place_id=node["id"], group_id=None)))
+                        for node in chart["nodes"] if node.get("historical_identity") and node.get("parent_id") == product["id"]]
+        nodes = [group] if group else [product, *groups, *applications]
         group_coverage = product.get("structure", {}).get("coverage", {})
         gaps = [] if parent_id is None else ["Ancestor metadata above the original saved view was not recorded."]
         if not receipt.get("coverage", {}).get("complete", False):
@@ -229,7 +245,8 @@ def _execute(request):
         return dict(schema_version=1, action="land", cursor=request["cursor"], session_id=session,
             result_key=request["result_key"], as_of=plan["as_of"], commit=product["commit"], tree=product["tree"],
             query=request["query"], center=group or product, nodes=nodes,
-            edges=[] if group else [dict(source=product["id"], target=node["id"], relation="committed_native_group") for node in groups],
+            edges=[] if group else [dict(source=product["id"], target=node["id"], relation="committed_application_address" if node.get("historical_identity") else "committed_native_group")
+                                   for node in [*groups, *applications]],
             breadcrumbs=breadcrumbs, selected_place=group or product, product=product,
             group_id=request["group_id"], allowed_paths=allowed, files=files,
             snapshot={key: snapshot[key] for key in ("id", "source_id", "kind", "repository", "commit", "tree", "authored_at",
@@ -237,7 +254,7 @@ def _execute(request):
             evidence=evidence, identity_policy=IDENTITY, conversation_policy=CONVERSATIONS,
             cli_command=_command(request, request["group_id"]),
             coverage=dict(complete=bool(receipt.get("coverage", {}).get("complete") and group_coverage.get("complete")),
-                files=len(files), native_groups=len(groups), snapshot=receipt.get("coverage", {}), native_grouping=group_coverage,
+                files=len(files), native_groups=len(groups), derived_applications=len(applications), snapshot=receipt.get("coverage", {}), native_grouping=group_coverage,
                 source= "Saved pinned plan and completed native result only", harvest_invocations=0,
                 current_catalog_read=False, current_repository_read=False, elapsed_seconds=round(time.monotonic()-started, 4),
                 parent_metadata_complete=parent_id is None, gaps=gaps))

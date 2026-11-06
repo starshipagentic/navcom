@@ -35,7 +35,7 @@ const api=(url,body)=>new Promise((resolve,reject)=>requests.push({url,body:stru
 const voiceInput={cancel:no},cancelFlight=no,beginFlight=()=>null,arrive=no,renderCrumbs=no,renderDestinationPager=no,renderSelection=no,renderFooter=no,applySystemTime=no;
 const renderTimeBar=()=>route.timeLanding?renderLandingBar():null,renderTimeResults=()=>route.timeLanding?renderLandingResults():null;
 const renderMap=()=>rendered.push(structuredClone(view));
-const loadDatedConversations=no,loadSource=()=>opened.push(route.sourceRead),hideSource=()=>{readerVisible=false;readerTicket++;},timeLabel=String,message=x=>notices.push(x),fly=x=>flown.push(x),returnToPresent=no;
+const loadDatedConversations=no,hideCarriedReader=no,loadSource=()=>opened.push(route.sourceRead),hideSource=()=>{readerVisible=false;readerTicket++;},timeLabel=String,message=x=>notices.push(x),fly=x=>flown.push(x),returnToPresent=no;
 const openSource=(ref)=>opened.push(ref),evidenceCard=(hit,title,context)=>({hit,ref:sourceRef(hit,context)});
 const galaxy={id:'galaxy:owner',kind:'galaxy',label:'Your galaxy',position:{x:0,y:0}};
 const system={id:'system:orchard',parent_id:galaxy.id,kind:'system',label:'Orchard',position:{x:10,y:10}};

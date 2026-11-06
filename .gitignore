@@ -15,3 +15,6 @@ __pycache__/
 
 # Lab machine-derived snapshots, catalogs and timing receipts stay local
 LABS/**/private/
+# Private local browser receipts are retained on this machine, not published.
+diary/evidence/
+uv.lock

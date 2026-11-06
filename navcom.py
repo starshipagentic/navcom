@@ -746,14 +746,16 @@ _SLASH_ARGS_RE = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.DOTA
 def _rescue_slash_command(text):
     """Claude logs slash commands as <command-name>/goal</command-name><command-args>…</command-args>.
 
-    The args are often the most important thing the user typed (a /goal, a /loop
-    prompt), so keep them as "/goal …" instead of discarding the whole turn.
+    The name is meaningful even without arguments. Keep both bare commands and
+    their optional prompt instead of treating the whole turn as provider setup.
     """
     name = _SLASH_COMMAND_RE.search(text)
     args = _SLASH_ARGS_RE.search(text)
-    if not name or not args or not args.group(1).strip():
+    command = name.group(1).strip() if name else ""
+    if not command:
         return None
-    return f"{name.group(1).strip()} {args.group(1).strip()}"
+    prompt = args.group(1).strip() if args else ""
+    return f"{command} {prompt}" if prompt else command
 
 
 def _raw_turns(key, provider, text_chunk=None):
@@ -796,7 +798,7 @@ def iter_clean_turns(key, provider, text_chunk=None):
         raw = clean_mod.clean_text(text)
         if not raw:
             continue
-        if role == "user" and "<command-name>" in raw:
+        if provider == "claude" and role == "user" and "<command-name>" in raw:
             rescued = _rescue_slash_command(raw)
             if rescued:
                 raw = rescued
@@ -1869,6 +1871,7 @@ def short_ref(key):
 INDEX_SCHEMA_VERSION = 3  # 3: repair Gemini turns stored as {'text': …} reprs
 # Bump when turn extraction changes; older rows get re-read gradually (see index_logs).
 PARSER_VERSION = 4  # 4: native per-event dates and persisted provider ancestry
+PARSER_PROVIDER_VERSIONS = {"claude": 5}  # Preserve bare slash-command turns.
 UPGRADE_BUDGET_SECONDS = 1.0
 UPGRADE_BYTES_PER_SECOND = 40_000_000
 MAX_UPGRADE_REREAD_BYTES = 200_000_000
@@ -2043,6 +2046,7 @@ def _index_recorded_metadata(conn, key, provider):
 def index_log(conn, log, force=False):
     """(Re)index one session. Appended JSONL is indexed incrementally from the stored offset."""
     key, mtime, size, provider = log
+    parser_version = max(PARSER_VERSION, PARSER_PROVIDER_VERSIONS.get(provider, 0))
     row = conn.execute("SELECT mtime, size, offset, msg_index FROM file_state WHERE file=?", (key,)).fetchone()
     if row and not force and row[0] == mtime and row[1] == size:
         return False
@@ -2055,7 +2059,7 @@ def index_log(conn, log, force=False):
         ver = conn.execute("SELECT ver FROM file_parser WHERE file=?", (key,)).fetchone()
         # else one full re-read to pick up parser improvements — unless it's huge (multi-GB
         # codex logs), where stalling this call matters more than the older parse
-        incremental = bool(ver and ver[0] >= PARSER_VERSION) or size > MAX_UPGRADE_REREAD_BYTES
+        incremental = bool(ver and ver[0] >= parser_version) or size > MAX_UPGRADE_REREAD_BYTES
     if incremental:
         offset, msg_index = row[2], row[3] or 0
     else:
@@ -2088,7 +2092,7 @@ def index_log(conn, log, force=False):
     )
     if not incremental:
         conn.execute("DELETE FROM file_meta WHERE file=?", (key,))
-        conn.execute("INSERT OR REPLACE INTO file_parser (file, ver) VALUES (?, ?)", (key, PARSER_VERSION))
+        conn.execute("INSERT OR REPLACE INTO file_parser (file, ver) VALUES (?, ?)", (key, parser_version))
         _index_recorded_metadata(conn, key, provider)
     return True
 
@@ -2153,8 +2157,9 @@ def upgrade_stale_parses(conn, logs, budget=UPGRADE_BUDGET_SECONDS):
     Keeps every call fast after an upgrade while the index converges in the background
     of normal use. `navcom --reindex` does it all at once.
     """
-    current = {row[0] for row in conn.execute("SELECT file FROM file_parser WHERE ver >= ?", (PARSER_VERSION,))}
-    stale = [log for log in logs if log[0] not in current]
+    versions = dict(conn.execute("SELECT file, ver FROM file_parser"))
+    stale = [log for log in logs if versions.get(log[0], 0) <
+             max(PARSER_VERSION, PARSER_PROVIDER_VERSIONS.get(log[3], 0))]
     if not stale:
         return 0
     import time
@@ -2654,7 +2659,8 @@ def _filter_hits(hits, limit, include_self, exclude_keys):
         if exclude_keys and hit.file in exclude_keys:
             excluded += 1
             continue
-        sig = (hit.role, re.sub(r"\s+", " ", (hit.text or "")[:400]))
+        # The same command in another session is another conversation to find.
+        sig = (hit.file, hit.role, re.sub(r"\s+", " ", (hit.text or "")[:400]))
         if sig in seen:
             continue
         seen.add(sig)
@@ -3267,6 +3273,12 @@ retained snapshots. Version families are heuristic suggestions, and literal
 project references do not establish ownership or dated succession. Follow its
 source-page continuation command and exact read/search commands; no harvest or
 chart change occurs during relationship browsing.
+Explicit product replacements appear separately: `.navcom-space.json` at a
+repository root or discovered app can declare `id` and `supersedes` IDs. Ordinary
+`atlas refresh --space` reads them; app claims never apply to sibling products.
+Declared identities survive moves; first declaring an ID rekeys an automatic ID.
+Missing/conflicting claims remain unresolved; observation times are not dates of
+replacement, and current declarations are excluded from historical views.
 `atlas files PLACE --query WORDS` filters retained file paths and returns exact
 snapshot read commands. Follow its generation-pinned continuation command;
 missing paths remain explicit and budget-limited inventories cannot be paged.
@@ -3278,7 +3290,7 @@ or new harvest occurs.
 handover document. Preserve the returned catalog SHA with --catalog for paging
 or search-to-open continuity. --offset, --limit and --max-chars bound output.
 This uses the installed native Starship reader, never current host conversations
-or a captain resume. Remote ships remain unavailable.
+or a captain resume. Remote carried-dialogue reads remain unavailable.
 
 Source reads open immutable harvested bytes, never live working files. Preserve
 returned snapshot and published values when following windows. An exact unchanged
@@ -3339,8 +3351,14 @@ linked-worktree versus independent-copy evidence; --refresh rechecks locations.
 `navcom history land PLACE --cursor PIN --result-key KEY` enters a saved historical product; add --group ID or --query WORDS to inspect its exact native group or source scope.
 `navcom history conversations PLACE --at DATE` reads individually dated indexed turns.
 `navcom atlas ask STAR "question"` prepares a native Hermes handoff.
-`navcom atlas board SHIP --validate` checks a native captain route.
-Use --launch --review TOKEN only to open that reviewed action in a terminal.
+`navcom atlas board SHIP` previews a native captain route. For a recorded remote
+working ship, it discovers the existing fleet/commission receipt and performs
+bounded read-only SSH metadata checks. `--validate` checks the exact native
+thread/workspace using Starship's unchanged lookup helper; no turn is sent.
+`--route` is a local route-file override only. Missing or conflicting evidence
+stops the action; archives cannot board. Use --launch --review TOKEN only to
+revalidate and open the reviewed existing captain in a new terminal. No new
+captain or prompt is created. Terminal dispatch does not prove human takeover.
 `navcom voice status` checks existing local Whisper tools without loading a model.
 `navcom voice transcribe FILE` accepts a short mono 16 kHz PCM WAV.
 Historical ownership, live expert answers and captain takeover remain unverified.
@@ -9510,10 +9528,11 @@ DISCOVER COLLECTIONS (CLI and web share the same scopes and evidence)
   navcom atlas list systems        cached galaxy: systems, planets, moons, cities, ships and bases
   navcom atlas navigate "find matrix in exp32"    resolve the place, then search its evidence
   navcom atlas navigate "fly to exp32 then find matrix" --choose <returned-place-id>    choose an ambiguous destination
-  navcom atlas related <place-id>  native version-family suggestions and documented project references
+  navcom atlas related <place-id>  declared replacements, native version families and documented references
   navcom atlas files <place-id> --query README    retained file paths and pinned source-read commands
   navcom atlas context <ship-id> --query login    search carried dialogue without resuming a captain
   navcom atlas inspect <place-id>  inspect code locations, living stars, or a ship's boarding capability
+  navcom atlas board <ship-id> --validate    check an existing local/SSH captain route without attaching
   navcom sources discover --harvest    discover bounded code/documents and invoke existing Starforge harvest
   navcom history timeline <place-id>    committed changes to a place's paths, with full Git identities
   navcom history explore <place-id> <commit> --query login    cached historical code/document search
@@ -10439,18 +10458,31 @@ def _tab_title(plan):
     return f"{plan['provider']} · {Path(plan['cwd']).name or '~'}" if plan["cwd"] else plan["provider"]
 
 
-def resume_in_new_tab(plan):
-    """Open the resume command in a new tab of the terminal you're in. → (ok, message)."""
+def resume_in_new_tab(plan, *, allow_gui=False):
+    """Open a new terminal; an explicit local web action may use the macOS desktop. → (ok, message)."""
     import subprocess
     pasted = bool(plan.get("paste")) and copy_to_clipboard(plan["paste"])
     if plan.get("paste"):
-        ok, message = _open_tab(plan, subprocess)
+        ok, message = _open_tab(plan, subprocess, allow_gui=allow_gui)
         return ok, message + (f" — the prompt is on your clipboard, paste it into {plan['provider']}" if pasted
                               else f" — then paste this into {plan['provider']}: {plan['paste']}")
-    return _open_tab(plan, subprocess)
+    return _open_tab(plan, subprocess, allow_gui=allow_gui)
 
 
-def _open_tab(plan, subprocess):
+def _desktop_gui_available():
+    """Require the current user's local macOS login, never an SSH/headless fallback."""
+    if sys.platform != "darwin" or any(os.environ.get(key) for key in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")):
+        return False
+    try:
+        import stat
+        console = os.stat("/dev/console")
+        uid = os.getuid()
+        return uid > 0 and os.geteuid() == uid and console.st_uid == uid and stat.S_ISCHR(console.st_mode)
+    except OSError:
+        return False
+
+
+def _open_tab(plan, subprocess, *, allow_gui=False):
     cwd = plan["cwd"] if plan["cwd"] and os.path.isdir(plan["cwd"]) else str(Path.home())
     shell = os.environ.get("SHELL") or "/bin/sh"
     keep_open = [shell, "-lic", f"{shlex.join(plan['argv'])}; exec {shlex.quote(shell)} -l"]
@@ -10492,6 +10524,10 @@ def _open_tab(plan, subprocess):
     if sys.platform == "darwin" and term == "ghostty":
         if run(["open", "-na", "Ghostty.app", "--args", f"--working-directory={cwd}", "-e"] + keep_open):
             return True, "opened in a new Ghostty window"
+    if allow_gui is True and term != "Apple_Terminal" and _desktop_gui_available():
+        if run(["/usr/bin/osascript", "-e", f'tell application "Terminal" to do script {_applescript_str(line)}',
+                "-e", 'tell application "Terminal" to activate']):
+            return True, "opened in a new Terminal window"
     if sys.platform.startswith("linux") and shutil.which("gnome-terminal") and \
             (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         if run(["gnome-terminal", "--tab", f"--working-directory={cwd}", "--"] + keep_open):

@@ -177,12 +177,14 @@ def test_web_old_handle_after_replacement_cannot_seed_new_database_catalog(navco
     changed.execute('UPDATE session_fts SET text=?',('New cobalt replacement',));changed.commit();changed.close()
     os.replace(replacement,db)
     try:
-        first=app.get(old,'/api/navigate',{'q':['find amber'],'local':['0']})
+        # Test replacement of the conversation database independently of the
+        # optional global source inventory (this fixture has no harvested cache).
+        first=app.get(old,'/api/navigate',{'q':['find amber'],'within':['galaxy:owner'],'local':['1']})
         assert first['evidence']['conversations'][0]['label']=='Old amber original'
         assert not navigation._ATLAS_POOL
         new=app.connect()
         try:
-            second=app.get(new,'/api/navigate',{'q':['find cobalt'],'local':['0']})
+            second=app.get(new,'/api/navigate',{'q':['find cobalt'],'within':['galaxy:owner'],'local':['1']})
             assert not second['evidence']['errors']
             assert second['evidence']['conversations'][0]['label']=='New cobalt replacement'
             assert next(iter(navigation._ATLAS_POOL.values()))[0].records[key]['title']=='New cobalt replacement'

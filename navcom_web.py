@@ -6,6 +6,7 @@ function a CLI command reaches. tests/test_architecture.py keeps the route table
 """
 import json
 from pathlib import Path
+import re
 import secrets
 import signal
 import sqlite3
@@ -17,6 +18,39 @@ import webbrowser
 from navcom_discovery import Discovery
 import navcom_navigation as navigation
 import navcom_research as research
+
+
+def _packaged_art(root=None):
+    """Expose only safe packaged manifest entries, never source-library paths."""
+    root = Path(root) if root is not None else Path(__file__).parent / 'assets' / 'starship'
+    # The original role icons remain a safe fallback for older/incomplete
+    # packages whose optional variation manifest is unavailable.
+    roles = ('starbase', 'dock', 'archive', 'lab', 'navcom', 'observatory', 'city', 'ship')
+    allowed = {role + '.png' for role in roles
+               if (root / (role + '.png')).is_file() and not (root / (role + '.png')).is_symlink()}
+    variants = []
+    try:
+        manifest = json.loads((root / 'manifest.json').read_text())
+        entries = manifest.get('assets', []) if isinstance(manifest, dict) else []
+        if not isinstance(entries, list):
+            return allowed, variants
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get('file')
+            if not isinstance(name, str) or not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*\.png', name):
+                continue
+            path = root / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            if name in allowed:
+                continue
+            allowed.add(name)
+            if entry.get('role') == 'ship_variant' and all(isinstance(entry.get(k), str) for k in ('id', 'title', 'culture')):
+                variants.append({k: entry[k] for k in ('id', 'file', 'title', 'culture')})
+    except (OSError, ValueError, TypeError):
+        pass
+    return allowed, sorted(variants, key=lambda item: item['id'])
 
 
 def _turn(value):
@@ -39,6 +73,7 @@ class WebApp:
         self.task = {'running': False, 'message': 'Ready', 'error': False}
         self.refresh_cancel = threading.Event()
         self.atlas = Discovery(api)
+        self.art_files, self.ship_art = _packaged_art()
 
     def connect(self):
         return navigation.conversation_connection(self.index_path, timeout=.3)
@@ -127,6 +162,12 @@ class WebApp:
             return navcom_history.view(value('within'),action='timeline',repo=Path(value('repo')) if value('repo') else None,space_cache=space_cache,
                 source_cache=source_cache,include=params.get('include') or None,limit=number('limit',50))
         if route == '/api/space':
+            if value('conversations')=='1':
+                return navigation.conversations(api,conn,space_cache=space_cache,
+                    action=value('action','explore'),within=value('within'),query=value('q'),
+                    limit=number('limit',12),offset=number('offset',0),provider=value('provider'),
+                    since=value('since'),until=value('until'),favorites=value('favorites') in ('1','true'),
+                    children=value('children') in ('1','true'))
             return navigation.view(api,conn,space_cache=space_cache,source_cache=source_cache,
                 action=value('action','explore'),kind=value('kind'),within=value('within'),query=value('q'),
                 limit=number('limit',80),offset=number('offset',0),include_evidence=value('evidence')=='1')
@@ -184,7 +225,7 @@ class WebApp:
                 if field in data and not isinstance(data[field],bool):raise ValueError('Action switches must be booleans.')
             return navigation.interact(api,space_cache=space_cache,within=data.get('within',''),
                 action=route.rsplit('/',1)[-1],question=data.get('question',''),launch=data.get('launch') is True,
-                review_token=data.get('review_token',''),validate=data.get('validate') is True)
+                review_token=data.get('review_token',''),validate=data.get('validate') is True,allow_gui=True)
         if route == '/api/voice':
             import navcom_voice
             return navcom_voice.transcribe_request(data)
@@ -257,7 +298,7 @@ class WebApp:
                 if not plan: raise ValueError('Original unavailable. Choose a fresh harness.')
                 ok, message, plan = api.prepare_launch(conn, plan)
                 if not ok: raise ValueError(message)
-                ok, message = api.resume_in_new_tab(plan)
+                ok, message = api.resume_in_new_tab(plan, allow_gui=True)
                 return dict(ok=ok, message=message, command=plan['line'])
             raise ValueError('Unknown request')
         finally:
@@ -338,13 +379,15 @@ def make_server(api, index_path, port=0):
                 self.send(200, path.read_text(), 'text/javascript' if path.suffix == '.js' else 'text/css'); return
             if route.path.startswith('/assets/starship/'):
                 name=route.path.removeprefix('/assets/starship/')
-                if name not in {'starbase.png','dock.png','archive.png','lab.png','navcom.png','observatory.png','city.png','ship.png'}:
+                if name not in app.art_files:
                     self.send(404,{'error':'Unknown asset'});return
                 path=Path(__file__).parent/'assets'/'starship'/name
                 self.send(200,path.read_bytes(),'image/png');return
             if route.path == '/':
                 template = Path(__file__).with_name('navcom_web.html').read_text()
-                self.send(200, template.replace('__NAVCOM_TOKEN__', json.dumps(app.token)), 'text/html'); return
+                template = template.replace('__NAVCOM_TOKEN__', json.dumps(app.token))
+                template = template.replace('__NAVCOM_SHIP_ART__', json.dumps(app.ship_art).replace('<', '\\u003c'))
+                self.send(200, template, 'text/html'); return
             if not self.authorized():
                 self.send(403, {'error': 'Local session required'}); return
             self.dispatch(route.path, parse_qs(route.query), False)

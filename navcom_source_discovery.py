@@ -18,6 +18,7 @@ from collections import Counter, deque
 
 from navcom_discovery import Discovery
 from navcom_sources import source_id
+from navcom_source_policy import instruction_document, permitted_path
 
 
 MAX_METADATA_FILES = 160
@@ -78,8 +79,71 @@ def _project_nodes(projects, maximum):
         collection = node.get("collection")
         if collection is not None and (not isinstance(collection, str) or len(collection) > 4096):
             raise ValueError("Pinned project collection identity is invalid")
-        nodes.append(dict(label=node["label"], collection=collection))
+        clean = dict(label=node["label"], collection=collection)
+        origin = node.get("source_origin")
+        if isinstance(origin, dict) and origin.get("kind") == "starforge":
+            clean["source_origin"] = {key: value for key, value in origin.items()
+                                      if isinstance(value, str) and len(value) <= 4096}
+        nodes.append(clean)
     return nodes
+
+
+def project_inventory(api, index_path, *, within=None, inventory="all"):
+    """Join existing inventories before pagination, retaining their actual provenance.
+
+    A native harvested repository has no inferred conversation/client membership.
+    Collection-scoped discovery therefore retains the indexed inventory only.
+    """
+    if inventory not in ("all", "indexed", "starforge"):
+        raise ValueError("Inventory must be all, indexed or starforge")
+    if within and inventory == "starforge":
+        raise ValueError("Starforge inventory has no conversation collection scope")
+    nodes, freshness, truncated = [], None, False
+    coverage = {}
+    if inventory != "starforge":
+        index_path = Path(index_path).expanduser()
+        if not index_path.is_file():
+            if inventory == "indexed" or within:
+                raise ValueError("Conversation index unavailable; index conversations first")
+            coverage["indexed"] = dict(available=False, reason="Conversation index unavailable")
+        else:
+            with contextlib.closing(sqlite3.connect(index_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=.3)) as conn:
+                conn.execute("BEGIN")
+                discovery = Discovery(api)
+                for offset in range(0, MAX_PROJECTS, 200):
+                    params = dict(action=["list"], grouping=["projects"], limit=["200"], offset=[str(offset)])
+                    if within:
+                        params["within"] = [within]
+                    page = discovery.view(conn, params)
+                    nodes.extend(_project_nodes(page["nodes"], 200))
+                    freshness = page.get("freshness")
+                    truncated = bool(page.get("more"))
+                    if not truncated:
+                        break
+            coverage["indexed"] = dict(available=True, rows=len(nodes), truncated=truncated)
+    if inventory != "indexed" and not within:
+        from navcom_starforge_inventory import inventory as native_inventory
+        native = native_inventory()
+        coverage["starforge"] = native["coverage"]
+        # Visit the existing harvest first: these repositories need not have any
+        # local conversation path, which was the original intake blind spot.
+        nodes = _project_nodes(native["nodes"], MAX_PROJECTS) + nodes
+        truncated = truncated or bool(native["coverage"].get("truncated"))
+    elif within:
+        coverage["starforge"] = dict(available=False, reason="Collection scope has no declared Starforge membership")
+    unique = []
+    seen = set()
+    for node in nodes:
+        key = (node["label"], node.get("collection"), json.dumps(node.get("source_origin"), sort_keys=True))
+        if key not in seen:
+            seen.add(key)
+            unique.append(node)
+    truncated = truncated or len(unique) > MAX_PROJECTS
+    requested = [key for key in coverage if not (key == "starforge" and within)]
+    complete = not truncated and all(coverage[key].get("available") and coverage[key].get("complete", True)
+                                     for key in requested)
+    return dict(nodes=unique[:MAX_PROJECTS], freshness=freshness, more=truncated,
+                coverage=coverage, complete=complete)
 
 
 def group_projects(projects):
@@ -460,7 +524,8 @@ def _metadata(root, max_files=10000, max_bytes=64 * 1024 * 1024, max_file_bytes=
         def needs_ignore_policy(path):
             """Do not ask Git about bytes this intake can never select or traverse."""
             relative = path.relative_to(root)
-            if any(part.startswith(".") or part.casefold() in EXCLUDED_DIRS for part in relative.parts) or path.is_symlink():
+            if (not permitted_path(relative, directory=path.is_dir()) or
+                    any(part.casefold() in EXCLUDED_DIRS for part in relative.parts) or path.is_symlink()):
                 return False
             return (path.is_dir() or path.name in METADATA_NAMES or _expertise_document(path)
                     or path.suffix.lower() in CODE_SUFFIXES | {".md"})
@@ -499,7 +564,8 @@ def _metadata(root, max_files=10000, max_bytes=64 * 1024 * 1024, max_file_bytes=
 
         def safe(path):
             relative = path.relative_to(root)
-            if any(part.startswith(".") or part.casefold() in EXCLUDED_DIRS for part in relative.parts):
+            if (not permitted_path(relative, directory=path.is_dir()) or
+                    any(part.casefold() in EXCLUDED_DIRS for part in relative.parts)):
                 reject(path, "hidden, secret or generated path")
                 return False
             if any((root.joinpath(*relative.parts[:i])).is_symlink()
@@ -620,7 +686,7 @@ def _metadata(root, max_files=10000, max_bytes=64 * 1024 * 1024, max_file_bytes=
                 continue
             application_roots.add(folder)
             for path in children(folder):
-                if path.name in METADATA_NAMES or _expertise_document(path):
+                if path.name in METADATA_NAMES or _expertise_document(path) or instruction_document(path.relative_to(root)):
                     add(path)
             for pattern in patterns(folder):
                 pending.extend(expand(folder, pattern))
@@ -659,7 +725,7 @@ def _metadata(root, max_files=10000, max_bytes=64 * 1024 * 1024, max_file_bytes=
                         else:
                             folders.append((path, depth + 1))
                     elif path.is_file() and path not in attempted:
-                        if path.name in NESTED_MANIFESTS or _expertise_document(path):
+                        if path.name in NESTED_MANIFESTS or _expertise_document(path) or instruction_document(path.relative_to(root)):
                             yield path, "metadata"
                         elif path.suffix.lower() not in CODE_SUFFIXES:
                             reject(path, "not an automatic code or metadata input")
@@ -741,7 +807,7 @@ def _metadata(root, max_files=10000, max_bytes=64 * 1024 * 1024, max_file_bytes=
 
 
 def discover(api, index_path, cache_path, limit=200, offset=0, within=None, progress=None, *, projects=None,
-             project_boundaries=None):
+             project_boundaries=None, inventory_kind="indexed"):
     """Discover one inventory page and preserve registered source scopes.
 
     ``projects`` is an internal page of already pinned Discovery nodes, not a
@@ -758,7 +824,15 @@ def discover(api, index_path, cache_path, limit=200, offset=0, within=None, prog
               "limit": [str(limit)], "offset": [str(offset)]}
     if within:
         params["within"] = [within]
-    if projects is None:
+    if projects is None and inventory_kind != "indexed":
+        combined = project_inventory(api, index_path, within=within, inventory=inventory_kind)
+        inventory = dict(nodes=combined["nodes"][offset:offset + limit],
+                         more=len(combined["nodes"]) > offset + limit,
+                         freshness=combined["freshness"], origins=combined["coverage"],
+                         truncated=combined["more"], complete=combined["complete"])
+        if project_boundaries is None:
+            project_boundaries = combined["nodes"]
+    elif projects is None:
         index_path = Path(index_path).expanduser()
         if not index_path.is_file():
             raise ValueError("Conversation index unavailable; index conversations first")
@@ -789,7 +863,10 @@ def discover(api, index_path, cache_path, limit=200, offset=0, within=None, prog
         root, native = _git_root(path, with_status=True)
         if native:
             native_roots.add(root)
-        grouped.setdefault(root, []).append({"path": str(path), "collection": node.get("collection")})
+        association = {"path": str(path), "collection": node.get("collection")}
+        if node.get("source_origin"):
+            association["source_origin"] = node["source_origin"]
+        grouped.setdefault(root, []).append(association)
     sources, scopes = [], []
     for ordinal, (root, associations) in enumerate(sorted(grouped.items()), 1):
         if progress:
@@ -817,10 +894,17 @@ def discover(api, index_path, cache_path, limit=200, offset=0, within=None, prog
             max_files=old.get("max_files", 10000),
             max_bytes=old.get("max_bytes", 64 * 1024 * 1024),
             max_file_bytes=old.get("max_file_bytes", 2 * 1024 * 1024),
-            conversation_collection=next((a["collection"] for a in associations if a["path"] == str(root)), old.get("conversation_collection")),
+            conversation_collection=next((a["collection"] for a in associations if a["path"] == str(root) and a.get("collection")), old.get("conversation_collection")),
         )
+        origins = list(old.get("source_origins", []))
+        for association in associations:
+            origin = association.get("source_origin")
+            if origin and origin not in origins:
+                origins.append(origin)
+        if origins:
+            source["source_origins"] = origins
         all_associations = {a["path"]: a for a in old.get("conversation_projects", [])}
-        all_associations.update({a["path"]: a for a in associations})
+        all_associations.update({a["path"]: a for a in associations if a.get("collection")})
         source["conversation_projects"] = [all_associations[k] for k in sorted(all_associations)]
         source["conversation_collections"] = sorted({a["collection"] for a in all_associations.values() if a["collection"]})
         sources.append(source)
@@ -831,6 +915,8 @@ def discover(api, index_path, cache_path, limit=200, offset=0, within=None, prog
         "within": within, "freshness": inventory.get("freshness"),
         "sources": len(sources), "skipped": skipped, "scopes": scopes,
         "selection": "bounded code and metadata; declared workspaces sampled fairly; existing registered scopes retained",
-        "full_inventory": projects is None and not offset and not inventory.get("more"),
+        "inventory_origins": inventory.get("origins", {}),
+        "inventory_truncated": bool(inventory.get("truncated")),
+        "full_inventory": projects is None and not offset and not inventory.get("more") and not inventory.get("truncated") and inventory.get("complete", True),
         "selection_input": "pinned_project_page" if projects is not None else "live_discovery_page",
     }}

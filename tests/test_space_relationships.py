@@ -1,9 +1,79 @@
 """Connections preserve pinned source identities and ignore stale navigation replies."""
 from pathlib import Path
+from test_space_action_rail import DOM
 from test_space_camera import js_between, run_js
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def render_program(body):
+    source = (ROOT / "navcom_space.js").read_text()
+    helpers = js_between("function renderRelated(", "function renderShipCopies(")
+    helpers += js_between("function relatedSourceRef(", "async function loadRelated(")
+    helpers += source[source.index("function pathRow("):].splitlines()[0]
+    helpers += source[source.index("function recordedTime("):].splitlines()[0]
+    run_js(DOM + helpers + r"""
+const panel=el('section'),node={id:'planet:lantern'},route={relatedQuery:'',relatedOffset:0};
+const flights=[],reads=[];const fly=id=>flights.push(id),openSource=(...args)=>reads.push(args);
+const closeRelated=()=>{},remember=()=>{},loadRelated=()=>{},cliLine=command=>el('code',{},command);
+const data={declared_relations:[{kind:'declared_supersession',status:'declared',
+ successor:{id:'planet:lantern',label:'Lantern',declared_id:'orchard.lantern'},
+ predecessor:{id:'planet:beacon',label:'Beacon',declared_id:'orchard.beacon'},
+ meaning:'Current recorded declaration. No replacement date, deployment state or historical ownership is inferred.',
+ evidence:{type:'owner_declaration',declarations:[{path:'/work/lantern/.navcom-space.json',observed_at:1700000000,stale:false}],stale:false}}],
+ families:[{label:'Lantern engine',parent_path:'/work/lantern/engines',members:[{label:'v1',relative_path:'engines/v1',retained_files:2,destination_ids:[],
+ source_ref:{source_id:'retained',relative_path:'engines/v1/README.md',line:12,snapshot:'a'.repeat(64),published:123}}]}],
+ references:[],source_offset:0,source_total:1,source_page_size:8,next_offset:null,cached:true,coverage:[]};
+""" + body)
+
+
+def test_declared_supersession_precedes_suggestions_and_flies_exact_endpoints():
+    render_program(r"""
+const before=structuredClone(data);renderRelated(panel,data,node);
+const shown=words(panel);assert.ok(shown.indexOf('Lantern supersedes Beacon')<shown.indexOf('Lantern engine'));
+assert.match(shown,/Current recorded declaration\. No replacement date/);
+assert.match(shown,/Version families below are suggestions/);assert.match(shown,/not a replacement date/);
+const provenance=walk(panel).find(n=>n.tag==='details'&&words(n.children[0])==='Declaration provenance');
+assert.ok(provenance);assert.equal(provenance.hasAttribute('open'),false);assert.match(words(provenance),/\/work\/lantern\/\.navcom-space.json/);
+press(panel,'Fly to Lantern →');press(panel,'Fly to Beacon →');assert.deepEqual(flights,['planet:lantern','planet:beacon']);
+press(provenance,'Copy');assert.deepEqual(copied,['/work/lantern/.navcom-space.json']);
+press(panel,'Read README.md');assert.deepEqual(reads[0][0],{source:'retained',path:'engines/v1/README.md',line:4,focus:12,limit:80,published:123,snapshot:'a'.repeat(64)});
+assert.deepEqual(data,before);assert.deepEqual(calls,[]);
+""")
+
+
+def test_declaration_and_source_warnings_are_visible_without_promoting_diagnostics():
+    render_program(r"""
+data.declared_relations[0].evidence.stale=true;data.families=[];
+data.declaration_diagnostics=[{code:'unresolved_target',declared_id:'orchard.lantern',target_declared_id:'orchard.missing',
+ reason:'No recorded product owns orchard.missing.',paths:['/work/lantern/.navcom-space.json']}];
+data.source_errors=['Retained native sources are unavailable.'];renderRelated(panel,data,node);
+const shown=words(panel);assert.match(shown,/Declaration evidence is stale/);assert.match(shown,/unresolved_target: No recorded product owns orchard.missing/);
+assert.match(shown,/Retained native sources are unavailable/);assert.equal(buttons(panel).filter(b=>words(b).startsWith('Fly to ')).length,2);
+const warnings=walk(panel).filter(n=>n.attrs.class==='space-search-warning');assert.equal(warnings.length,3);
+assert.ok(warnings.every(n=>n.tag!=='details'));assert.equal(walk(panel).filter(n=>n.tag==='strong'&&words(n).includes('supersedes')).length,1);
+assert.deepEqual(calls,[]);
+""")
+
+
+def test_declaration_only_products_expose_the_existing_connections_action():
+    rail = js_between("function placeRail(", "function renderSelection(")
+    run_js(DOM + rail + r"""
+const route={relatedPlace:''},railLines=[],opened=[];
+const cliLine=command=>el('code',{},command.join(' ')),openRelated=node=>opened.push(node.id);
+const base={id:'planet:lantern',kind:'planet',label:'Lantern',source_ids:[],
+ commands:{related:['navcom','atlas','related','planet:lantern']}};
+for(const declaration of [{declared_id:'orchard.lantern'},{product_declarations:[{relation:'supersedes',target:'orchard.beacon'}]},
+ {evidence:[{type:'owner_declaration',path:'/work/lantern/.navcom-space.json'}]}]){
+ const node={...base,...declaration},{rail:actions,used}=placeRail(node,true);
+ assert.equal(buttons(actions,'Connections & versions').length,1);assert.ok(used.has('related'));
+ assert.match(words(actions),/navcom atlas related planet:lantern/);press(actions,'Connections & versions');
+}
+assert.deepEqual(opened,['planet:lantern','planet:lantern','planet:lantern']);
+assert.equal(buttons(placeRail(base,true).rail,'Connections & versions').length,0);
+assert.deepEqual(calls,[],'Rendering the action does not inspect or harvest a source');
+""")
 
 
 def test_related_source_refs_preserve_snapshot_and_publication_for_exact_reads():

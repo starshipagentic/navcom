@@ -1,7 +1,8 @@
-"""Cached native lineage suggestions and literal documented place references.
+"""Published product declarations, native suggestions and document references.
 
-These are evidence about retained source paths, never ownership, ancestry, or
-historical succession. All analysis runs against immutable harvest snapshots.
+Native analysis runs against immutable harvest snapshots and does not establish
+product succession. Explicit supersession is read separately from the chart;
+it records current declarations, never a reconstructed historical fact.
 """
 from collections import defaultdict
 import json
@@ -12,6 +13,7 @@ import shlex
 import subprocess
 import tempfile
 import time
+from urllib.parse import unquote
 
 VERSION = 1
 SOURCE_PAGE = 8
@@ -19,6 +21,71 @@ MAX_FILES = 20000
 MAX_DIRECTORIES = 2000
 MAX_GROUPS = 128
 MAX_OUTPUT = 4 * 1024 * 1024
+MAX_REPOSITORIES = 2000
+URL_TOKEN = re.compile(r"(?:https?|ssh|git)://[^\s<>\[\](){}\"'`]+|git@[^\s<>\[\](){}\"'`]+", re.I)
+
+
+def _repository_targets(chart):
+    """Use recorded Git identities, not manifest names or guessed hosting paths."""
+    from navcom_space import sanitize_origin
+    targets = {}
+    for node in chart['entities']:
+        if node.get('kind') not in ('planet', 'moon'):
+            continue
+        for evidence in node.get('evidence', []):
+            value, root = evidence.get('origin'), evidence.get('path')
+            if evidence.get('type') != 'repository_identity' or not isinstance(value, str) or not isinstance(root, str):
+                continue
+            # Saved origins are already canonical host/path identities. Local
+            # remotes remain covered by the existing literal-path references.
+            if value.startswith('file:') or len(value) > 4096 or len(root) > 4096 or not Path(root).is_absolute():
+                continue
+            try:
+                origin = sanitize_origin('https://' + value)
+            except ValueError:
+                continue
+            if origin != value or '/' not in origin or any(part in ('.', '..') for part in origin.split('/')):
+                continue
+            key = (origin, node['id'])
+            row = dict(origin=origin, root=root, destination_id=node['id'])
+            if key not in targets or root < targets[key]['root']:
+                targets[key] = row
+    return sorted(targets.values(), key=lambda row: (row['origin'], row['destination_id']))
+
+
+def _repository_pattern(targets):
+    patterns = []
+    for origin in sorted({row['origin'] for row in targets}, key=lambda value: (-len(value), value)):
+        host, path = origin.split('/', 1)
+        # URL remotes may carry an explicit numeric port; SCP-style Git
+        # addresses still use the single colon immediately before the path.
+        patterns.append(r'(?i:' + re.escape(host) + r')(?::[0-9]+)?[/:]' + re.escape(path) +
+                        r'(?:\.git)?(?=$|[/#?\s<>\[\](){}\"\x27`,;.])')
+    return '|'.join(patterns)
+
+
+def _repository_matches(text, targets):
+    """Validate complete URL tokens; never emit credentials/query values."""
+    from navcom_space import sanitize_origin
+    origins = sorted({row['origin'] for row in targets}, key=lambda value: (-len(value), value))
+    seen = set()
+    for token in URL_TOKEN.findall(text):
+        try:
+            canonical = sanitize_origin(token.rstrip('.,;'))
+        except ValueError:
+            continue
+        if any(part in ('.', '..') for part in unquote(canonical).split('/')):
+            continue
+        for origin in origins:
+            if canonical not in (origin, origin + '.git') and not canonical.startswith((origin + '/', origin + '.git/')):
+                continue
+            # A nested known origin wins over an enclosing address. The whole
+            # canonical URL remains evidence, never a declaration of ancestry.
+            key = (origin, canonical)
+            if key not in seen:
+                seen.add(key)
+                yield origin, canonical
+            break
 
 
 def _safe(value):
@@ -121,6 +188,8 @@ def _native(request):
     # roots. A reference to an unknown child is not a reference to its container.
     pattern = '|'.join(re.escape(root) + (r'(?=$|[\s`)\]#])' if root in container_roots
         else r'(?=$|[/\s`)\]#])') for root in sorted(root_targets, key=len, reverse=True))
+    repository_targets = request.get('repository_targets', [])
+    repository_pattern = _repository_pattern(repository_targets) if len(repository_targets) <= MAX_REPOSITORIES else ''
     references = []
     families = []
     evidence = []
@@ -155,6 +224,28 @@ def _native(request):
                                 meaning='This retained document literally references the target path; no ancestry or ownership is inferred.'))
         elif pattern:
             inspected['omitted'].append('Known-root reference pattern exceeded 32768 characters.')
+        inspected['repository_reference_targets'] = len(repository_targets)
+        if len(repository_targets) > MAX_REPOSITORIES:
+            inspected['omitted'].append('Known repository identities exceeded the 2000-target reference budget.')
+        if repository_pattern and len(repository_pattern) <= 32768:
+            hits = native.combined_search(dict(query=repository_pattern, regex=True, ext='md', mode='text',
+                within=source['id'], paths=paths, limit=100), cache, state=state, extractor=engine)
+            inspected['repository_reference_hits_truncated'] = hits['potentially_truncated']
+            for hit in hits['text_hits']:
+                for origin, url in _repository_matches(hit['match'], repository_targets):
+                    for target in repository_targets:
+                        if target['origin'] != origin or target['root'] == source['root']:
+                            continue
+                        references.append(dict(kind='documented_repository_reference', source_id=source['id'],
+                            source_snapshot=Path(source['artifact']).name,
+                            path=hit['relative_path'], relative_path=hit['relative_path'], line=hit['line'],
+                            excerpt=url, excerpt_kind='canonical_repository_url', target_origin=origin,
+                            target_source_id=next(iter(root_targets.get(target['root'], [])), None),
+                            target_root=target['root'], destination_ids=[target['destination_id']],
+                            engine='starforge code-search',
+                            meaning='This retained document links to the recorded Git repository address; no shared product identity, current synchronization, ancestry or succession is inferred.'))
+        elif repository_pattern:
+            inspected['omitted'].append('Known-repository URL pattern exceeded 32768 characters.')
         if request['query']:
             evidence.append(dict(source_id=source['id'], **native.combined_search(dict(query=request['query'],
                 mode='both', within=source['id'], paths=paths, limit=min(request['limit'], 20)),
@@ -204,6 +295,34 @@ def _run(request, seconds):
             process.wait()
 
 
+def _declared_relations(chart, selected, space_cache, source_cache):
+    """Project exact authored edges; do not inherit a root claim in its apps."""
+    from navcom_space import subtree
+    nodes = {node['id']: node for node in chart['entities']}
+    inside = subtree(nodes.values(), selected['id'])
+
+    def endpoint(identity):
+        node = nodes[identity]
+        command = ['navcom', 'atlas', 'show', identity, '--space-cache', str(space_cache),
+                   '--source-cache', str(source_cache)]
+        return dict(id=identity, label=node['label'], declared_id=node.get('declared_id'),
+                    show_command=shlex.join(command))
+
+    result = []
+    for edge in chart.get('edges', []):
+        if (edge.get('relation') != 'supersedes' or edge.get('status') != 'declared'
+                or edge.get('source') not in nodes or edge.get('target') not in nodes
+                or not inside.intersection((edge['source'], edge['target']))):
+            continue
+        result.append(dict(kind='declared_supersession', status='declared',
+            successor=endpoint(edge['source']), predecessor=endpoint(edge['target']),
+            evidence=edge.get('evidence', {}),
+            meaning='Current recorded declaration. No replacement date, deployment state or historical ownership is inferred.'))
+    result.sort(key=lambda item: (item['successor']['label'].casefold(), item['predecessor']['label'].casefold(),
+                                  item['successor']['id'], item['predecessor']['id']))
+    return result
+
+
 def related(space_cache, source_cache, within, *, query='', limit=20, seconds=15, offset=0):
     import navcom_space as space
     space_cache = Path(space_cache).expanduser().resolve()
@@ -214,6 +333,22 @@ def related(space_cache, source_cache, within, *, query='', limit=20, seconds=15
         raise ValueError('Use limit 1–100, seconds 1–30 and a nonnegative source offset.')
     chart = space.load_catalog(space_cache)
     selected = space.view(space_cache, action='show', within=within, catalog=chart)['center']
+    declared = _declared_relations(chart, selected, space_cache, source_cache)
+    inside = space.subtree(chart['entities'], selected['id'])
+    declared_ids = {node['declared_id'] for node in chart['entities']
+                    if node['id'] in inside and node.get('declared_id')}
+    declaration_paths = {item['path'] for node in chart['entities'] if node['id'] in inside
+                         for item in node.get('evidence', [])
+                         if item.get('type') == 'owner_declaration' and item.get('path')}
+    diagnostics = [item for item in chart.get('coverage', {}).get('product_succession', {}).get('diagnostics', [])
+                   if selected['id'] == space.GALAXY or item.get('declared_id') in declared_ids
+                   or item.get('target_declared_id') in declared_ids
+                   or declaration_paths.intersection(item.get('paths', []))]
+    if query:
+        terms = query.casefold().split()
+        declared = [item for item in declared if all(term in ' '.join(
+            str(item[side].get(field) or '') for side in ('successor', 'predecessor')
+            for field in ('label', 'declared_id')).casefold() for term in terms)]
     scopes = defaultdict(set)
     for scope in selected.get('source_scopes', []):
         paths = scope.get('paths')
@@ -231,12 +366,19 @@ def related(space_cache, source_cache, within, *, query='', limit=20, seconds=15
             container_roots.update(item['path'] for item in evidence if item.get('type') == 'repository_identity'
                 and item.get('basis') == 'Local path fallback' and item.get('path'))
     page = ordered[int(offset):int(offset) + SOURCE_PAGE]
+    repository_targets = _repository_targets(chart)
+    source_errors = []
+    result = dict(schema_version=VERSION, families=[], references=[], evidence=[], coverage=[],
+                  published=None, cached=True, harvest_invocations=0)
     if page:
-        result = _run(dict(source_cache=str(Path(source_cache).expanduser().resolve()), scopes=page,
-                          query=query, limit=int(limit), container_roots=sorted(container_roots)), float(seconds))
-    else:
-        result = dict(schema_version=VERSION, families=[], references=[], evidence=[], coverage=[],
-                      published=None, cached=True, harvest_invocations=0)
+        try:
+            result = _run(dict(source_cache=str(Path(source_cache).expanduser().resolve()), scopes=page,
+                              query=query, limit=int(limit), container_roots=sorted(container_roots),
+                              repository_targets=repository_targets), float(seconds))
+        except (ValueError, TimeoutError, OSError) as exc:
+            if not declared and not diagnostics:
+                raise
+            source_errors.append(str(exc))
     for family in result['families']:
         root = result['source_roots'][family['source_id']]
         for member in family['members']:
@@ -261,8 +403,9 @@ def related(space_cache, source_cache, within, *, query='', limit=20, seconds=15
     for reference in result['references']:
         reference['source_ref'] = dict(source_id=reference['source_id'], relative_path=reference['relative_path'],
             line=reference['line'], snapshot=reference['source_snapshot'], published=result['published'])
-        reference['destination_ids'] = sorted(node['id'] for node in chart['entities']
-            if any(location.get('path') == reference['target_root'] for location in node.get('locations', [])))
+        if reference['kind'] != 'documented_repository_reference':
+            reference['destination_ids'] = sorted(node['id'] for node in chart['entities']
+                if any(location.get('path') == reference['target_root'] for location in node.get('locations', [])))
         reference['read_command'] = shlex.join(['navcom', 'sources', 'read', reference['source_id'], reference['path'],
             '--line', str(reference['line']), '--limit', '8', '--cache', str(source_cache),
             '--published', str(result['published']), '--snapshot', reference['source_snapshot']])
@@ -277,9 +420,11 @@ def related(space_cache, source_cache, within, *, query='', limit=20, seconds=15
     result['references'] = result['references'][:int(limit)]
     result.update(center=selected, query=query, chart_published=chart['published'], source_offset=int(offset), source_total=len(ordered),
         source_page_size=SOURCE_PAGE, next_offset=int(offset) + SOURCE_PAGE if int(offset) + SOURCE_PAGE < len(ordered) else None,
-        result_limits=dict(families=family_count, references=reference_count, limit=int(limit),
-                           truncated=family_count > int(limit) or reference_count > int(limit)),
-        meaning='Retained source evidence only. Families are suggestions, references are literal, and neither changes the chart or establishes historical succession.')
+        declared_relations=declared[:int(limit)],
+        declaration_diagnostics=diagnostics, source_errors=source_errors,
+        result_limits=dict(families=family_count, references=reference_count, declared_relations=len(declared), limit=int(limit),
+                           truncated=family_count > int(limit) or reference_count > int(limit) or len(declared) > int(limit)),
+        meaning='Explicit product declarations are separate from native evidence. Families are suggestions, references are literal, and neither changes the chart or establishes historical succession. Current declarations do not establish past ownership or replacement dates.')
     command = ['navcom', 'atlas', 'related', selected['id'], '--space-cache', str(space_cache),
                '--source-cache', str(source_cache), '--limit', str(limit), '--seconds', str(seconds)]
     if query: command += ['--query', query]

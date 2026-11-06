@@ -122,7 +122,7 @@ def test_plan_route_focuses_a_turn_like_resume_ref_turn(app, indexed):
 def test_launch_route_starts_the_focused_plan_after_the_shared_preflight(app, indexed, navcom, monkeypatch):
     web, conn = app
     launched, checked = [], []
-    monkeypatch.setattr(navcom, "resume_in_new_tab", lambda plan: (launched.append(plan) or True, "opened"))
+    monkeypatch.setattr(navcom, "resume_in_new_tab", lambda plan, **options: (launched.append(plan) or True, "opened"))
     real = navcom.prepare_launch
     monkeypatch.setattr(navcom, "prepare_launch", lambda db, plan: checked.append(plan) or real(db, plan))
     monkeypatch.setattr(navcom.shutil, "which", lambda exe: "/usr/bin/" + exe)
@@ -142,7 +142,7 @@ STUB_TAB = r"""
 import sys
 sys.path.insert(0, sys.argv[1])
 import navcom
-navcom.resume_in_new_tab = lambda plan: (True, "opened (test)")  # never a real terminal tab
+navcom.resume_in_new_tab = lambda plan, **options: (True, "opened (test)")  # never a real terminal tab
 sys.exit(navcom.run(sys.argv[2:]))
 """
 

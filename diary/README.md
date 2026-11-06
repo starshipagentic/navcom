@@ -1,5 +1,25 @@
 # navcom diary
 
+- [2026-10-17 — Products inside one repository](2026-10-17-products-inside-one-repository.md) — each discovered app can retain its own declared identity through moves, separate source/conversation scope, replacement links, installed native CLI and browser proof.
+
+- [2026-10-17 — Follow an explicit product replacement](2026-10-17-declared-product-replacements.md) — existing root declarations, automatic chart refresh, shared CLI/API relationships, real Fly/Back/reload proof, and remaining multi-product identity decisions.
+
+- [2026-10-17 — Ask for the experiments, fly, and return](2026-10-17-navigator-lists-and-return.md) — shared cached kind lists, typed Back, installed CLI and real browser paging/reload/copied-link proof, compact desktop and narrow layouts.
+
+- [2026-10-17 — Arrive where the work is](2026-10-17-arrival-workspaces-and-historical-applications.md) — ship and historical source workspaces, native committed application destinations, real CLI/browser proof, readable evidence paths and carried-reader Back repair.
+
+- [2026-10-17 — Follow evidence and open the captain](2026-10-17-arrival-evidence-and-native-handoff.md) — relevant cited question summaries, honest source coverage, GUI terminal-launch repair, installed CLI/browser proof and pending visible captain takeover.
+
+- [2026-10-17 — Keep the passage, not just the place](2026-10-17-conversation-passage-continuity.md) — installed exact-turn reload, Back/Forward, copied-link and child-reader proof; Library isolation; remaining product, voice, captain and missing-history gaps.
+
+- [2026-10-16 — Search whole places and follow evidence](2026-10-16-search-whole-places-and-follow-evidence.md) — shared CLI/API conversation scope, all collections, children and paging, query-preserving evidence flight, installed browser proof, and remaining reader-restoration gap.
+
+- [2026-10-16 — Basic solve2 search](2026-10-16-basic-solve2-search.md) — bare slash-command parser and cross-session deduplication repairs, installed CLI proof, and 44 missing original ThriveCart session IDs; transcript recovery remains unresolved.
+
+- [2026-10-16 — Search the existing harvest](2026-10-16-search-the-existing-harvest.md) — native catalog intake, authored command files, global source coverage before chart publication, and real solve2 CLI/browser proof.
+
+- [2026-10-16 — Arrivals should contain the work](2026-10-16-arrivals-berths-and-place-questions.md) — compact bridge, stable fleet berths and original ship art, shared CLI/UI place briefings, cited local-answer adapter, real offline-project proof and remaining gaps.
+
 - [2026-10-16 — The galaxy becomes a cockpit](2026-10-16-galaxy-becomes-a-cockpit.md) — one action rail per place (each action = one twin API call + the service's own navcom command), system hue families, archive sprite, review-first launches, focus/memo/Library-state polish, proof gif.
 - [2026-10-16 — The dated journey is proven live](2026-10-16-dated-journey-proven-live.md) — Playwright UI == API on Syra Oct 1 → mobile → sign-in → login → pinned file → Back/Forward/reload/copied link (camera in links); write guards; reload bug fixed; 7/7 on installed 0.11.0.
 - [2026-10-16 — BDD for every cockpit verb](2026-10-16-bdd-for-every-cockpit-verb.md) — real "Orchard" fixture galaxy, verb-family features, mutation-tested; `ask/board --launch` no-terminal KeyError fixed.

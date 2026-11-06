@@ -116,6 +116,7 @@ class FrozenEvidence:
         self.coverage = deepcopy(list(coverage))
         self.mentions = {r['id']: resolve(r, entities) for r in self.records}
         self.categories = {r['id']: category(r) for r in self.records}
+        self.text_tokens = {r['id']: tokens(r['text']) for r in self.records}
         self.sessions = defaultdict(list)
         for r in self.records:
             self.sessions[r['session']].append(r)
@@ -268,8 +269,8 @@ class FrozenEvidence:
             if not available:
                 break
             def mmr(rid):
-                a = tokens(self.by_id[rid]['text'])
-                similarity = max((len(a & tokens(self.by_id[c]['text'])) / max(1, len(a | tokens(self.by_id[c]['text']))) for c in chosen), default=0)
+                a = self.text_tokens[rid]
+                similarity = max((len(a & self.text_tokens[c]) / max(1, len(a | self.text_tokens[c])) for c in chosen), default=0)
                 lam = self.parameters['mmr_lambda']
                 return lam * scores.get(rid, 0) / max_score - (1 - lam) * similarity
             pick = min(available, key=lambda rid: (-mmr(rid), rid))

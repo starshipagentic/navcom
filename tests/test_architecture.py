@@ -717,7 +717,7 @@ def route_json(navcom, world, monkeypatch, route):
     import navcom_intelligence
     from navcom_web import WebApp
     use_env(monkeypatch, world["env"])
-    monkeypatch.setattr(navcom, "resume_in_new_tab", lambda plan: (True, "opened (test)"))  # never a real tab
+    monkeypatch.setattr(navcom, "resume_in_new_tab", lambda plan, **options: (True, "opened (test)"))  # never a real tab
     monkeypatch.setattr(navcom_intelligence, "_request", local_model)
     app = WebApp(navcom, world["index"])
     method, path = route.split(" ", 1)

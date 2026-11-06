@@ -29,6 +29,64 @@ recognition fallback is enabled. When unavailable, use the search box with
 system dictation or type. System dictation's processing settings belong to the OS.
 The implementation follows the [Web Speech on-device explainer](https://github.com/WebAudio/web-speech-api/blob/main/explainers/on-device-speech-recognition.md).
 
+## Arriving at a place and asking about it
+
+In the Galactic Bridge's Navigator, type **show the experiments** to list the
+moons inside the current place. **Show the products**, **list ships** and the
+other map kinds work the same way. The list leaves the chart in place; choose
+**Fly to** on a result to travel. **Take me back** restores the previous view.
+Paging, reload and copied links retain the listing and its scope.
+
+The CLI uses the same cached list:
+
+```sh
+navcom atlas navigate "show the experiments" --within <system-id>
+navcom atlas list moons --within <system-id>
+```
+
+These requests list destinations without searching code or conversations. Clear
+**Search only this place**, or pass `--global`, to list across the galaxy. More
+pages use the returned `atlas list` command. The CLI reports a Back request; it
+does not change the shell's directory.
+
+A product, experiment or district with no smaller destinations still has a
+briefing: its saved description, attributed source/history clues, and recorded
+code locations. Conversation excerpts remain useful when the original code
+folder is unavailable. Missing code and harvest coverage stay visible.
+
+`navcom atlas explore <place-id>` and `navcom atlas show <place-id>` return this
+same briefing. To ask using the selected place as context:
+
+```sh
+navcom atlas navigate "what does it do?" --within <place-id>
+```
+
+Questions combine the place briefing with Starforge's existing concept and text
+retrieval. A suitable already-running local model can compose an answer citing
+the supplied evidence; unchanged questions and evidence reuse cached answers.
+NavCom does not start or download a model for this. Without one, it presents the
+attributed context, rather than claiming that a keyword miss means nothing is
+known. Recorded conversation claims do not prove today's implementation.
+
+## Starbase berths
+
+The Galactic Bridge groups parked ships using the recorded fleet's source
+relationships. Ships associated with an existing system share a berth; ships
+carrying the same exact project/source context park together. Unassigned context
+stays explicit. These groups do not establish ownership or boarding readiness,
+and do not merge physical copies or move their stored files.
+
+`navcom atlas list ships --within <starbase-id>` shows the same berth assignments.
+Add `--json` for `fleet_layout`, full-fleet membership and each ship's evidence.
+Grouping uses the published chart before filtering or pagination, so searching
+does not shuffle the parking arrangement or require a new harvest/model call.
+
+Ships use the existing Starship fleet and cargo artwork, imported with original
+bytes and provenance by `scripts/import_starship_art.py`. A ship's stable ID
+chooses its appearance consistently in the chart and inspector. Hull artwork is
+visual identity, not a claim about its function, size, ownership or readiness.
+Stored archives keep their archive icon.
+
 ## Source ideas and optional Starship connection
 
 Read-only reference inspection on 2026-10-14:

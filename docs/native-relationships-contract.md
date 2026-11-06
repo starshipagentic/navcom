@@ -1,10 +1,64 @@
 # Native relationship evidence
 
-NavCom exposes retained version families and literal links between known source roots. This service does not change planet/moon ownership, infer ancestry, or establish dated succession. It reads immutable Starforge harvest artifacts; it neither harvests nor scans the current project tree while browsing.
+NavCom exposes explicit product replacement declarations, retained version families and literal links between known source roots. These are separate kinds of evidence. Browsing reads the published chart and immutable Starforge harvest artifacts; it neither harvests nor scans the current project tree.
+
+## Explicit product replacements
+
+A `.navcom-space.json` at a repository root or an already discovered application
+boundary can name a stable product ID and the IDs it supersedes. For example,
+`apps/mobile-v1/.navcom-space.json` declares `{"id":"aurora-v1","kind":"planet"}`;
+`apps/mobile-v2/.navcom-space.json` declares:
+
+```json
+{"id":"aurora-v2","label":"Aurora Next","kind":"planet","supersedes":["aurora-v1"]}
+```
+
+The ordinary `navcom atlas refresh --space` reads this metadata from discovered
+roots and applications. Applications come from the existing runnable workspace
+and native app discovery; declaration files do not trigger a recursive scan or
+turn arbitrary directories into products. There is no separate catalog to
+synchronize. `navcom atlas related PLACE`
+then exposes the resolved declarations and exact commands for either endpoint.
+No Starforge runtime or source harvest is required to read declarations already
+in the chart. Native family and document analysis still uses the existing
+Starforge path; if that analysis fails, available declarations remain readable
+and the source error is disclosed.
+
+Only literal IDs belonging to declared products resolve. Missing endpoints,
+conflicting declarations, self-links and cycles stay unresolved with reasons.
+An explicit shared ID retains its existing meaning: repositories can belong to
+the same declared product. Conflicting replacement declarations for that identity
+remain unresolved. Multiple intentional predecessors or successors
+are allowed; no transitive relationship is manufactured. Descendant applications
+do not inherit their containing repository's product replacement claim.
+
+Each application declaration belongs to that exact application: its ID, label,
+description and replacement links do not leak to siblings. Application kind is
+omitted or `planet`; the repository's system is used unless explicitly declared
+otherwise. Files retain their exact application scopes, and conversations retain
+the existing most-specific application attribution. A declared application uses
+the same identity rule as a declared root product, so moving it within a
+repository or splitting it into its own repository preserves its ID. Adding an
+explicit ID for the first time changes an automatically derived ID; old automatic
+bookmarks are not redirected. Linked paths and linked declaration files are not
+followed.
+
+The chart stores `supersedes` edges separately from containment. A successor and
+predecessor remain distinct places with their own files, conversations and
+coordinates. Declaration paths and observation times are retained; an unavailable
+location is marked stale. An observation time is **not a replacement date**.
+Historical views continue to exclude current declarations. No real project is
+assigned a successor by this feature.
 
 ## Shared interface
 
-`navcom_relationships.related(space_cache, source_cache, within, query='', limit=20, seconds=15, offset=0)` returns the selected chart `center`, `families`, `references`, optional native search `evidence`, `coverage`, publication/fingerprint, and copyable CLI/continuation commands. CLI: `navcom atlas related PLACE [--query TEXT] [--offset N]`.
+`navcom_relationships.related(space_cache, source_cache, within, query='', limit=20, seconds=15, offset=0)` returns the selected chart `center`, `declared_relations`, `declaration_diagnostics`, `families`, `references`, optional native search `evidence`, `coverage`, publication/fingerprint, and copyable CLI/continuation commands. CLI: `navcom atlas related PLACE [--query TEXT] [--offset N]`.
+
+Declared relationships touch the selected place or one of its descendants;
+parent declarations do not widen a child query. `--query` filters their labels
+and literal declared IDs. `--limit` caps each category, and result counts expose
+truncation. Source offsets continue to paginate native scopes; declarations are
+chart metadata and do not change between source pages.
 
 Each family is a `version_family_suggestion`. Its members preserve exact source-relative directory paths, retained file counts, any exact existing chart destination IDs, and `scope_paths` intersected with the originally selected scope. Generated native search commands repeat those exact paths, including file-only scopes; they never widen a district to the containing version directory. Each member also exposes at most three `representative_files`, selecting a retained README first, supported code next, then other retained files. Each file has a `source_ref` containing `source_id`, actual file `relative_path`, `line`, immutable artifact `snapshot`, and source publication `published`. Destination matching uses the source roots pinned in the native result, not a newer source-cache publication.
 

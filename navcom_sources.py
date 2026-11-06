@@ -21,7 +21,7 @@ def parser():
     subs = p.add_subparsers(dest="action")
     for name, description in [
         ("harvest", "Add/update a local source and its explicit scope."),
-        ("discover", "Discover indexed repositories and bounded code/document scopes; optionally harvest them."),
+        ("discover", "Discover indexed projects and existing Starforge harvests; optionally harvest bounded scopes."),
         ("refresh", "Check all registered sources; analyze only changed contents."),
         ("list", "Show harvested sources, scope and coverage."),
         ("search", "Search Starforge concepts and literal code/document text."),
@@ -39,9 +39,11 @@ def parser():
             help="Structured output; progress/errors go to stderr.",
         )
         if name == "discover":
+            s.add_argument("--inventory", choices=["all", "indexed", "starforge"], default="all",
+                           help="Input inventory: both conversation projects and Starforge's existing catalog (default all). Starforge reads local cached repositories; no downloads.")
             s.add_argument("--index",type=Path,help="Conversation index used for discovery.")
             s.add_argument("--within",help="Existing Atlas collection to inspect.")
-            s.add_argument("--limit",type=int,default=200,help="Indexed projects per page (default 200).")
+            s.add_argument("--limit",type=int,default=200,help="Inventory rows per page (default 200).")
             s.add_argument("--offset",type=int,default=0)
             s.add_argument("--harvest",action="store_true",help="Run existing Starforge harvest on these discovered scopes.")
         if name == "read":
@@ -309,8 +311,9 @@ def run(api, argv):
             discovery = None
             if args.action == "discover":
                 from navcom_source_discovery import discover
-                print("navcom sources ▸ discovering indexed source scopes",file=sys.stderr,flush=True)
+                print("navcom sources ▸ discovering source scopes from existing inventories",file=sys.stderr,flush=True)
                 discovery=discover(api,index.expanduser(),cache,limit=args.limit,offset=args.offset,within=args.within,
+                    inventory_kind=args.inventory,
                     progress=lambda done,total,root:print(f'navcom sources ▸ {done}/{total} · {root}',file=sys.stderr,flush=True))
                 if not args.harvest:
                     print(json.dumps(discovery,indent=2) if args.json else "\n".join(s["root"]+"\n  "+", ".join(s["include"]) for s in discovery["sources"])+"\nCoverage: "+json.dumps(discovery["coverage"]))

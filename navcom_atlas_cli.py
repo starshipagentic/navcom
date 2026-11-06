@@ -22,7 +22,7 @@ Search       navcom <words> [--project TEXT] [--here] [--days N]
 Discover     navcom atlas list systems   · navcom atlas list research
 Navigate     navcom atlas navigate "fly to NAME"  · navcom help space
 Find inside  navcom atlas navigate "find matrix in EXP32"
-Related      navcom atlas related PLACE          · cached versions and references
+Related      navcom atlas related PLACE          · declared replacements, cached versions and references
 History      navcom history timeline PLACE  · navcom history system PLACE --at DATE
 Read         navcom --open REF:TURN     · navcom sources read SOURCE PATH
 Inspect      navcom atlas inspect PLACE         · --refresh for code locations
@@ -89,7 +89,7 @@ Atlas search, classifications and display labels require no LLM.
 
 
 def is_spatial(args):
-    return (getattr(args,'command','') in ('navigate','related','inspect','ask','board','files','context') or getattr(args,'space',False) or getattr(args,'grouping','') in SPACE_KINDS or
+    return (getattr(args,'command','') in ('navigate','related','inspect','ask','board','files','context') or getattr(args,'space',False) or getattr(args,'conversations',False) or getattr(args,'grouping','') in SPACE_KINDS or
             any(str(getattr(args,k,'') or '').startswith(PREFIXES) for k in ('collection','within','ref')))
 
 
@@ -97,7 +97,7 @@ def parser():
     from navcom_discovery import GROUPS
     p=argparse.ArgumentParser(prog='navcom atlas',description='Navigate cached places and collections; follow source, conversation and provider evidence. No web server or model required.',epilog='Start: navcom atlas list systems\nLearn: navcom help space\nLiteral search: navcom --query "atlas"',formatter_class=argparse.RawDescriptionHelpFormatter)
     subs=p.add_subparsers(dest='command')
-    descriptions={'context':'Read a ship’s carried conversations and handover without resuming a captain.','files':'Browse the retained code and documents at a product, experiment or district.','ask':'Review a question for an exact Hermes expert; explicitly open it in its native terminal.','board':'Find and validate the native captain route for one local ship; explicitly reopen it.','list':'List places or conversation collections by grouping.','explore':'Show a place, collection branches or conversations.','search':'Search globally or within a place or collection.','navigate':'Interpret a destination or question and follow cached place, source and conversation evidence.','related':'Inspect cached native version-family suggestions and literal documented references to other projects.','inspect':'Inspect physical code locations, ship context or expertise; optionally observe an existing star provider process.','show':'Show a place or conversation context, ancestry and safe launch preview.','tree':'Show actual parent/child conversation hierarchy.','refresh':'Refresh indexed evidence, or rebuild current geography and provider metadata with --space.','help':'Explain a grouping or command.'}
+    descriptions={'context':'Read a ship’s carried conversations and handover without resuming a captain.','files':'Browse the retained code and documents at a product, experiment or district.','ask':'Review a question for an exact Hermes expert; explicitly open it in its native terminal.','board':'Review and validate an existing local or SSH captain route for a working ship; explicitly reopen it.','list':'List places or conversation collections by grouping.','explore':'Show a place, collection branches or conversations.','search':'Search globally or within a place or collection.','navigate':'Interpret a destination or question and follow cached place, source and conversation evidence.','related':'Inspect declared product replacements, cached version-family suggestions and documented references.','inspect':'Inspect physical code locations, ship context or expertise; optionally observe an existing star provider process.','show':'Show a place or conversation context, ancestry and safe launch preview.','tree':'Show actual parent/child conversation hierarchy.','refresh':'Refresh indexed evidence, or rebuild current geography and provider metadata with --space.','help':'Explain a grouping or command.'}
     for name,description in descriptions.items():
         s=subs.add_parser(name,help=description,description=description,formatter_class=argparse.RawDescriptionHelpFormatter)
         if name=='help':s.add_argument('subject',nargs='?');continue
@@ -131,28 +131,28 @@ def parser():
             continue
         if name=='related':
             s.add_argument('ref',metavar='PLACE',help='Exact place ID or unique name; use its saved harvested source scopes.')
-            s.add_argument('--query',default='',help='Filter suggested family paths and run both native search paths in the same scopes (at most 500 characters).')
-            s.add_argument('--limit',type=int,default=20,help='Maximum returned families and references per source page (1–100; default 20).')
+            s.add_argument('--query',default='',help='Filter declared product names/IDs and suggested family paths; search both native paths in the same scopes (at most 500 characters).')
+            s.add_argument('--limit',type=int,default=20,help='Maximum returned declarations, families and references per category (1–100; default 20).')
             s.add_argument('--seconds',type=float,default=15.0,help='Native analysis time budget (1–30 seconds; default 15).')
             s.add_argument('--offset',type=int,default=0,help='Source-scope offset; follow next_offset for pages of 8 sources (default 0).')
             s.add_argument('--space-cache',type=Path,help='Saved geography; defaults beside the index.')
             s.add_argument('--source-cache',type=Path,help='Published NavCom Starforge harvest cache.')
             s.add_argument('--index',type=Path,help='Index location for default cache paths; conversations are not scanned.')
             s.add_argument('--json',action='store_true',help='Native evidence, exact paths, snapshot provenance and coverage.')
-            s.epilog='Examples: navcom atlas related <planet-id>\n          navcom atlas related <planet-id> --query engines --json\nUses retained harvest snapshots and caches native Starforge analysis. No new harvest, model, source sync or chart changes. Family scores are heuristic suggestions, not dated succession; documented references do not prove ownership or ancestry. Result caps and source pagination are explicit.'
+            s.epilog='Examples: navcom atlas related <planet-id>\n          navcom atlas related <planet-id> --query engines --json\nUses retained harvest snapshots and caches native Starforge analysis. No new harvest, model, source sync or chart changes. Family scores are heuristic suggestions, not dated succession; documented references do not prove ownership or ancestry. Repository or discovered-app .navcom-space.json id/supersedes declarations appear separately; dates are unknown. Result caps and source pagination are explicit.'
             continue
         if name in ('ask','board'):
             s.add_argument('ref',help='Exact star or ship ID, or unique name from atlas list.')
             if name=='ask':s.add_argument('question',help='Question for this expert. Preparation does not send it.')
             else:
-                s.add_argument('--route',type=Path,help='Exact native route when automatic route discovery is ambiguous.')
-                s.add_argument('--validate',action='store_true',help='Read-only native thread and working-directory check.')
+                s.add_argument('--route',type=Path,help='Local route-file override only; remote routes come from existing fleet and commission receipts.')
+                s.add_argument('--validate',action='store_true',help='Read-only native thread and working-directory check, through SSH for a recorded remote working ship; sends no turn.')
             s.add_argument('--launch',action='store_true',help='Explicitly open this reviewed native action in a new terminal.'+(' Hermes may run tools and use remote models.' if name=='ask' else ''))
             s.add_argument('--review',default='',help='Exact identity printed by preparation; changing inputs requires a fresh review.')
             s.add_argument('--space-cache',type=Path,help='Saved geography; defaults beside the index.')
             s.add_argument('--index',type=Path,help='Index location for default cache paths.')
             s.add_argument('--json',action='store_true',help='Versioned plan, provenance and disclosed effects.')
-            s.epilog='Prepare first; then repeat with --launch --review TOKEN. No services are started by inspection. Terminal dispatch does not establish receipt, readiness or human takeover.'
+            s.epilog=('Preparation discovers existing fleet/commission evidence and performs bounded read-only SSH metadata checks for recorded remote working ships. Archives and missing or conflicting routes cannot board. No captain or prompt is created. ' if name=='board' else '')+'Prepare first; then repeat with --launch --review TOKEN. No services are started by inspection. Terminal dispatch does not establish receipt, readiness or human takeover.'
             continue
         if name=='inspect':
             s.add_argument('ref',help='Exact product, experiment, district, ship or star ID, or unique destination name.')
@@ -168,7 +168,7 @@ def parser():
         if name in ('search','navigate'):s.add_argument('words',nargs='+',help='Natural words; quote phrases when convenient.')
         if name=='navigate':
             s.add_argument('--choose',default='',metavar='PLACE_ID',help='Choose one returned candidate for a named-place search; remains inside the allowed scope.')
-            s.epilog='Examples: navcom atlas navigate "find matrix in EXP32"\n          navcom atlas navigate "fly to EXP32 then find matrix"\n          navcom atlas navigate "find login within Mobile" --choose <returned-place-id>\nNamed places resolve against the current chart before source/conversation search. Ambiguous or missing places never trigger a galaxy-wide fallback.'
+            s.epilog='Examples: navcom atlas navigate "find matrix in EXP32"\n          navcom atlas navigate "fly to EXP32 then find matrix"\n          navcom atlas navigate "find login within Mobile" --choose <returned-place-id>\n          navcom atlas navigate "show the experiments" --within <system-id>\n          navcom atlas navigate "take me back"\nExact show/list requests use cached systems, planets/products, moons/experiments, cities/districts, stars, starbases or ships. Follow the returned atlas list command for more pages. Back requests restore browser history; the CLI reports the request without moving your shell. Named places resolve against the current chart before source/conversation search. Ambiguous or missing places never trigger a galaxy-wide fallback.'
             s.add_argument('--global',dest='global_scope',action='store_true',help='Search the entire galaxy instead of --within; returns explicit scope and steps.')
             s.add_argument('--within',metavar='PLACE',help='Current place ID or exact unique name; defaults to the galaxy.')
         if name in ('show','tree'):s.add_argument('ref',help='Conversation ref printed in results; ambiguous refs require more characters.')
@@ -194,6 +194,8 @@ def parser():
             s.add_argument('--limit',type=int,default=20,help='With --harvest: at most this many pinned projects per pass (1–200; default 20).')
             s.add_argument('--restart',action='store_true',help='With --harvest: start a fresh inventory sweep; otherwise resume saved progress.')
         if name!='navigate':s.add_argument('--space',action='store_true',help='Use cached galactic destinations; refresh builds their evidence.')
+        if name in ('explore','search'):
+            s.add_argument('--conversations',action='store_true',help='Browse/search indexed conversations across every saved collection in this geographic place; no source search or model.')
         s.add_argument('--space-cache',type=Path,help='Geographic cache JSON; default beside the index.')
         s.add_argument('--source-cache',type=Path,help='NavCom Starforge harvest cache.')
         if name!='navigate':s.add_argument('--evidence',action='store_true',help='Search existing source, host conversation and carried ship context within this place.')
@@ -220,14 +222,19 @@ def help_text(api,subject=None,atlas=False):
   navcom atlas list systems
   navcom atlas list planets --within <system-id>
   navcom atlas explore <planet-id>
+  navcom atlas explore <system-id> --conversations
+  navcom atlas search matrix --within <moon-id> --conversations
   navcom atlas files <district-id> --query login
   navcom atlas search matrix --within <moon-id> --evidence
   navcom atlas search exp32 --space
   navcom atlas navigate "fly to exp32"
   navcom atlas navigate "find matrix" --within <moon-id>
+  navcom atlas navigate "show the experiments" --within <system-id>
+  navcom atlas navigate "take me back"
   navcom atlas related <planet-id> --query engines
   navcom atlas inspect <planet-id> --refresh
   navcom atlas list ships
+  navcom atlas list ships --within <starbase-id>
   navcom atlas inspect <ship-id>
   navcom atlas context <ship-id> --query decision
   navcom atlas list stars
@@ -249,8 +256,20 @@ original turn; repeated searches reuse cached native results and check remaining
 ships within the budget. An exact ship search never substitutes another copy.
 Source --path scopes constrain both engines. A reported cap or unavailable source
 means evidence coverage is incomplete. No model is needed.
-Related uses existing Starforge lineage and code-search on retained harvests to
-find suggested version families and literal cross-project document references.
+Exact Navigator show/list commands list the requested kind from the cached map
+inside --within, or across the galaxy with --global. They do not search source
+files or conversations. Follow the printed atlas list command for more pages.
+"Take me back" requests browser history; it does not change a CLI shell's cwd.
+Use --conversations with explore or search to read the whole place's saved
+conversation collections together, across every page. Parent/child grouping,
+--children, --provider, --since, --until and --favorites use ordinary indexed
+conversation discovery. Missing collections are disclosed; scope never widens.
+Related reads explicit product supersedes declarations from the cached chart,
+separately from Starforge version-family suggestions and literal document links.
+Declare stable IDs in .navcom-space.json at a repository root or discovered app;
+supersedes names exact prior IDs. App declarations do not apply to siblings.
+Refresh picks them up automatically. Missing/conflicting targets stay unresolved;
+products and their source/conversation scopes remain separate. Dates are unknown.
 It does not harvest again or change the chart. --query also searches both native
 paths within those saved scopes. Source pages contain up to 8 sources; follow
 next_offset or the printed continuation command. Suggestions are not dated
@@ -264,6 +283,18 @@ positions; ordinary navigation does not scan source. --space-cache and
 --source-cache select private caches. sources discover is paginated; follow its
 reported next_offset to harvest more than the first page. --menu offers the same
 Galactic bridge and a tool-driven refresh of discovered material.
+
+Starbase ships are parked in berths using recorded system/source relationships.
+Ships sharing exact source context stay together; unknown relationships remain
+Unassigned context. JSON includes fleet_layout and each ship's berth evidence.
+Berths organize the view, without changing ownership, physical paths or readiness.
+
+Explore/show include a place briefing from saved descriptions and scoped history.
+Ask in context: navcom atlas navigate "what does it do?" --within <place-id>
+Questions keep this place as their context and include attributed evidence.
+An already-running local model can compose a cited answer; answers are cached.
+No model is started or downloaded. Without one, the recorded context still works.
+Unavailable code and missing harvests are disclosed alongside conversation clues.
 
 Show, explore and search include a bounded contents preview: counts and named
 direct children from the same published chart. JSON provides their exact IDs;
@@ -281,9 +312,14 @@ reads cached metadata; --refresh updates the selected dossier; --observe explici
 checks an existing provider process without inference or service startup. Ask
 prepares a native Hermes question; --launch --review TOKEN explicitly opens it.
 Hermes uses its own tools, hooks and configured model, possibly remotely. Board
-discovers native captain routes; --validate checks the exact thread and workspace.
-An explicit launch revalidates and opens the native captain; takeover stays unproven. Stars
-can relate to implementation products without acquiring client/system ownership.
+discovers native captain routes from existing fleet/commission evidence. Recorded
+remote working ships use bounded read-only SSH metadata checks; --validate checks
+the exact native thread and workspace without sending a turn. --route overrides
+local route files only. Missing or conflicting routes and archives cannot board.
+An explicit --launch --review TOKEN revalidates and opens the existing captain;
+no new captain or prompt is created, and human takeover stays unproven. Ordinary
+browsing does not connect. Stars can relate to implementation products without
+acquiring client/system ownership.
 Ship/base entries require actual records. Refresh also discovers local commission
 archives from exact native evidence, using a bounded metadata cache. list ships
 and search include stored copies; explore links their catalog without filling
@@ -370,8 +406,13 @@ def render_interaction(data):
     if result.get('reason'):print(result['reason'])
     if result.get('question'):print('Question: '+result['question'])
     spec=result.get('command') or result.get('handoff',{})
-    if spec.get('argv'):print('Command: '+shlex.join((['env']+[k+'='+v for k,v in sorted(spec.get('env',{}).items())] if spec.get('env') else [])+spec['argv']))
-    if spec.get('cwd'):print('Working directory: '+spec['cwd'])
+    if spec.get('preview'):print('Operation: '+spec['preview'])
+    elif spec.get('argv'):print('Command: '+shlex.join((['env']+[k+'='+v for k,v in sorted(spec.get('env',{}).items())] if spec.get('env') else [])+spec['argv']))
+    route=result.get('route',{})
+    if route.get('transport')=='ssh':
+        print('Remote host: '+route['host']+' (SSH '+route['ssh_alias']+')')
+        print('Remote working directory: '+route['cwd'])
+    elif spec.get('cwd'):print('Working directory: '+spec['cwd'])
     for effect in result.get('effects',[]):print('• '+effect)
     token=result.get('review_token') or result.get('fingerprint')
     if token and result['state']!='dispatched' and result.get('handoff',{}).get('status')!='dispatched':print('Reviewed identity: '+token+'\nTo open this exact action in a terminal, repeat with --launch --review '+token)
@@ -450,11 +491,19 @@ def render_space(data):
             print('Destination: '+data['destination'])
             print(data.get('destination_command') or 'navcom atlas explore '+shlex.quote(data['destination']))
     print(' / '.join(n['label'] for n in data.get('breadcrumbs',[])) or 'Your galaxy')
+    if data.get('briefing'):
+        render_briefing(data['briefing'])
+    if data.get('fleet_layout'):
+        print('Berths group recorded systems and shared sources; they do not establish ownership or readiness.')
     for node in data.get('nodes',[]):
         display_kind=('ship archive' if node.get('form')=='archive' else
                       'lab application' if node.get('form')=='application' and node['kind']=='district' else node['kind'])
         print(f"\n{node['label']}  [{display_kind} · {node.get('status','observed')}]")
         print('  '+node['id'])
+        if node.get('berth'):
+            berth = node['berth']
+            print('  Berth: '+berth['label']+' · '+berth['status'])
+            print('    '+berth['basis'])
         if node.get('physical'):
             print('  '+str(node['physical'].get('host') or 'Host unknown')+': '+str(node['physical'].get('path') or 'Location not recorded'))
         for link in node.get('ship_links',[]):
@@ -477,7 +526,7 @@ def render_space(data):
                 if reason.get('path'):print('    '+str(reason['path']))
             else:print('  '+str(reason))
     proof=data.get('evidence',{})
-    if proof.get('query_plan',{}).get('style')=='question':
+    if proof.get('query_plan',{}).get('style')=='question' and proof['query_plan'].get('text_terms'):
         print('\nDocument search terms: '+', '.join(proof['query_plan']['text_terms']))
         print('  '+proof['query_plan']['text_policy'])
     for place in proof.get('places',[]):
@@ -506,11 +555,47 @@ def render_space(data):
             print('  Repeat this search to check remaining ships; unchanged native results are cached.')
     for error in proof.get('errors',[]):print('  '+error)
     if data.get('scope_candidates_limited'):print('More places match; use a more specific name or exact place ID.')
-    if data.get('more'):print('More destinations available with --offset '+str(data['offset']+data['limit']))
+    if data.get('more'):
+        print('More destinations: '+data['next_command'] if data.get('next_command') else
+              'More destinations available with --offset '+str(data['offset']+data['limit']))
     if data.get('stored_copy_count'):
         command=data.get('center',{}).get('commands',{}).get('stored_copies',['navcom','atlas','list','ships'])
         print(str(data['stored_copy_count'])+' stored ship copies are linked from their ships; list them with '+shlex.join(command)+'.')
     print('\n'+'\n'.join(_coverage_lines(data.get('coverage',{}))))
+
+
+def render_briefing(briefing):
+    """The same attributed place context shown by the arrival workspace."""
+    print('\nAbout '+briefing.get('place',{}).get('label','this place'))
+    summary=briefing.get('summary',{})
+    if summary.get('text'):
+        print(summary['text'])
+    answer=briefing.get('answer',{})
+    if answer.get('available'):
+        print('\nLocal answer'+(' · cached' if answer.get('cached') else '')+
+              (' · '+answer['model'] if answer.get('model') else ''))
+        if answer.get('claims'):
+            for claim in answer['claims']:
+                print('  '+claim['text']+' ['+', '.join(claim.get('citations',[]))+']')
+        elif answer.get('text'):
+            print(answer['text'])
+    elif answer.get('message'):
+        print(answer['message'])
+    for item in briefing.get('evidence',[]):
+        print('\n['+item['id']+'] '+item.get('label',item.get('kind','Recorded evidence')))
+        if item.get('temporal_basis'):
+            print('  '+item['temporal_basis'])
+        print(item.get('text',''))
+        if item.get('open_command'):
+            command=item['open_command']
+            print('  '+(shlex.join(command) if isinstance(command,list) else command))
+        elif item.get('conversation_ref'):
+            ref=item['conversation_ref']
+            print('  navcom --open '+shlex.quote(ref.get('ref') or ref['key'])+
+                  ':'+str(ref.get('turn',1)))
+    coverage=briefing.get('coverage',{})
+    for gap in coverage.get('limitations',[]):
+        print('  Coverage: '+str(gap))
 
 
 def render_context(data):
@@ -558,6 +643,19 @@ def render_files(data):
 
 def render_related(data):
     print(data['center']['label'] + ' — related source evidence')
+    for relation in data.get('declared_relations', []):
+        successor, predecessor = relation['successor'], relation['predecessor']
+        print('\nDeclared supersession: ' + successor['label'] + ' supersedes ' + predecessor['label'])
+        for record in relation.get('evidence', {}).get('declarations', []):
+            print('  ' + record['path'] + (' (retained; location unavailable)' if record.get('stale') else ''))
+        print('  ' + relation['meaning'])
+        print('  Successor: ' + successor['show_command'])
+        print('  Predecessor: ' + predecessor['show_command'])
+    for diagnostic in data.get('declaration_diagnostics', []):
+        print('\nUnresolved product declaration: ' + diagnostic['reason'])
+        for path in diagnostic.get('paths', []): print('  ' + path)
+    for error in data.get('source_errors', []):
+        print('\nSource analysis unavailable: ' + error)
     for family in data['families']:
         print('\nSuggested version family: ' + family['label'])
         for member in family['members']:
@@ -580,7 +678,7 @@ def render_related(data):
                 print('  ' + label + ' · ' + location)
         if len(concepts) > 5 or len(text) > 5 or evidence.get('potentially_truncated'):
             print('  Bounded match preview; full returned evidence: ' + data['cli_command'] + ' --json')
-    if not data['families'] and not data['references'] and not query_hits:
+    if not data['families'] and not data['references'] and not data.get('declared_relations') and not query_hits:
         print('No relationships found in the selected retained source scopes.')
     print('\n' + data['meaning'])
     if data.get('result_limits', {}).get('truncated'):
@@ -650,6 +748,23 @@ def run(api,argv):
                     progress=lambda *message:print('NavCom geography ▸ '+' '.join(map(str,message)),file=sys.stderr,flush=True))
                 if args.json:print(json.dumps(result))
                 else:print('Geography refreshed: '+str(len(result['entities']))+' destinations.')
+                return 0
+            if getattr(args,'conversations',False):
+                if args.evidence or args.space:
+                    raise ValueError('--conversations selects indexed history; use it without --space or --evidence.')
+                result=navigation.conversations(api,conn,space_cache=space_cache,
+                    within=getattr(args,'collection',None) or args.within or '',
+                    action=args.command,query=' '.join(args.words) if args.command=='search' else args.query or '',
+                    limit=args.limit,offset=args.offset,provider=args.provider or '',since=args.since or '',
+                    until=args.until or '',favorites=args.favorites,children=args.children)
+                if args.json:print(json.dumps(result,ensure_ascii=False))
+                else:
+                    render(result)
+                    scope=result['conversation_scope']
+                    print('Place scope: '+scope['label']+' · '+str(scope['indexed_conversations'])+' indexed conversations across '+str(scope['collection_count'])+' saved collections.')
+                    if result.get('conversation_basis',{}).get('type')=='project_query_context':
+                        print('Related product history; a relationship to these exact district files is unproven.')
+                    for error in result['errors']:print('Coverage: '+error)
                 return 0
             if any(getattr(args,k,None) for k in ('provider','since','until','favorites','children')):
                 raise ValueError('Conversation filters apply to conversation collections; geographic evidence is a saved snapshot.')

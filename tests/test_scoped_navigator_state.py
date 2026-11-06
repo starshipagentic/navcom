@@ -19,6 +19,7 @@ const buttons=new Map();
 const copyRoute=()=>JSON.parse(JSON.stringify(route)),remember=()=>{},el=()=>({append:()=>{}});
 const button=(label,callback)=>{buttons.set(label,callback);return {classList}};
 const renderSearch=()=>{rendered++},fail=e=>{throw e};
+const placeBriefing=()=>null,briefingHasEvidence=()=>false;
 const response=()=>({published:123,center:{id:'system:fixture',label:'Fixture'},
  intent:{action:'search',query:'matrix',within:'system:fixture'},nodes:[],total:90,offset:0,limit:40,more:true,
  evidence:{sources:[{source_id:'original-local-source'}]}});

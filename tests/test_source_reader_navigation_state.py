@@ -12,7 +12,7 @@ let loadTicket=0,sourceTicket=0,timeTicket=0,timeBusy=false,timeData=null,view=n
 let bootstrapAttempted=true,layoutNarrow=false,sourceReturn=null;
 const voiceInput={cancel(){}},sourceDialog={open:true,close(){this.open=false}};
 const hide=()=>{};
-const cancelFlight=hide,renderCrumbs=hide,renderMap=hide,renderDestinationPager=hide,
+const hideCarriedReader=hide,cancelFlight=hide,renderCrumbs=hide,renderMap=hide,renderDestinationPager=hide,
  renderSelection=hide,renderFooter=hide,renderTimeBar=hide,arrive=hide,
  applySystemTime=hide,loadSystemTime=hide,message=hide,loadSource=hide;
 const refresh={disabled:true};

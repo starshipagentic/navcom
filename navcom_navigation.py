@@ -168,7 +168,9 @@ def _place_evidence(api, nodes, result, selected=None):
         group['source_complete']=bool(expected) and all(sid in sources and not sources[sid].get('potentially_truncated') for sid in expected)
         group['has_evidence']=bool(group['source_refs'] or group['conversation_refs'])
         group['state']='evidence_found' if group['has_evidence'] else 'no_matches_in_scanned_source_scope' if group['source_complete'] else 'coverage_unknown'
-    result['places']=sorted(groups.values(),key=lambda n:(not n['has_evidence'],n['label'].casefold(),n['id']))
+    # One presentation order for CLI/API/browser; counts are not relevance scores.
+    result['places']=sorted(groups.values(),key=lambda n:(not n['has_evidence'],-n['concept_hits'],
+        -n['conversation_hits'],n['label'].casefold(),n['id']))
     result['coverage']['source_hits_without_place_membership']=unassigned
     result['coverage']['place_membership_complete']=not places or not unassigned
     result['place_policy']='Evidence grouped by current saved product paths and project conversation memberships. Matches are clues, not proof of implementation or equivalent behavior. No matches is not proof of absence.'
@@ -198,17 +200,99 @@ def _carried_candidates(entities, nodes, selected):
     return [by_id[identity] for identity in sorted(chosen)]
 
 
+def conversations(api, conn, *, space_cache, within='', query='', action='explore', limit=12, offset=0,
+                  provider='', since='', until='', favorites=False, children=False, catalog=None):
+    """Browse/search the exact saved place memberships using ordinary Discovery."""
+    import navcom_space
+    from navcom_discovery import Discovery
+    if action not in ('explore','search'):
+        raise ValueError('Place conversations support explore or search.')
+    if not 1 <= limit <= 200 or offset < 0:
+        raise ValueError('Conversation limit must be 1–200 and offset must be nonnegative.')
+    if conn is None:
+        raise ValueError('Conversation index unavailable; no conversations were searched.')
+    catalog=catalog if catalog is not None else (navcom_space.load_catalog(space_cache) or {})
+    place=navcom_space.view(space_cache,action='show',within=within,catalog=catalog)
+    selected=place['center']
+    entities=catalog['entities']
+    if isinstance(entities,dict):entities=list(entities.values())
+    eligible=navcom_space.subtree(entities,selected['id'])
+    collections={cid for node in entities if node['id'] in eligible
+                 for cid in node.get('conversation_collections',[])}
+    requested_query=query
+    query=query or selected.get('suggested_query') or ''
+    registered=set();missing=[];members=set()
+    class PlaceDiscovery(Discovery):
+        def registry(self, connection, records):
+            registry, cache=super().registry(connection,records)
+            for collection in sorted(collections):
+                if collection not in registry:
+                    missing.append(collection)
+                    continue
+                registered.add(collection)
+                group=registry[collection]
+                members.update(group['keys'] & set(self.hits(connection,records,group,cache)))
+            registry[selected['id']]=dict(id=selected['id'],label=selected['label'],grouping='projects',
+                keys=members,reason='Saved place conversation memberships')
+            return registry,cache
+    params={'action':[action],'within':[selected['id']],'q':[query],
+            'limit':[str(limit)],'offset':[str(offset)]}
+    filters=dict(provider=provider,since=since,until=until,favorites=favorites,children=children)
+    for key,value in filters.items():
+        if value:params[key]=['1' if value is True else str(value)]
+    deadline=time.monotonic()+20
+    try:
+        conn.set_progress_handler(lambda: int(time.monotonic()>deadline),10000)
+        with _conversation_atlas(api,conn,deadline) as atlas:
+            discovery=PlaceDiscovery(api)
+            discovery.atlas=atlas
+            data=discovery.view(conn,params)
+    finally:
+        conn.set_progress_handler(None,0)
+    data.update(place={key:selected[key] for key in ('id','label','kind')},center=selected,
+                breadcrumbs=place['breadcrumbs'],published=catalog['published'],
+                action=action,conversations=True,requested_query=requested_query)
+    data['conversation_scope']=dict(place_id=selected['id'],label=selected['label'],
+        catalog_published=catalog['published'],collection_ids=sorted(collections),collection_count=len(collections),
+        searched_collection_count=len(registered),missing_collection_ids=missing,
+        indexed_conversations=len(members),matching_conversations=data['matches'],
+        result_count=data['total'],result_grouping='conversations' if children else 'families',
+        matching_families=None if children else data['total'],complete=not missing)
+    data['errors']=['Conversation collection no longer indexed: '+cid for cid in missing]
+    if selected.get('conversation_basis'):
+        data['conversation_basis']=dict(selected['conversation_basis'],query=query)
+    command=['navcom','atlas',action]
+    if action=='explore':command.append(selected['id'])
+    else:command += [query,'--within',selected['id']]
+    command += ['--conversations','--space-cache',str(space_cache),'--limit',str(limit)]
+    if query and action!='search':command += ['--query',query]
+    if offset:command += ['--offset',str(offset)]
+    for key,value in filters.items():
+        if value:command += ['--'+key] if value is True else ['--'+key,str(value)]
+    db=conn.execute('PRAGMA database_list').fetchone()[2]
+    if db:command += ['--index',db]
+    data['cli_command']=shlex.join(command)
+    if data['more']:
+        continuation=list(command)
+        if '--offset' in continuation:continuation[continuation.index('--offset')+1]=str(offset+limit)
+        else:continuation += ['--offset',str(offset+limit)]
+        data['continue_command']=shlex.join(continuation)
+    return data
+
+
 def evidence(api, conn, space_cache, source_cache, within, query, limit=12, *, query_style='literal', catalog=None):
     """Fan out existing search engines within the saved place; never infer ownership from hits."""
     import navcom_space
     import navcom_sources
-    from navcom_discovery import Discovery
     catalog=catalog if catalog is not None else (navcom_space.load_catalog(space_cache) or {})
     selected=navcom_space.view(space_cache,action='show',within=within,catalog=catalog)['center']
     entities=catalog['entities']
     if isinstance(entities,dict):entities=list(entities.values())
     eligible=navcom_space.subtree(entities,selected['id']) if within else {n['id'] for n in entities}
     nodes=[n for n in entities if n['id'] in eligible]
+    # A galaxy-wide request includes published sources that geography has not
+    # charted yet. Explicit places, including a named galaxy, keep saved scopes.
+    global_sources=not within and selected.get('kind')=='galaxy'
     scopes={};collections=set();missing_scopes=[]
     for node in nodes:
         collections.update(node.get('conversation_collections',[]))
@@ -228,13 +312,15 @@ def evidence(api, conn, space_cache, source_cache, within, query, limit=12, *, q
     results['coverage']=dict(catalog_published=catalog['published'],source_scopes=len(scopes),searched_source_scopes=0,
                             unsearched_source_ids=sorted(scopes),
                             conversation_collections=len(collections),searched_collections=0,
+                            source_scope_policy='all_published_sources' if global_sources else 'saved_place_paths',
                             complete=True)
-    if scopes:
+    if scopes or global_sources:
         try:
             request=dict(action='batch-search',cache=str(Path(source_cache).resolve()),query=query,
                 scopes=[dict(source_id=sid,paths=[] if '.' in relative else sorted(relative))
                         for sid,relative in sorted(scopes.items())],
                 mode='both',limit=min(limit,50),time_budget_seconds=20)
+            if global_sources:request['include_published_sources']=True
             if query_style=='question':request['text_mode']='question_terms'
             p=subprocess.run(navcom_sources.worker_argv(),input=json.dumps(request),capture_output=True,text=True,timeout=30)
             if p.returncode:
@@ -252,41 +338,18 @@ def evidence(api, conn, space_cache, source_cache, within, query, limit=12, *, q
     if conn is None and collections:
         results['errors'].append('Conversation index unavailable; source evidence remains searchable.')
     elif collections:
-        # Existing Discovery ranks once across the union of eligible memberships.
-        # Only the collection adapter changes; its catalog, filters, FTS retrieval,
-        # ancestry routing, enrichment and result ranking stay unchanged.
-        registered_collections=set()
-        class PlaceDiscovery(Discovery):
-            def registry(self, connection, records):
-                registry, cache=super().registry(connection,records)
-                keys=set()
-                for collection in sorted(collections):
-                    if collection not in registry:
-                        results['errors'].append('Conversation collection no longer indexed: '+collection)
-                        continue
-                    registered_collections.add(collection)
-                    group=registry[collection]
-                    keys.update(group['keys'] & set(self.hits(connection,records,group,cache)))
-                registry['navcom-navigation-scope']=dict(id='navcom-navigation-scope',label='Selected places',
-                    grouping='projects',keys=keys,reason='Saved place conversation memberships')
-                return registry,cache
-        deadline=time.monotonic()+20
         try:
-            conn.set_progress_handler(lambda: int(time.monotonic()>deadline),10000)
-            with _conversation_atlas(api,conn,deadline) as atlas:
-                discovery=PlaceDiscovery(api)
-                discovery.atlas=atlas
-                data=discovery.view(conn,{'action':['search'],'within':['navcom-navigation-scope'],
-                    'q':[query],'limit':[str(min(limit,200))]})
+            data=conversations(api,conn,space_cache=space_cache,within=within,query=query,
+                               action='search',limit=min(limit,200),catalog=catalog)
             results['conversations']=data['nodes']
-            results['coverage']['searched_collections']=len(registered_collections)
+            results['errors'].extend(data['errors'])
+            results['coverage']['searched_collections']=data['conversation_scope']['searched_collection_count']
+            results['coverage']['indexed_conversations']=data['conversation_scope']['indexed_conversations']
             results['coverage']['conversation_matches']=data.get('total',len(data['nodes']))
             results['coverage']['conversation_results_truncated']=bool(data.get('more'))
             if data.get('more'):results['coverage']['complete']=False
         except (ValueError,sqlite3.Error) as exc:
             results['errors'].append('Conversation search unavailable: '+str(exc))
-        finally:
-            conn.set_progress_handler(None,0)
     if len(results['conversations'])>limit or results['errors'] or any(r.get('potentially_truncated') for r in results['sources']):results['coverage']['complete']=False
     results['conversations']=results['conversations'][:limit]
     candidates = _carried_candidates(entities, nodes, selected)
@@ -325,6 +388,10 @@ def view(api, conn, *, space_cache, source_cache, action='list', kind='', within
         # retrieval syntax; never interpret back/home/fly here.
         style=retrieval_style(query) if action=='search' else 'literal'
         result['evidence']=evidence(api,conn,space_cache,source_cache,within,query,limit,query_style=style,catalog=catalog)
+        if style=='question':
+            _brief_place(api,conn,result,space_cache,source_cache,question=query)
+    elif action in ('show','explore') and result['center']['kind'] in ('planet','moon','district'):
+        _brief_place(api,conn,result,space_cache,source_cache)
     command=['navcom','atlas',action]
     if action=='list':command.append(kind or 'systems')
     elif action in ('explore','show'):command.append(within)
@@ -337,8 +404,39 @@ def view(api, conn, *, space_cache, source_cache, action='list', kind='', within
     db=conn.execute('PRAGMA database_list').fetchone()[2] if conn is not None else ''
     if db:command+=['--index',db]
     result['cli_command']=shlex.join(command)
+    if action == 'list' and kind:
+        result['listing_kind'] = kind
+        result['list_command'] = result['cli_command']
+        if result['more']:
+            continuation = command.copy()
+            if '--offset' in continuation:
+                continuation[continuation.index('--offset') + 1] = str(result['offset'] + result['limit'])
+            else:
+                continuation += ['--offset', str(result['offset'] + result['limit'])]
+            result['next_command'] = shlex.join(continuation)
     _place_commands([result['center'], *result['nodes']],space_cache,source_cache,db)
     return result
+
+
+def _brief_place(api, conn, result, space_cache, source_cache, *, question=''):
+    """One shared, bounded current-place briefing for CLI, arrival and questions."""
+    import navcom_place_briefing
+    center=result['center']
+    if center['kind'] not in ('planet','moon','district'):
+        if question:
+            result['briefing']=dict(schema_version=1,
+                place={key:center[key] for key in ('id','label','kind')},catalog_published=result['published'],
+                summary=dict(text='Choose a product, experiment or district for a grounded place briefing.',
+                             basis='unavailable',evidence_ids=[]),evidence=[],
+                coverage=dict(complete=False,limitations=['This view is too broad for a selected-place briefing.']))
+        return
+    brief=navcom_place_briefing.briefing(api,conn,center=center,catalog_published=result['published'],
+        source_cache=source_cache,retrieval=result.get('evidence'),atlas_context=_conversation_atlas)
+    if question:
+        import navcom_intelligence
+        brief['answer']=navcom_intelligence.answer_grounded(question,brief['evidence'],
+            place_id=center['id'],cache_path=Path(str(space_cache)+'.briefing-answers'))
+    result['briefing']=brief
 
 
 def _place_commands(nodes, space_cache, source_cache, db):
@@ -352,7 +450,7 @@ def _place_commands(nodes, space_cache, source_cache, db):
 
 
 # The cache options each emitted command accepts (atlas, history and sources parsers);
-# everything else takes all three. Conversation collection searches take only --index.
+# everything else takes all three. Place conversation reads need the chart and index.
 _CACHE_OPTIONS = {('sources','list'):('cache',),('sources','search'):('cache',),
                   ('atlas','context'):('space','index'),('atlas','inspect'):('space','index'),
                   ('atlas','ask'):('space','index'),('atlas','board'):('space','index'),
@@ -362,7 +460,7 @@ _CACHE_OPTIONS = {('sources','list'):('cache',),('sources','search'):('cache',),
 def _pin_caches(argv, name, space_cache, source_cache, db):
     """Append this chart's caches so a copied command reads the same evidence."""
     if not argv or '--index' in argv or '--space-cache' in argv or '--cache' in argv:return
-    accepted=('index',) if name=='conversation_search' else _CACHE_OPTIONS.get(tuple(argv[1:3]),('space','sources','index'))
+    accepted=('space','index') if name in ('conversation_search','conversation_explore') else _CACHE_OPTIONS.get(tuple(argv[1:3]),('space','sources','index'))
     if 'cache' in accepted:argv+=['--cache',str(source_cache)]
     if 'space' in accepted:argv+=['--space-cache',str(space_cache)]
     if 'sources' in accepted:argv+=['--source-cache',str(source_cache)]
@@ -392,14 +490,15 @@ def inspect(*, space_cache, within, refresh=False, observe=False):
     return dict(schema_version=1,center=center,inspection=data,cli_command=shlex.join(command))
 
 
-def interact(api, *, space_cache, within, action, question='', launch=False, review_token='', route_path=None, validate=False):
+def interact(api, *, space_cache, within, action, question='', launch=False, review_token='', route_path=None, validate=False, allow_gui=False):
     """Review native actions from current provider records; only an explicit launch dispatches."""
     import navcom_space
     center=navcom_space.view(space_cache,action='show',within=within)['center']
     def launcher(*, argv, cwd, env):
         if not Path(cwd).is_dir():raise ValueError('The selected native workspace is unavailable; nothing was launched.')
         command=(['/usr/bin/env']+[key+'='+value for key,value in sorted(env.items())] if env else [])+argv
-        ok,message=api.resume_in_new_tab(dict(argv=command,cwd=cwd,provider='hermes' if action=='ask' else 'codex'))
+        options={'allow_gui':True} if allow_gui is True else {}
+        ok,message=api.resume_in_new_tab(dict(argv=command,cwd=cwd,provider='hermes' if action=='ask' else 'codex'),**options)
         if not ok:raise ValueError(message)
         return True
     if action=='ask':
@@ -500,6 +599,13 @@ def navigate(api, conn, *, space_cache, source_cache, text, within='', local=Tru
         return finish(dict(schema_version=1, intent=intent, action=action,
                     destination='galaxy:owner' if action == 'home' else None,
                     steps=[dict(status='requested', description=intent['steps'][0])], nodes=[]))
+    if action == 'list':
+        result = view(api, conn, space_cache=space_cache, source_cache=source_cache,
+                      action='list', kind=intent['kind'], within=intent['within'], limit=limit, catalog=catalog)
+        result.update(intent=intent, action='list', destination=None,
+                      steps=[dict(status='complete', description='Listed cached '+intent['kind']+' inside '+result['center']['label']+'.',
+                                  matches=result['total'])])
+        return finish(result)
     target = None
     scope_steps = []
     if intent.get('scope_query'):
@@ -565,6 +671,8 @@ def navigate(api, conn, *, space_cache, source_cache, text, within='', local=Tru
         if proof.get('places'):
             steps.append(dict(status='complete' if proof['coverage'].get('place_membership_complete') else 'partial',description='Grouped retrieved clues by saved product paths and project conversation memberships; no comparative answer inferred.',
                               matches=sum(place['has_evidence'] for place in proof['places'])))
+        if intent.get('retrieval_style')=='question':
+            _brief_place(api,conn,result,space_cache,source_cache,question=intent['query'])
     if target and intent.get('navigate_first'):
         destination = target['id']
     result.update(intent=intent, action=action, destination=destination, steps=steps)

@@ -67,3 +67,20 @@ def test_cli_actions_and_voice_help_do_not_open_index(navcom,tmp_path,monkeypatc
         assert result==0
         assert 'usage:' in capsys.readouterr().out
     assert not (tmp_path/'absent.sqlite').exists()
+
+
+def test_web_board_launch_permits_local_gui_after_review(native,monkeypatch):
+    api,cache,launched,folder=native
+    app=navcom_web.WebApp(api,folder/'index.sqlite')
+    def open_terminal(plan, *, allow_gui=False):
+        launched.append((plan,allow_gui))
+        return True,'opened'
+    api.resume_in_new_tab=open_terminal
+    def board(center, *, approved_fingerprint, launcher, route_path):
+        assert approved_fingerprint=='reviewed' and route_path is None
+        launcher(argv=['codex','resume','existing-thread'],cwd=str(folder),env={})
+        return dict(state='dispatched')
+    monkeypatch.setattr(navcom_ship_boarding,'launch_boarding',board)
+    result=app.post(None,'/api/space/board',dict(within='ship:test',launch=True,review_token='reviewed'))
+    assert result['interaction']['state']=='dispatched'
+    assert launched==[(dict(argv=['codex','resume','existing-thread'],cwd=str(folder),provider='codex'),True)]

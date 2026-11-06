@@ -21,12 +21,15 @@ def run_controller(body, extra=''):
 class Element {
  constructor(tag, attrs={}, children=[]) {
   this.tag=tag;this.attrs=attrs;this.children=children;this.isConnected=true;
-  this.value=attrs.value||'';this.events={};this.focused=false;
+  this.value=attrs.value||'';this.events={};this.focused=false;this.open=false;
+  Object.defineProperty(this,'parentNode',{value:null,writable:true});
  }
- append(...children){this.children.push(...children)}
- replaceChildren(...children){this.children=children}
+ append(...children){for(const child of children){if(child&&typeof child==='object'){if(child.parentNode)child.parentNode.children=child.parentNode.children.filter(n=>n!==child);child.parentNode=this;}this.children.push(child)}}
+ replaceChildren(...children){for(const child of this.children)if(child&&typeof child==='object')child.parentNode=null;this.children=[];this.append(...children)}
  addEventListener(name,handler){this.events[name]=handler}
  focus(){this.focused=true;document.activeElement=this}
+ showModal(){this.open=true}
+ close(){this.open=false}
  scrollIntoView(){this.scrolled=true}
  setAttribute(name,value){this.attrs[name]=value}
  querySelector(selector){return selector==='h3'?walk(this).find(x=>x.tag==='h3')||null:null}
@@ -39,18 +42,20 @@ const click=(root,label)=>findButton(root,label).attrs.onclick();
 const pathRow=path=>el('code',{},path);
 const copy=()=>{};
 const PAGE_SIZE=80,SEARCH_PAGE_SIZE=40,STORE='test';
-let route=fresh(),active=true,lastStep=0,carriedTicket=0,carriedFocus=false,timeData=null;
+let route=fresh(),active=true,lastStep=0,carriedTicket=0,carriedFocus=false,timeData=null,journeyId='';
+const history={state:null};
 const ship={id:'fleet:ship:orchard',kind:'ship',label:'Orchard'},other={id:'fleet:ship:cedar',kind:'ship',label:'Cedar'};
 let view={center:{id:'fleet:base:fixture',kind:'starbase'},nodes:[ship,other]};
 const inspector=el('aside'),input={value:''},scope={checked:true};
 const remembered=[];
 const remember=(push=false)=>remembered.push({push,route:JSON.parse(JSON.stringify(route))});
-const renderSelection=()=>{carriedTicket++};
+const renderSelection=()=>{carriedTicket++;hideCarriedReader()};
 const location={href:'http://localhost/?view=space',search:'?view=space'};
 const catalog='a'.repeat(64),newCatalog='b'.repeat(64);
 function baseState(){return {place:ship.id,action:'inspect',q:'',ref:'',turn:null,offset:0,chars:2000,catalog:''}}
 function begin(state={}){route.carriedRead=carriedState({...baseState(),...state});route.selected=ship.id}
 const panel=el('section');
+const carriedDialog=el('dialog',{class:'space-source-reader space-carried-reader'});
 const document={body:el('body'),activeElement:null};document.activeElement=document.body;
 """ + extra + "\n" + body
     run_js(script)
@@ -69,6 +74,94 @@ closeCarried();
 assert.equal(route.carriedRead,null);
 for(const key of ['place','q','interpretedQ','searchWithin','local','searchOffset','offset','zoom','pan','cameraReady','cameraScale','chartLayout','relatedPlace'])
  assert.deepEqual(route[key],before[key],key);
+""")
+
+
+@pytest.mark.parametrize('action', ['open', 'handover'])
+def test_passages_use_one_wide_panel_and_reload_keeps_the_exact_read(action):
+    run_controller(r"""
+const requests=[];const api=async url=>{requests.push(new URL(url,'http://localhost'));return {
+ state:'available',catalog:route.carriedRead.action==='handover'?'':catalog,offset:0,
+ text:'Retained handover',text_chars:17,provenance:{},messages:[{
+  id:'session-one',provider:'aider',role:'assistant',index:34,text:'Exact retained passage'
+ }]};};
+(async()=>{
+ begin({action:ACTION,ref:ACTION==='open'?'session-one':'',turn:ACTION==='open'?34:null,chars:8000,catalog});
+ route={...route,place:view.center.id,zoom:2.4,pan:{x:42,y:-12},q:'matrix',step:9};
+ const before=JSON.parse(JSON.stringify(route));inspector.append(panel);
+ await loadCarried(ship,panel);
+ assert.equal(carriedDialog.open,true);assert.deepEqual(carriedDialog.children,[panel]);
+ assert.ok(!inspector.children.includes(panel),'The passage moves to the reader instead of being duplicated in the rail');
+ assert.equal(panel.querySelector('h3').children[0],'Carried context · Orchard');
+ assert.deepEqual(route,before,'Opening the presentation must not change the exact request or chart');
+ const copied=url();closeCarried();assert.equal(carriedDialog.open,false);
+ assert.deepEqual(carriedDialog.children,[]);
+ restore({...before,carriedRead:carriedParam(copied.searchParams)});
+ inspector.append(panel);await loadCarried(ship,panel);
+ assert.equal(carriedDialog.open,true);assert.deepEqual(route,before);
+ const params=requests.at(-1).searchParams;
+ assert.equal(params.get('within'),ship.id);assert.equal(params.get('action'),ACTION);
+ assert.equal(params.get('catalog'),ACTION==='handover'?'':catalog);
+ assert.equal(params.get('turn'),ACTION==='open'?'34':null);
+ assert.deepEqual(route.pan,{x:42,y:-12});assert.equal(route.zoom,2.4);
+})().catch(error=>{console.error(error);process.exitCode=1});
+""".replace('ACTION', repr(action)))
+
+
+def test_back_to_context_search_keeps_the_pin_and_uses_the_rail():
+    run_controller(r"""
+const api=async()=>({state:'available',catalog,offset:0,messages:[],provenance:{}});
+(async()=>{
+ begin({action:'search',q:'amber',catalog});inspector.append(panel);
+ await loadCarried(ship,panel);assert.equal(carriedDialog.open,false);
+ assert.ok(inspector.children.includes(panel));
+ openCarried(ship,{action:'open',q:'amber',ref:'session-one',turn:34,catalog,chars:8000});
+ inspector.append(panel);await loadCarried(ship,panel);
+ assert.equal(carriedDialog.open,true);
+ click(panel,'← Back to context search');
+ assert.equal(carriedDialog.open,false);assert.equal(route.carriedRead.action,'search');
+ assert.equal(route.carriedRead.q,'amber');assert.equal(route.carriedRead.catalog,catalog);
+ assert.equal(route.carriedRead.ref,'');assert.equal(route.carriedRead.turn,null);
+ inspector.append(panel);await loadCarried(ship,panel);
+ assert.equal(carriedDialog.open,false);assert.ok(inspector.children.includes(panel));
+ assert.equal(remembered.at(-1).route.carriedRead.catalog,catalog);
+})().catch(error=>{console.error(error);process.exitCode=1});
+""")
+
+
+def test_escape_from_reader_input_cancels_pending_read_without_losing_camera():
+    handler = next(line for line in JS.splitlines() if line.startswith("document.addEventListener('keydown'"))
+    run_controller(r"""
+let resolve;const api=()=>new Promise(done=>resolve=done);
+const voiceInput={active:()=>false},actionDialog={open:false},sourceDialog={open:false};
+let keydown;document.addEventListener=(name,callback)=>{if(name==='keydown')keydown=callback};
+HANDLER
+(async()=>{
+ begin({action:'open',ref:'session-one',turn:34,catalog});route.pan={x:38,y:17};
+ inspector.append(panel);const pending=loadCarried(ship,panel);
+ assert.equal(carriedDialog.open,true);el('input').focus();
+ let prevented=0,stopped=0;
+ keydown({key:'Escape',preventDefault(){prevented++},stopImmediatePropagation(){stopped++}});
+ assert.equal(prevented,1);assert.equal(stopped,1);
+ assert.equal(carriedDialog.open,false);assert.equal(route.carriedRead,null);
+ resolve({state:'available',catalog,messages:[{id:'session-one',index:34,text:'Late passage'}]});await pending;
+ assert.equal(carriedDialog.open,false);assert.deepEqual(carriedDialog.children,[]);
+ assert.deepEqual(route.pan,{x:38,y:17});
+})().catch(error=>{console.error(error);process.exitCode=1});
+""".replace('HANDLER', handler))
+
+
+def test_reader_error_keeps_ship_identity_and_a_working_exit():
+    run_controller(r"""
+const api=async()=>{throw Error('The saved catalog changed')};
+(async()=>{
+ begin({action:'open',ref:'session-one',turn:34,catalog});
+ await loadCarried(ship,panel);
+ assert.equal(carriedDialog.open,true);
+ assert.equal(panel.querySelector('h3').children[0],'Carried context · Orchard');
+ assert.ok(walk(panel).some(node=>node.children?.includes('The saved catalog changed')));
+ click(panel,'Close');assert.equal(carriedDialog.open,false);assert.equal(route.carriedRead,null);
+})().catch(error=>{console.error(error);process.exitCode=1});
 """)
 
 
@@ -92,7 +185,7 @@ detail.open=false;detail.events.toggle();assert.equal(route.copiesPlace,'');
 
 
 def test_url_only_back_retains_interpreted_scope_and_stored_copy_catalog():
-    popstate = next(line for line in JS.splitlines() if line.startswith("window.addEventListener('popstate'"))
+    popstate = section("window.addEventListener('popstate'", "\nfunction fly(")
     run_controller("""
 const saved=baseState();saved.action='open';saved.ref='record';saved.turn=7;saved.catalog=catalog;
 const params=new URLSearchParams({view:'space',place:ship.id,q:'find amber in orchard',

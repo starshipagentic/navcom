@@ -13,8 +13,17 @@ Consequential actions never run from the rail or a card. They open their review 
 Ask expert, Board ship, Resume…, and Fresh agent… all read the exact command before a
 second, explicit button launches it.
 
-The rail is the one place for a place's actions. The arrival state (*You've arrived*) points at
-it instead of repeating its buttons, and **Explore time** lives in the time bar above the chart
+The rail is the one place for a place's actions. Empty product destinations show their
+recorded briefing with shortcuts to the same readers. Ship destinations show their
+recorded mission, location, context availability, readiness gaps and stored-copy links
+in the main workspace. **Open ship actions** moves focus to the existing rail; arrival
+does not inspect, read cargo, check a captain route or launch anything. An observation
+already loaded through **Inspect ship** can also fill the workspace dossier.
+Historical leaf destinations use the already-loaded landing result to show the
+selected date, commit, retained file inventory and matching source passages in
+the main workspace. File shortcuts open the same pinned source reader; they
+do not fetch current files, run another harvest or reconstruct another date.
+**Explore time** lives in the time bar above the chart
 (its command is under *More CLI commands* until the bar is open). Every rail click rebuilds the
 inspector, but an open panel whose request did not change shows the answer (or failure) it
 already has: only the panel whose input changed calls its route again, and each failure's
@@ -50,7 +59,7 @@ place that is not the center its `navigate`.
 | search (evidence) | Built | Navigator replay on Back, reload or paging → `GET /api/space?action=search&evidence=1` → `search`; results show the response `cli_command` |
 | related | Built | **Connections & versions** → `GET /api/space/related` → `related` |
 | sources search | Built | **Search harvested sources** → `GET /api/sources/search?within=SOURCE[&path=…]` → `source_search[]` (one per source) |
-| conversation collections | Built | **Conversations here** → `GET /api/atlas?action=explore` (newest first), then `action=search` → `conversation_search[]`. One collection per read: the panel names it from the response (`effective_scope.label`), says *collection i of N* and the place's total, and shows the response `cli_command`. Typed words fill the line's `<query>` as you type; a collection whose command has no `<query>` gets no words box. Naming every collection up front, or one read across all of them, is a [candidate](cli-concept-candidates.md#from-the-place-and-conversation-action-matrix) |
+| place conversations | Built | **Conversations here** → `GET /api/space?conversations=1&action=explore` (newest first), then `action=search` → `conversation_explore` / `conversation_search[]`. Reads the union of every saved collection in the place before ranking and pagination. The panel names the place, reports collection coverage, pages results, and offers **Show child conversations**. Its response carries the exact `atlas explore/search --conversations` command. District suggestions retain the product-context warning. |
 | history conversations | Built | **Conversations by date** → `GET /api/history/conversations` → `history_conversations` (`<YYYY-MM-DD>` = chosen date) previews the date; after the read the line is the response `cli_command` (with `--query` when words were given) |
 | history system | Built | Time bar **Explore time** (above the chart); *Explore this time* → `POST /api/history/system` → `history_system` (`<YYYY-MM-DD>` = chosen UTC time) |
 | sources list | Built | **Harvested sources** → `GET /api/sources` → `sources_list` |
@@ -58,7 +67,7 @@ place that is not the center its `navigate`.
 | pause refresh | Built (exempt by design) | Header **Pause** → `POST /api/space/refresh/pause`, tagged `view-state` in `ROUTES`. A CLI pause is a [candidate](cli-concept-candidates.md#from-the-place-and-conversation-action-matrix) |
 | upkeep | Built | Library header **Run upkeep** → `POST /api/upkeep` (`navcom --maintain`); not place-scoped |
 | inspect, files, history timeline | N/A | `navigation.inspect`, `place_files.files` and `history.resolve_place` reject the galaxy; use history system |
-| resume / recap newest here | Candidate | [A place's conversations as one list](cli-concept-candidates.md#from-the-place-and-conversation-action-matrix) |
+| resume / recap newest here | Candidate | [Resume or recap newest conversation in one step](cli-concept-candidates.md#from-the-place-and-conversation-action-matrix) |
 
 ## Solar system
 
@@ -71,11 +80,11 @@ place that is not the center its `navigate`.
 | search (evidence) | Built | Navigator replay → `search` |
 | related | Built | **Connections & versions** → `related` |
 | sources search | Built | **Search harvested sources** → `source_search[]` |
-| conversation collections | Built | **Conversations here** → `conversation_search[]` (a choice per collection) |
+| conversation collections | Built | **Conversations here** → `conversation_explore` / `conversation_search[]` (the whole saved place) |
 | history conversations | Built | **Conversations by date** → `history_conversations` |
 | history system | Built | Time bar **Explore time** (center) → `POST /api/history/system` → `history_system`; a system that is not the center lists it under More CLI commands |
 | inspect, files, history timeline | N/A | Rejected by the services for systems |
-| resume newest here | Candidate | Collections intersect; see candidates |
+| resume newest here | Candidate | Selecting a newest REF in one command remains a candidate |
 
 ## Product planet
 
@@ -95,7 +104,7 @@ place that is not the center its `navigate`.
 | history explore --repo | Built | A commit in a chosen copy's trail → `POST /api/history/explore {…, repo}` → the revision shows the response `cli_command` (with `--repo`). Back and reload reopen the saved revision of that copy |
 | history conversations | Built | **Conversations by date** → `history_conversations` |
 | sources search | Built | **Search harvested sources** → `source_search[]` |
-| conversation collections | Built | **Conversations here** → `conversation_search[]` |
+| conversation collections | Built | **Conversations here** → `conversation_explore` / `conversation_search[]` |
 | history system | N/A | Needs a galaxy or system center |
 | board | N/A | Ships only |
 | resume / recap newest here, fresh agent here | Candidate | See candidates |
@@ -119,7 +128,7 @@ History system and board are N/A; resume newest and fresh agent here are candida
 | history timeline / explore | Built | **Check history** → `history_timeline`; commit → `history_explore` |
 | history conversations | Built | **Conversations by date** → `history_conversations` |
 | sources search | Built | **Search harvested sources** → `source_search[]` (the district's exact `--path` files) |
-| conversation collections | Built | **Conversations here** → the product's collections, searched with the service's suggested query (the command has no `<query>`, so the panel has no words box and names the words it used), labeled *relationship unproven* |
+| conversation collections | Built | **Conversations here** → the union of the product's collections, searched with the service's suggested query (the command has no `<query>`, so the panel has no words box and names the words it used), labeled *relationship unproven* |
 | inspect | N/A | Code areas carry no locations; the service lists no `inspect` command |
 | list | N/A | Districts have no listed children |
 | resume newest here | Candidate | Would fall back to the product's conversations |
@@ -159,7 +168,7 @@ history and files are N/A (no locations or source scopes).
 
 | Verb | Status | Where → route → command |
 |---|---|---|
-| explore | Built | **Fly to …** → `explore` |
+| explore | Built | **Fly to …** → `explore`; the arrival workspace renders the returned recorded ship metadata and copy links |
 | board (check) | Built | **Board ship** → review dialog; *Check captain route* → `POST /api/space/board` (`validate: true`) → `board_validate` |
 | board (launch) | Built | *Open captain in terminal →* → `POST /api/space/board` (`launch: true`, review fingerprint). Only after the check |
 | inspect / --refresh | Built | **Inspect ship** → `inspect`; dossier **↻ Refresh observation** → `inspect_refresh` |
@@ -170,12 +179,26 @@ history and files are N/A (no locations or source scopes).
 | navigate | Built | **Search this place** (center) → `navigate` (searches carried context) |
 | inspect --observe, history, files, resume | N/A | Raised for ships, no locations or scopes, not an indexed conversation (board is the captain analog) |
 
+Boarding preparation is an explicit action: local ships use native route metadata;
+recorded remote working ships use their existing fleet SSH alias and commission
+receipt, with bounded read-only SSH metadata checks. Validation streams Starship's
+unchanged lookup helper to check the exact native thread/workspace without sending
+a turn. `--route` applies only to local route files. Missing or conflicting evidence
+blocks the action. Launch requires the reviewed identity and revalidation; it opens
+the existing captain without creating one or adding a prompt. Terminal dispatch
+does not establish visible arrival or human takeover. Ordinary browsing does not
+connect to a captain.
+
 ## Ship archive (`kind: ship, form: archive`)
 
 **Fly to …** (`explore`), **Inspect archive** (+ refresh), **Read carried context** (search, handover),
 **Search this place** at the center, and the working ship through its link. Board is N/A
 (archives cannot board). Recap or revive of a carried session is a
 [candidate](cli-concept-candidates.md).
+
+Archive arrival uses the same workspace with an explicit stored-archive identity.
+The working-copy link remains a separate destination. A recorded archive path or
+capture receipt never establishes current integrity, readiness or captain takeover.
 
 ## Conversation (cards in search results, Conversations here, and dated lists)
 

@@ -443,6 +443,14 @@ documented links you can fly along. `atlas related PLACE --query TEXT` exposes t
 same evidence and continuation controls from the CLI. Folder versions are
 suggestions, not proven ancestry; missing harvested files remain explicit. See the
 [native relationship contract](docs/native-relationships-contract.md).
+Explicit product replacements can be recorded with stable `id` and
+`supersedes` fields in `.navcom-space.json` at a repository root or an already
+discovered application boundary. Each app can have its own identity, including
+when it moves to a different folder or its own repository. Ordinary
+chart refresh picks them up; **Connections & versions** presents them separately
+with their declaration paths. Products retain separate files and conversations.
+Missing or conflicting identities stay unresolved, and no replacement date is
+inferred.
 
 Browsing reads the saved chart while existing Starforge harvest analyzes bounded
 code and documents. Unchanged sources reuse cached artifacts. Existing explicit
@@ -450,6 +458,15 @@ scopes stay registered; updating one source retains other published snapshots ev
 when their original storage is offline. Native Git ignore rules and metadata
 budgets apply; raw provider config is not added by document discovery.
 `sources discover --json` reports its selected files, exclusions and pagination.
+Discovery and bridge upkeep combine indexed projects with Starforge's existing
+local harvest catalog. `sources discover --inventory starforge --harvest` visits
+that catalog through the same bounded intake; `--inventory indexed` restricts
+discovery to conversation projects. No repositories are downloaded. Authored
+command, agent and skill Markdown is included, including known `.claude`,
+`.agents` and `.codex` instruction directories; settings and private files remain
+excluded. Global search includes all published sources even before the chart
+catches up. Local search keeps its recorded place membership; a preserved backup
+does not establish client ownership merely by mentioning a client.
 Use `sources harvest ROOT --include src --include docs` to register a larger code
 scope, then refresh the chart; no catalog copying or manual synchronization is
 needed. Starforge is optional for the map and required for source analysis.
@@ -480,7 +497,7 @@ the ship's handover document. Preserve the returned catalog SHA with `--catalog`
 when paging or opening a result; a changed catalog requires a fresh read.
 `--offset`, `--limit` and `--max-chars` bound the output. This uses the installed
 Starship reader and the selected local ship's retained dialogue, without resuming
-a captain or substituting current host history. Remote ships remain unavailable.
+a captain or substituting current host history. Remote carried-dialogue reads remain unavailable.
 Refresh discovers separate local commission archives from Starship evidence and
 caches their metadata. **Stored ship copies** at the galaxy and **Ships & stored
 context** on linked ships/products open those copies. `atlas list ships` and
@@ -515,10 +532,15 @@ or change files; this is an explicit action, separate from chart navigation.
 `navcom atlas ask STAR "question"` prepares the same review. Repeat with
 `--launch --review TOKEN` only to open that reviewed action.
 
-**Board ship** discovers the exact host/workspace route in native captain metadata
-and uses installed Starship tools to validate it. `navcom atlas board SHIP` previews;
-`--validate` checks the native thread; `--launch --review TOKEN` revalidates and
-opens it. Missing, ambiguous or remote routes remain unavailable. A terminal
+**Board ship** discovers the exact host/workspace route from existing native
+metadata. `navcom atlas board SHIP` previews it; for recorded remote working ships,
+it uses the existing fleet SSH alias and commission receipt, then makes bounded
+read-only SSH metadata checks. `--validate` checks the exact native thread and
+workspace through Starship's unchanged lookup helper, without sending a turn.
+`--route` overrides a local route file only. Missing or conflicting evidence stops
+the action, and archives cannot board. Ordinary chart browsing makes no boarding
+connections. `--launch --review TOKEN` revalidates and opens the existing captain
+in a new terminal; it does not create a captain or supply a prompt. A terminal
 dispatch does not prove an expert reply, restored context or captain takeover. See the
 [spatial vision](docs/spatial-navigation-vision.md) and
 [implementation status](docs/galactic-implementation-plan.md).
@@ -707,3 +729,10 @@ stage without Git pulls, modifying original repositories, or updating Starforge'
 global catalog. Refresh holds a separate nonblocking writer lock; searches remain
 available against the last complete publication. CLI and bridge searches/readers
 consume the same published artifacts.
+
+## Evidence retrieval
+
+The published package includes `navcom_evidence.EvidenceCorpus`: cited origin context,
+related evidence and bounded passage selection, with no model calls. See
+[the evidence API](docs/evidence-retrieval.md). These functions return evidence;
+callers retain product identity, interpretation and owner decisions.

@@ -14,6 +14,13 @@ _QUESTION = re.compile(r"^(?:how|what|where|which|why|who|when|compare)\b", re.I
 _PATH = re.compile(r"(?:^|\s)(?:[a-zA-Z][\w+.-]*://[^\s]+|(?:~?/|\.{1,2}/|[\w.-]+/)[^\s]+|[\w.-]+\.[\w]{1,12}(?=\s|$|[?]))")
 _SCOPED_SEARCH = re.compile(r"^(?:find|search for|search|now search for|now search)\s+(.+?)\s+(?:in|within)\s+(.+)$", re.IGNORECASE | re.DOTALL)
 _TRAVEL_SEARCH = re.compile(r"^(?:take me to|fly to|open)\s+(.+?)(?:\s*,\s*|\s+)(?:then|and)\s+(?:find|search for|search)\s+(.+)$", re.IGNORECASE | re.DOTALL)
+_LIST_KINDS = {"systems": "systems", "solar systems": "systems", "planets": "planets",
+               "products": "planets", "moons": "moons", "experiments": "moons",
+               "districts": "cities", "cities": "cities", "stars": "stars",
+               "starbases": "starbases", "ships": "ships"}
+_LIST = re.compile(r"^(?:show|list)\s+(?:me\s+)?(?:the\s+)?(" +
+                   "|".join(re.escape(label).replace(r"\ ", r"\s+") for label in _LIST_KINDS) + r")$",
+                   re.IGNORECASE)
 
 
 def _command_tail(phrase):
@@ -45,8 +52,8 @@ def interpret(text, within, local=True):
     """Return a navigation/search plan without changing query vocabulary.
 
     ``within`` is an existing opaque place identifier. ``local=False`` clears it
-    so the caller can search globally. Only complete back/home commands navigate
-    directly; destination phrases remain unresolved queries for the shared API.
+    so the caller can search globally. Only complete back/home/list commands are
+    recognized; destination phrases remain unresolved queries for the shared API.
     """
     if not isinstance(text, str):
         raise ValueError("Navigation input must be text")
@@ -60,11 +67,18 @@ def interpret(text, within, local=True):
     result = {"action": "search", "query": command, "within": scope,
               "steps": [], "engine": "procedural"}
     control=_command_tail(command).casefold()
-    if control in ("back", "go back"):
+    if control in ("back", "go back", "take me back"):
         result.update(action="back", query="", steps=["Return to the previous view using navigation history."])
         return result
     if control == "home":
         result.update(action="home", query="", within="", steps=["Return to the galaxy overview."])
+        return result
+    listing = _LIST.fullmatch(control)
+    if listing:
+        label = " ".join(listing.group(1).split())
+        boundary = f'within the current place "{scope}"' if scope else "across the galaxy"
+        result.update(action="list", kind=_LIST_KINDS[label], query="",
+                      steps=[f"List {label} {boundary} from the cached galactic map."])
         return result
     # These are command clauses, not a product classifier. Resolve the named
     # place against the actual catalog before searching; quoted/path input keeps

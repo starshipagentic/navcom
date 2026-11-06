@@ -74,11 +74,31 @@ def test_art_import_is_exact_repeatable_and_contained(tmp_path):
     (atlas / "fixture.png").write_bytes(png)
     catalog = [{"id": asset_id, "image": "fixture.png", "sheet": "sheet.png", "provenance": "fixture"}
                for asset_id in module.ROLES.values()]
+    by_id = {item['id']: item for item in catalog}
+    classes = ['probe', 'scout', 'courier', 'surveyor', 'science-frigate',
+               'expedition-cruiser', 'community-ark', 'research-outpost', 'service-tender']
+    for family in ['03-verdant-fleet', '04-prism-fleet', '05-amber-fleet']:
+        for name in classes:
+            asset_id = family + '/' + name
+            by_id.setdefault(asset_id, {'id': asset_id, 'image': 'fixture.png'})
+            by_id[asset_id].update(kind='fleet', title=name, culture=family)
+    cargo = ['parcel-drone', 'orbital-tug', 'container-hauler', 'ice-tanker', 'salvage-crab',
+             'mobile-fabricator', 'seed-vault-transport', 'passenger-liner', 'heavy-lift-cradle']
+    for name in cargo:
+        asset_id = '06-cargo-utility/' + name
+        by_id[asset_id] = dict(id=asset_id, image='fixture.png', kind='facility', title=name, culture='Cargo')
+    catalog = list(by_id.values())
     write(atlas / "catalog.json", catalog)
-    assert module.import_art(source, output)["copied"] == 8
+    assert module.import_art(source, output)["copied"] == 41
     manifest = json.loads((output / "manifest.json").read_text())
+    variants = [a for a in manifest['assets'] if a['role'] == 'ship_variant']
+    assert len(variants) == 33
+    assert not any(a['id'].endswith('/research-outpost') for a in variants)
+    assert sum(a['id'].startswith('06-cargo-utility/') for a in variants) == 9
+    assert {a['file'] for a in manifest['assets'] if a['role'] != 'ship_variant'} == {role+'.png' for role in module.ROLES}
+    assert all(a['file'] == 'ship-'+a['id'].replace('/', '-')+'.png' for a in variants)
     before = {p.name: p.stat().st_mtime_ns for p in output.iterdir()}
-    assert module.import_art(source, output)["unchanged"] == 8
+    assert module.import_art(source, output)["unchanged"] == 41
     assert before == {p.name: p.stat().st_mtime_ns for p in output.iterdir()}
     assert all(a["sha256"] == hashlib.sha256(png).hexdigest() and a["width"] == 16 for a in manifest["assets"])
     for a in manifest["assets"]:
@@ -87,4 +107,9 @@ def test_art_import_is_exact_repeatable_and_contained(tmp_path):
     catalog[0]["image"] = "../../escape.png"; write(atlas / "catalog.json", catalog)
     import pytest
     with pytest.raises(ValueError, match="escapes"):
+        module.import_art(source, output)
+    catalog[0]['image'] = 'fixture.png'
+    catalog.append(dict(id='06-cargo-utility/../../escape', image='fixture.png'))
+    write(atlas / 'catalog.json', catalog)
+    with pytest.raises(ValueError, match='Unsafe asset ID'):
         module.import_art(source, output)

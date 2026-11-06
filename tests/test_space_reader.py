@@ -6,11 +6,13 @@ from test_space_camera import run_js
 def test_reader_close_survives_paging_failure_and_rerender_without_focus_churn():
     source=(Path(__file__).resolve().parents[1]/'navcom_space.js').read_text()
     reader=source[source.index('let readerOrigin='):source.index('const voiceInput=',source.index('let readerOrigin='))]
-    script=r"""
+    identity=source[source.index('function conversationState('):source.index('function conversationRoute(')]
+    script=identity+r"""
 const assert=require('node:assert/strict');
 let active=true,observerCallback,observing=false,disconnects=0,mutations=0,focuses=0;
 const classes=()=>({values:new Set(),add(v){this.values.add(v)},remove(v){this.values.delete(v)},contains(v){return this.values.has(v)}});
 const document={body:{classList:classes()},activeElement:null};document.activeElement=document.body;
+let route={step:0,conversationRead:null},lastStep=0,journeyId='test';const remember=()=>{},cancelDetail=()=>{},history={state:null};
 const listeners={};const window={addEventListener:(name,fn)=>listeners[name]=fn};
 let children=[],focusin=()=>{};
 const box={
@@ -50,4 +52,4 @@ function tick(){if(observing)observerCallback()}
 })().catch(e=>{console.error(e);process.exitCode=1});
 """
     run_js(script)
-    assert 'closeReader(false);datedTicket++' in source, 'Leaving the bridge must disconnect its reader observer without stealing nav focus'
+    assert 'closeReader(false,false);datedTicket++' in source, 'Leaving the bridge must disconnect its reader observer without stealing nav focus'

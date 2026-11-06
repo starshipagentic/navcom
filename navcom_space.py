@@ -369,6 +369,16 @@ def _safe_relative(value):
     return bool(str(value)) and not path.is_absolute() and ".." not in path.parts
 
 
+def _linked_within(path, root):
+    """Do not follow a substituted directory while inspecting exact metadata."""
+    relative = _relative(path, root)
+    if relative is None or not _safe_relative(relative):
+        return True
+    parts = Path(relative).parts
+    return root.is_symlink() or any(root.joinpath(*parts[:i]).is_symlink()
+                                    for i in range(1, len(parts) + 1))
+
+
 def in_scopes(path, scopes):
     """A repository-relative path lies in one of these relative scopes ("." is all)."""
     return any(scope == "." or path == scope or path.startswith(scope + "/") for scope in scopes)
@@ -427,7 +437,7 @@ def _boundaries(root, warnings, max_boundaries, native_apps=()):
             if inspected > max_boundaries:
                 truncated = True
                 break
-            if not candidate.is_dir() or candidate.is_symlink() or candidate == root:
+            if candidate == root or _linked_within(candidate, root) or not candidate.is_dir():
                 continue
             data = _package(candidate, warnings)
             scripts = data.get("scripts") if isinstance(data.get("scripts"), dict) else {}
@@ -468,6 +478,31 @@ def _boundaries(root, warnings, max_boundaries, native_apps=()):
                                            description="Experiment directory; product relationship follows explicit containment.",
                                            evidence=dict(type="experiment_directory", path=str(candidate), parent=str(parent)))
     return package, list(found.values()), truncated
+
+
+def _retain_unavailable_products(root, boundaries, previous_locations, max_boundaries):
+    """Keep exact prior app observations without discovering another directory."""
+    found = {boundary["relative"] for boundary in boundaries}
+    for location, prior in previous_locations.items():
+        destination = Path(location)
+        relative = _relative(destination, root)
+        if (not relative or relative == "." or not _safe_relative(relative) or relative in found
+                or prior.get("kind") != "planet" or not prior.get("declared_id")
+                or (not _linked_within(destination, root) and destination.is_dir())):
+            continue
+        evidence = next((item for item in prior.get("evidence", [])
+                         if item.get("type") in {"workspace_application", "native_application"}
+                         and item.get("repository_root") == str(root)
+                         and Path(item.get("path", "")).parent == destination), None)
+        if not evidence or not any(record.get("path") == str(destination / ".navcom-space.json")
+                                   for record in prior.get("product_declarations", [])):
+            continue
+        if len(boundaries) >= max_boundaries:
+            return True
+        boundaries.append(dict(relative=relative, kind="planet", label=prior["label"],
+                               description=prior.get("description", ""), evidence=evidence))
+        found.add(relative)
+    return False
 
 
 def _cached_applications(source, structure, warnings, previous_locations=None, dependency_components=None):
@@ -563,20 +598,153 @@ def _snapshot_contains(source, relative):
     return (snapshot / relative).exists()
 
 
-def _declaration(root, warnings):
+def _declaration(root, warnings, diagnostics=None, *, product_boundary=False):
     path = root / ".navcom-space.json"
     try:
+        if path.is_symlink():
+            raise ValueError("Linked declarations are not read")
         value = _read(path, {}, 256 * 1024)
         if not isinstance(value, dict):
             raise ValueError("Expected an object")
         if value.get("kind", "planet") not in ("planet", "moon", "star"):
             raise ValueError("kind must be planet, moon or star")
+        if product_boundary and value.get("kind", "planet") != "planet":
+            raise ValueError("A discovered application declaration must have kind planet")
+        if product_boundary and "id" in value and not (
+                isinstance(value["id"], str) and value["id"] and value["id"] == value["id"].strip()
+                and len(value["id"]) <= 200):
+            raise ValueError("A product id must be a nonempty string of at most 200 characters without surrounding whitespace")
         if "system" in value and (not isinstance(value["system"], dict) or not value["system"].get("id") or not value["system"].get("label")):
             raise ValueError("system needs explicit id and label")
+        if "supersedes" in value:
+            identity, targets = value.get("id"), value["supersedes"]
+            valid_id = isinstance(identity, str) and bool(identity.strip()) and len(identity) <= 200
+            valid_targets = (isinstance(targets, list) and len(targets) <= 64 and
+                             all(isinstance(target, str) and bool(target.strip()) and len(target) <= 200
+                                 and target == target.strip() for target in targets))
+            if not valid_id or identity != identity.strip() or value.get("kind", "planet") != "planet" or not valid_targets:
+                reason = "supersedes needs an explicit nonempty id, kind planet, and at most 64 nonempty declared-id strings."
+                warnings.append("Ignored succession in " + str(path) + ": " + reason)
+                if diagnostics is not None:
+                    diagnostics.append(dict(code="invalid", declared_id=identity if isinstance(identity, str) else None,
+                                            paths=[str(path)], reason=reason))
+                value = {key: item for key, item in value.items() if key != "supersedes"}
+            else:
+                value = dict(value, kind="planet", supersedes=sorted(set(targets)))
         return value
     except (OSError, ValueError) as exc:
         warnings.append("Ignored declaration " + str(path) + ": " + str(exc))
+        if diagnostics is not None:
+            diagnostics.append(dict(code="invalid", declared_id=None, paths=[str(path)], reason=str(exc)))
         return {}
+
+
+def _product_succession(entities, edges, diagnostics):
+    """Resolve one-hop authored claims; never alter containment or evidence scope."""
+    declarations = defaultdict(list)
+    for node in entities.values():
+        for record in node.get("product_declarations", []):
+            declarations[record["declared_id"]].append((node, record))
+    invalid_paths = {path for item in diagnostics if item["code"] == "invalid" for path in item.get("paths", [])}
+    blocked = {item.get("declared_id") for item in diagnostics if item["code"] == "conflicting"}
+    for identity, records in declarations.items():
+        live = [(node, record) for node, record in records if not record.get("stale")]
+        # An unavailable copy is an old observation, not a veto over a current
+        # declaration. If all copies are unavailable, retain their last agreement.
+        authoritative = live or records
+        signatures = {(node["kind"], tuple(record["supersedes"])) for node, record in authoritative}
+        if len({node["id"] for node, _ in records}) != 1 or len(signatures) != 1:
+            if identity not in blocked:
+                diagnostics.append(dict(code="conflicting", declared_id=identity,
+                                        paths=sorted({record["path"] for _, record in records}),
+                                        reason="Declared identity has incompatible copies or succession claims; no link resolved."))
+            blocked.add(identity)
+        if any(record["path"] in invalid_paths for _, record in authoritative):
+            blocked.add(identity)
+    proposed = []
+    for identity, records in sorted(declarations.items()):
+        if identity in blocked:
+            continue
+        live = [(node, record) for node, record in records if not record.get("stale")]
+        selected = live or records
+        node = selected[0][0]
+        if node["kind"] != "planet":
+            continue
+        for target in selected[0][1]["supersedes"]:
+            paths = sorted({record["path"] for _, record in selected})
+            if target == identity:
+                diagnostics.append(dict(code="self", declared_id=identity, target_declared_id=target,
+                                        paths=paths, reason="A product cannot supersede itself."))
+                continue
+            matches = declarations.get(target, [])
+            if not matches:
+                diagnostics.append(dict(code="missing", declared_id=identity, target_declared_id=target,
+                                        paths=paths, reason="No exact declared product ID is present in this publication."))
+                continue
+            if target in blocked or matches[0][0]["kind"] != "planet":
+                diagnostics.append(dict(code="conflicting", declared_id=identity, target_declared_id=target,
+                                        paths=paths, reason="Target declared ID is conflicting or is not a product; no link resolved."))
+                continue
+            target_live = [(n, record) for n, record in matches if not record.get("stale")]
+            target_records = target_live or matches
+            records_used = [dict(record) for _, record in selected]
+            proposed.append(dict(source=node["id"], target=matches[0][0]["id"], relation="supersedes", status="declared",
+                                 evidence=dict(type="owner_declaration", declared_id=identity, target_declared_id=target,
+                                               declarations=records_used,
+                                               target_declarations=[dict(record) for _, record in target_records],
+                                               stale=any(record.get("stale") for _, record in selected + target_records),
+                                               meaning="Explicit product succession; observation time is not an effective date. No scope, ownership, or historical identity is inferred.")))
+    # Iterative strongly connected components find every participant, including
+    # overlapping cycles, without depending on Python's recursion depth.
+    adjacency, reverse = defaultdict(list), defaultdict(list)
+    for record in proposed:
+        adjacency[record["source"]].append(record["target"])
+        reverse[record["target"]].append(record["source"])
+    visited, finished = set(), []
+    for start in sorted(adjacency):
+        if start in visited:
+            continue
+        visited.add(start)
+        stack = [(start, iter(adjacency[start]))]
+        while stack:
+            current, children = stack[-1]
+            child = next(children, None)
+            if child is None:
+                stack.pop()
+                finished.append(current)
+            elif child not in visited:
+                visited.add(child)
+                stack.append((child, iter(adjacency[child])))
+    assigned, cyclic = set(), set()
+    for start in reversed(finished):
+        if start in assigned:
+            continue
+        component, pending = set(), [start]
+        assigned.add(start)
+        while pending:
+            current = pending.pop()
+            component.add(current)
+            for parent in reverse[current]:
+                if parent not in assigned:
+                    assigned.add(parent)
+                    pending.append(parent)
+        if len(component) > 1:
+            cyclic.update(component)
+    resolved = []
+    for record in proposed:
+        if record["source"] in cyclic or record["target"] in cyclic:
+            evidence = record["evidence"]
+            diagnostics.append(dict(code="cycle", declared_id=evidence["declared_id"],
+                                    target_declared_id=evidence["target_declared_id"],
+                                    paths=[item["path"] for item in evidence["declarations"]],
+                                    reason="Succession touches a contradictory cycle; no link resolved."))
+        else:
+            resolved.append(record)
+    edges.extend(resolved)
+    return dict(declared_products=sum(node["kind"] == "planet" and bool(node.get("declared_id")) for node in entities.values()),
+                resolved_edges=len(resolved), stale_declarations=sum(record.get("stale", False) for rows in declarations.values() for _, record in rows),
+                diagnostics=diagnostics,
+                policy="Exact repository or discovered application product declarations only. Missing targets stay unresolved; links do not merge products, scopes, or dates.")
 
 
 def _system(root, declaration):
@@ -1000,6 +1168,15 @@ def refresh(api, conn, cache_path, source_cache=None, progress=None):
         old = _read(path, {}) or {}
         old_nodes = {n["id"]: n for n in old.get("entities", [])}
         old_locations = {loc["path"]: n for n in old_nodes.values() for loc in n.get("locations", [])}
+        old_product_boundaries = defaultdict(dict)
+        for node in old_nodes.values():
+            if not node.get("declared_id"):
+                continue
+            for evidence in node.get("evidence", []):
+                if evidence.get("type") in {"workspace_application", "native_application"} and evidence.get("repository_root"):
+                    address = str(Path(evidence["path"]).parent)
+                    if old_locations.get(address) is node:
+                        old_product_boundaries[evidence["repository_root"]][address] = node
         warnings = []
         indexed = defaultdict(list)
         unknown_projects = 0
@@ -1066,6 +1243,19 @@ def refresh(api, conn, cache_path, source_cache=None, progress=None):
         rejected_groups = 0
         missing_structure = []
         unavailable = []
+        succession_diagnostics = []
+        repositories, declarations_by_root = {}, {}
+        observed_at = time.time()
+        for ordinal, root_string in enumerate(inventory):
+            if progress:
+                progress(ordinal + 1, len(inventory))
+            repo = repositories[root_string] = _repository(Path(root_string))
+            repository_root = repo["root"]
+            key = str(repository_root)
+            if key in declarations_by_root:
+                continue
+            declaration = _declaration(repository_root, warnings, succession_diagnostics) if repository_root.is_dir() else {}
+            declarations_by_root[key] = declaration
 
         def put(identity, kind, label, parent=GALAXY, status="suggested", evidence=None, **extra):
             if identity not in entities:
@@ -1089,19 +1279,19 @@ def refresh(api, conn, cache_path, source_cache=None, progress=None):
             evidence=dict(type="inventory_scope", meaning="Your indexed and harvested work, independent of hosting machine."))
         for ordinal, root_string in enumerate(inventory):
             root = Path(root_string)
-            if progress:
-                progress(ordinal + 1, len(inventory))
             present = root.is_dir()
             if not present:
                 unavailable.append(root_string)
-            repo = _repository(root)
+            repo = repositories[root_string]
             repository_root = repo["root"]
             repository_present = repository_root.is_dir()
-            declaration = _declaration(repository_root, warnings) if repository_present else {}
+            declaration = declarations_by_root[str(repository_root)]
             system_id, system_label, system_status, system_evidence = _system(repository_root, declaration)
             # A duplicate/moved Git copy reuses its already established conceptual parent.
-            basis = str(declaration.get("id") or repo["identity"])
-            root_kind = declaration.get("kind") or ("moon" if EXPERIMENT.fullmatch(repository_root.name) else "planet")
+            declared_id = declaration.get("id")
+            basis = str(declared_id or repo["identity"])
+            valid_product_id = isinstance(declared_id, str) and declared_id and declared_id == declared_id.strip() and len(declared_id) <= 200
+            root_kind = declaration.get("kind") or ("planet" if valid_product_id else "moon" if EXPERIMENT.fullmatch(repository_root.name) else "planet")
             root_id = _id(root_kind, basis + "::.")
             prior_location = old_locations.get(str(repository_root)) if not repository_present else None
             retained_parent = None
@@ -1125,7 +1315,22 @@ def refresh(api, conn, cache_path, source_cache=None, progress=None):
             edge(GALAXY, system_id, status=system["status"], evidence=system_evidence)
             if str(repository_root) not in boundaries_by_root:
                 package, boundaries, bounded = _boundaries(repository_root, warnings, MAX_BOUNDARIES, native_apps)
+                bounded |= _retain_unavailable_products(repository_root, boundaries,
+                                                        old_product_boundaries[str(repository_root)], MAX_BOUNDARIES)
                 truncated |= bounded
+                for boundary in boundaries:
+                    if boundary["kind"] != "planet":
+                        continue
+                    destination = repository_root / boundary["relative"]
+                    if _linked_within(destination, repository_root) or not destination.is_dir():
+                        continue
+                    # The boundary already exists through native/workspace
+                    # evidence. A declaration never discovers a new directory.
+                    child_declaration = _declaration(destination, warnings, succession_diagnostics,
+                                                     product_boundary=True)
+                    if child_declaration:
+                        boundary["declaration"] = child_declaration
+                        boundary["declaration_repository"] = _repository(destination)
                 boundaries_by_root[str(repository_root)] = (package, boundaries)
             package, boundaries = boundaries_by_root[str(repository_root)]
             label = str(declaration.get("label") or repository_root.name)
@@ -1163,6 +1368,29 @@ def refresh(api, conn, cache_path, source_cache=None, progress=None):
                 node["ownership"] = "Product unassigned; experiment name alone does not establish a parent product."
             if declaration:
                 node["evidence"].append(dict(type="owner_declaration", path=str(repository_root / ".navcom-space.json")))
+            if isinstance(declared_id, str) and declared_id.strip() == declared_id and declared_id and len(declared_id) <= 200:
+                node["declared_id"] = declared_id
+                record = dict(declared_id=declared_id, kind=root_kind, supersedes=list(declaration.get("supersedes", [])),
+                              path=str(repository_root / ".navcom-space.json"), repository_root=str(repository_root),
+                              repository_identity=repo["identity"], observed_at=observed_at, stale=False)
+                records = node.setdefault("product_declarations", [])
+                if record not in records:
+                    records.append(record)
+            elif prior_location and node["id"] == prior_location["id"] and not repository_present:
+                # Retain only the exact unavailable copy's already recorded
+                # declaration. The old observation never becomes current fact.
+                retained = [dict(record, stale=True) for record in prior_location.get("product_declarations", [])
+                            if record.get("path") == str(repository_root / ".navcom-space.json")]
+                if retained and prior_location.get("declared_id"):
+                    node["declared_id"] = prior_location["declared_id"]
+                    records = node.setdefault("product_declarations", [])
+                    for record in retained:
+                        if record not in records:
+                            records.append(record)
+                        declaration_evidence = dict(type="owner_declaration", path=record["path"], stale=True,
+                                                    observed_at=record["observed_at"])
+                        if declaration_evidence not in node["evidence"]:
+                            node["evidence"].append(declaration_evidence)
             edge(parent_id, root_id, status=node["status"], evidence=evidence)
             candidates = [(repository_root, node)]
             for boundary in sorted(boundaries, key=lambda b: (b["kind"] == "moon", len(b["relative"]))):
@@ -1172,19 +1400,75 @@ def refresh(api, conn, cache_path, source_cache=None, progress=None):
                 if boundary["kind"] == "moon":
                     ancestors = [(p, n) for p, n in candidates if _relative(destination, p) is not None and n["kind"] == "planet"]
                     parent_id = max(ancestors, key=lambda item: len(str(item[0])))[1]["id"] if ancestors else root_id
+                child_declaration = boundary.get("declaration", {})
+                child_declared_id = child_declaration.get("id")
                 child_id = _id(boundary["kind"], basis + "::" + rel)
-                prior_boundary = old_locations.get(str(destination)) if not destination.is_dir() else None
+                if child_declared_id:
+                    # Identical to repository-root declarations: moving a
+                    # product into/out of a monorepo does not change its identity.
+                    child_id = _id("planet", child_declared_id + "::.")
+                elif child_declaration and boundary["declaration_repository"]["root"] == destination:
+                    child_id = _id("planet", boundary["declaration_repository"]["identity"] + "::.")
+                if child_declaration.get("system"):
+                    parent_id, child_system_label, child_system_status, child_system_evidence = _system(destination, child_declaration)
+                    put(parent_id, "system", child_system_label, status=child_system_status, evidence=child_system_evidence)
+                    edge(GALAXY, parent_id, status=child_system_status, evidence=child_system_evidence)
+                unavailable_boundary = _linked_within(destination, repository_root) or not destination.is_dir()
+                prior_boundary = old_locations.get(str(destination)) if unavailable_boundary else None
                 if prior_boundary and prior_boundary["kind"] == boundary["kind"]:
                     child_id = prior_boundary["id"]
+                if (not child_declaration.get("system") and child_id in old_nodes
+                        and old_nodes[child_id].get("declared_id")
+                        and old_nodes[child_id].get("parent_id") in old_nodes):
+                    prior_system = old_nodes[old_nodes[child_id]["parent_id"]]
+                    if prior_system["kind"] == "system":
+                        parent_id = prior_system["id"]
+                        put(parent_id, "system", prior_system["label"], status=prior_system["status"])
+                        edge(GALAXY, parent_id, status=prior_system["status"])
                 boundary_evidence = dict(boundary["evidence"], repository_root=str(repository_root))
-                child = put(child_id, boundary["kind"], boundary["label"], parent=parent_id,
-                            evidence=boundary_evidence, description=_clean_clue(api, boundary["description"], 320),
-                            status="candidate" if boundary["evidence"]["type"] == "native_application" else "suggested")
+                child = put(child_id, boundary["kind"], str(child_declaration.get("label") or boundary["label"]), parent=parent_id,
+                            evidence=boundary_evidence, description=_clean_clue(api, child_declaration.get("description") or boundary["description"], 320),
+                            status="established" if child_declaration else "candidate" if boundary["evidence"]["type"] == "native_application" else "suggested")
+                parent_id = child["parent_id"]
+                if not child.get("position") and str(destination) in old_locations:
+                    child["position"] = old_locations[str(destination)].get("position")
                 _prefer_description(child, dict(text=_clean_clue(api, boundary["description"], 320),
                                                 basis=boundary["evidence"]["type"],
                                                 path=boundary["evidence"].get("path", str(destination))))
+                declaration_path = str(destination / ".navcom-space.json")
+                if child_declaration:
+                    child.update(label=str(child_declaration.get("label") or boundary["label"]), status="established")
+                    declaration_evidence = dict(type="owner_declaration", path=declaration_path)
+                    if declaration_evidence not in child["evidence"]:
+                        child["evidence"].append(declaration_evidence)
+                    _prefer_description(child, dict(text=_clean_clue(api, child_declaration.get("description"), 320),
+                                                    basis="owner_declaration", path=declaration_path))
+                if child_declared_id:
+                    child["declared_id"] = child_declared_id
+                    child_repository = boundary["declaration_repository"]
+                    record = dict(declared_id=child_declared_id, kind="planet", supersedes=list(child_declaration.get("supersedes", [])),
+                                  path=declaration_path, repository_root=str(child_repository["root"]),
+                                  repository_identity=child_repository["identity"], observed_at=observed_at, stale=False)
+                    records = child.setdefault("product_declarations", [])
+                    if record not in records:
+                        records.append(record)
+                elif prior_boundary:
+                    retained = [dict(record, stale=True) for record in prior_boundary.get("product_declarations", [])
+                                if record.get("path") == declaration_path]
+                    if retained and prior_boundary.get("declared_id"):
+                        child["declared_id"] = prior_boundary["declared_id"]
+                        records = child.setdefault("product_declarations", [])
+                        if not any(not record.get("stale") for record in records):
+                            child["label"] = prior_boundary["label"]
+                        for record in retained:
+                            if record not in records:
+                                records.append(record)
+                            declaration_evidence = dict(type="owner_declaration", path=record["path"], stale=True,
+                                                        observed_at=record["observed_at"])
+                            if declaration_evidence not in child["evidence"]:
+                                child["evidence"].append(declaration_evidence)
                 edge(parent_id, child_id, evidence=boundary["evidence"])
-                if boundary["kind"] == "planet":
+                if boundary["kind"] == "planet" and root_id != child_id:
                     edge(root_id, child_id, relation="shares_repository", evidence=boundary["evidence"])
                 candidates.append((destination, child))
             for candidate_root, candidate_node in candidates:
@@ -1220,6 +1504,12 @@ def refresh(api, conn, cache_path, source_cache=None, progress=None):
                         if candidate_node is not target:
                             continue
                         relative = "."
+                    if (source.get("artifact") and (artifact / "source").is_dir()
+                            and (_linked_within(candidate_root, repository_root) or not candidate_root.is_dir())
+                            and not _snapshot_contains(source, relative)):
+                        # Keep the exact stale location/declaration, but do not
+                        # attach a missing subtree from a newer source snapshot.
+                        continue
                     if borrowed and not _snapshot_contains(source, relative):
                         # Native candidate DTOs prove their own recorded root,
                         # even in older fixture/partial artifacts without code.
@@ -1294,6 +1584,7 @@ def refresh(api, conn, cache_path, source_cache=None, progress=None):
                     edge(owner, district_id, evidence=group_evidence)
         reconciliation = _reconcile_places(entities, edges, root_nodes, old_nodes, warnings)
         reconciliation["lab_applications"] = _place_lab_applications(entities, edges, old_nodes)
+        product_succession = _product_succession(entities, edges, succession_diagnostics)
         edge_keys = {(record["source"], record["target"], record["relation"]) for record in edges}
         star_records, star_coverage = _star_inventory(inventory, source_by_root, path, old)
         for record in star_records:
@@ -1447,6 +1738,7 @@ def refresh(api, conn, cache_path, source_cache=None, progress=None):
                         sources={source_id: structure.get("application_coverage", {"complete": False, "reason": "Snapshot predates native app detection."})
                                  for source_id, structure in structures.items() if isinstance(structure, dict)}),
                     fleet=fleet["coverage"], stars=star_coverage, reconciliation=reconciliation,
+                    product_succession=product_succession,
                     warnings=warnings, history="Current evidence only; no historical as-of reconstruction.",
                     inventory="Indexed working directories and registered harvested sources; not a full disk inventory.",
                     ownership="Folder, manifest and experiment candidates are suggestions unless explicitly declared.",
@@ -1479,11 +1771,14 @@ def commands(node):
                 command.extend(["--path", relative])
         source_search.append(command)
     result = dict(explore=atlas + ["explore", identity], source_search=source_search,
-                  conversation_search=[atlas + ["search", node.get("suggested_query") or "<query>", "--within", cid]
-                                       for cid in node.get("conversation_collections", [])],
+                  conversation_search=([atlas + ["search", node.get("suggested_query") or "<query>",
+                                                "--within", identity, "--conversations"]]
+                                       if node.get("conversation_collections") else []),
                   show=atlas + ["show", identity],
                   search=atlas + ["search", "<query>", "--within", identity, "--space", "--evidence"],
                   navigate=atlas + ["navigate", "<query>", "--within", identity])
+    if node.get("conversation_collections"):
+        result["conversation_explore"] = atlas + ["explore", identity, "--conversations"]
     if kind in LIST_KINDS:
         result["list"] = [atlas + ["list", grouping, "--within", identity] for grouping in LIST_KINDS[kind]]
     if kind in ("galaxy", "system", "planet", "moon", "district", "star"):
@@ -1567,6 +1862,12 @@ def view(cache_path, action="list", kind="", within="", query="", limit=50, offs
             raise ValueError("Spatial scope " + ("is ambiguous; use its ID." if matches else "was not found: " + within))
         within = matches[0]
     within = within or GALAXY
+    # Berths describe the full cached fleet, not the current result page. They
+    # organize its presentation without moving a ship's semantic/physical home.
+    fleet_layout = None
+    if nodes[within]["kind"] == "starbase":
+        from navcom_fleet_layout import derive
+        fleet_layout = derive(data, within)
     children = defaultdict(list)
     for node in nodes.values():
         children[node["parent_id"]].append(node["id"])
@@ -1591,12 +1892,27 @@ def view(cache_path, action="list", kind="", within="", query="", limit=50, offs
             score = sum(3 if term in node["label"].casefold() else 1 for term in terms)
             scored.append((score, node))
     scored.sort(key=lambda pair: (-pair[0], pair[1]["kind"], pair[1]["label"].casefold(), pair[1]["id"]))
+    if fleet_layout and not terms and action in ("explore", "list"):
+        berth_order = {identity: (group_index, member_index)
+                       for group_index, group in enumerate(fleet_layout["groups"])
+                       for member_index, identity in enumerate(group["members"])}
+        scored.sort(key=lambda pair: berth_order.get(pair[1]["id"], (len(berth_order), 0)))
     total = len(scored)
     output = [node for _, node in scored[int(offset):int(offset) + int(limit)]]
     from navcom_place_overview import previews
     contents = previews(nodes.values(), [within, *[node["id"] for node in output]])
     # Commands are rebuilt on read, so charts published earlier offer current verbs.
     output = [{**node, "contents": contents[node["id"]], "commands": commands(node)} for node in output]
+    if fleet_layout:
+        assignments = fleet_layout["assignments"]
+        output = [{**node, **({"berth": assignments[node["id"]]} if node["id"] in assignments else {})}
+                  for node in output]
+        matched = {node["id"] for _, node in scored}
+        visible = {node["id"] for node in output}
+        fleet_layout["groups"] = [{**group,
+                                   "matched_count": len(matched.intersection(group["members"])),
+                                   "visible_count": len(visible.intersection(group["members"]))}
+                                  for group in fleet_layout["groups"]]
     breadcrumbs = []
     cursor = within
     visited = set()
@@ -1610,4 +1926,6 @@ def view(cache_path, action="list", kind="", within="", query="", limit=50, offs
                 query=query, center={**nodes[within], "contents": contents[within], "commands": commands(nodes[within])}, breadcrumbs=list(reversed(breadcrumbs)), nodes=output, entities=output,
                 edges=edges, coverage=data["coverage"], total=total, more=int(offset) + len(output) < total,
                 stored_copy_count=len(stored_copies) if action == "explore" and not kind and not query else 0,
-                offset=int(offset), limit=int(limit), search_scope="Cached place metadata; use destination commands for source and conversation contents.")
+                offset=int(offset), limit=int(limit),
+                **({"fleet_layout": fleet_layout} if fleet_layout else {}),
+                search_scope="Cached place metadata; use destination commands for source and conversation contents.")

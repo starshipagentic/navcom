@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import re
 import struct
 
 
@@ -29,8 +30,20 @@ def import_art(source, destination):
     catalog_bytes = catalog_path.read_bytes()
     catalog = json.loads(catalog_bytes)
     by_id = {a["id"]: a for a in catalog}
+    selections = [(role, asset_id, f"{role}.png") for role, asset_id in ROLES.items()]
+    for item in sorted(catalog, key=lambda entry: entry["id"]):
+        asset_id = item["id"]
+        # The native catalog calls cargo craft "facility"; preserve that
+        # provenance while explicitly including its existing vessel collection.
+        if ((item.get("kind") == "fleet" and not asset_id.endswith("/research-outpost"))
+                or asset_id.startswith("06-cargo-utility/")):
+            if not re.fullmatch(r"[a-z0-9]+(?:[-/][a-z0-9]+)*", asset_id):
+                raise ValueError(f"Unsafe asset ID: {asset_id}")
+            selections.append(("ship_variant", asset_id, "ship-" + asset_id.replace("/", "-") + ".png"))
+    if len({name for _, _, name in selections}) != len(selections):
+        raise ValueError("Catalog asset filenames collide")
     staged = []
-    for role, asset_id in ROLES.items():
+    for role, asset_id, filename in selections:
         item = by_id[asset_id]
         original = (atlas / item["image"]).resolve()
         if not original.is_relative_to(atlas):
@@ -39,8 +52,8 @@ def import_art(source, destination):
         if not content.startswith(b"\x89PNG\r\n\x1a\n") or len(content) < 24:
             raise ValueError(f"Not a PNG: {asset_id}")
         width, height = struct.unpack(">II", content[16:24])
-        staged.append((role, content, {"role": role, "id": asset_id,
-            "file": f"{role}.png", "sha256": hashlib.sha256(content).hexdigest(),
+        staged.append((filename, content, {"role": role, "id": asset_id,
+            "file": filename, "sha256": hashlib.sha256(content).hexdigest(),
             "bytes": len(content), "width": width, "height": height,
             "suggested_display_width": item.get("suggestedDisplayWidth"),
             "source_image": "art/atlas/" + item["image"],
@@ -50,8 +63,8 @@ def import_art(source, destination):
             "title": item.get("title")}))
     destination.mkdir(parents=True, exist_ok=True)
     copied = 0
-    for role, content, _ in staged:
-        target = destination / f"{role}.png"
+    for filename, content, _ in staged:
+        target = destination / filename
         if not target.exists() or target.read_bytes() != content:
             target.write_bytes(content)
             copied += 1

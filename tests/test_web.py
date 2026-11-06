@@ -103,7 +103,11 @@ def test_web_launch_uses_selected_plan(web, monkeypatch):
     server, request, key, _=web
     launched=[]
     monkeypatch.setattr(server.app.api.shutil,'which',lambda _: '/bin/true')
-    monkeypatch.setattr(server.app.api,'resume_in_new_tab',lambda plan:(launched.append(plan) or True,'opened'))
+    def launch(plan, *, allow_gui=False):
+        assert allow_gui is True
+        launched.append(plan)
+        return True,'opened'
+    monkeypatch.setattr(server.app.api,'resume_in_new_tab',launch)
     assert request('/api/launch',{'key':key})['ok']
     assert launched[0]['argv'][0:2]==['codex','resume']
     with pytest.raises(HTTPError): request('/api/launch',{'key':key,'harness':'sh; echo bad'})
@@ -166,6 +170,8 @@ def test_atlas_http_search_and_project_drilldown(web):
 
 
 def test_space_api_reuses_cli_contract_and_serves_only_packaged_art(web, monkeypatch, tmp_path):
+    import hashlib
+    import re
     import navcom_navigation
     import navcom_space
     server, request, key, index = web
@@ -178,15 +184,58 @@ def test_space_api_reuses_cli_contract_and_serves_only_packaged_art(web, monkeyp
         cli=navcom_navigation.view(server.app.api,conn,space_cache=cache,source_cache=sources,action='explore',limit=80)
     response=request('/api/space?action=explore&limit=80')
     assert response==cli
-    assert 'Galactic bridge' in request('/',token=False)
+    html = request('/',token=False)
+    assert 'Galactic bridge' in html and '__NAVCOM_SHIP_ART__' not in html
+    variants = json.loads(re.search(r'const NAVCOM_SHIP_ART=(.*?);const \$', html).group(1))
+    manifest = json.loads((ROOT/'assets/starship/manifest.json').read_text())
+    expected = [a for a in manifest['assets'] if a['role'] == 'ship_variant']
+    assert len(variants) == len(expected) == 33
+    assert all(set(item) == {'id', 'file', 'title', 'culture'} for item in variants)
+    assert {item['file'] for item in variants} == {item['file'] for item in expected}
     for route in ['/api/space','/api/space/refresh']:
         with pytest.raises(HTTPError) as caught:request(route,{} if route.endswith('refresh') else None,token=False)
         assert caught.value.code==403
     with urlopen(f'http://127.0.0.1:{server.server_port}/assets/starship/city.png') as art:
         assert art.headers['Content-Type'].startswith('image/png')
         assert art.read(8)==b'\x89PNG\r\n\x1a\n'
-    with pytest.raises(HTTPError) as caught:request('/assets/starship/../../navcom.py',token=False)
-    assert caught.value.code==404
+    chosen = expected[0]
+    with urlopen(f'http://127.0.0.1:{server.server_port}/assets/starship/'+chosen['file']) as art:
+        raw = art.read()
+        assert art.headers['Content-Type'].startswith('image/png')
+        assert raw.startswith(b'\x89PNG\r\n\x1a\n')
+        assert hashlib.sha256(raw).hexdigest() == chosen['sha256']
+    for name in ['../../navcom.py', '%2e%2e%2fnavcom.py', 'manifest.json', 'ship-not-packaged.png']:
+        with pytest.raises(HTTPError) as caught:request('/assets/starship/'+name,token=False)
+        assert caught.value.code==404
+    # Metadata is inert JSON even if a packaged title contains an HTML delimiter.
+    title = '</script><script>alert("fixture")</script>'
+    server.app.ship_art = [dict(variants[0], title=title)]
+    html = request('/', token=False)
+    assert title not in html and '\\u003c/script>' in html
+    assert json.loads(re.search(r'const NAVCOM_SHIP_ART=(.*?);const \$', html).group(1))[0]['title'] == title
+
+
+def test_packaged_art_manifest_rejects_nonflat_missing_and_symlink_entries(tmp_path):
+    root = tmp_path/'art';root.mkdir()
+    (root/'ship-good.png').write_bytes(b'fixture')
+    outside = tmp_path/'outside.png';outside.write_bytes(b'outside')
+    (root/'ship-linked.png').symlink_to(outside)
+    assets = [dict(role='ship_variant', id='fixture/'+name, title='Fixture', culture='Original', file=name)
+              for name in ['ship-good.png', 'ship-linked.png', '../outside.png', '/outside.png',
+                           'ship-missing.png', 'nested/ship.png', 'ship-good.png']]
+    (root/'manifest.json').write_text(json.dumps(dict(assets=assets)))
+    allowed, variants = navcom_web._packaged_art(root)
+    assert allowed == {'ship-good.png'}
+    assert len(variants) == 1 and variants[0]['file'] == 'ship-good.png'
+
+
+def test_packaged_art_keeps_original_role_fallback_without_valid_manifest(tmp_path):
+    (tmp_path/'ship.png').write_bytes(b'original role fixture')
+    (tmp_path/'unlisted.png').write_bytes(b'not a role')
+    assert navcom_web._packaged_art(tmp_path) == ({'ship.png'}, [])
+    for content in ['invalid JSON', '[]', '{"assets": "invalid"}']:
+        (tmp_path/'manifest.json').write_text(content)
+        assert navcom_web._packaged_art(tmp_path) == ({'ship.png'}, [])
 
 
 def test_space_refresh_retains_navigation_when_starforge_unavailable(web, monkeypatch, tmp_path):

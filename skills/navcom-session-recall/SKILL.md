@@ -153,6 +153,12 @@ retained snapshots. Version families are heuristic suggestions, and literal
 project references do not establish ownership or dated succession. Follow its
 source-page continuation command and exact read/search commands; no harvest or
 chart change occurs during relationship browsing.
+Explicit product replacements appear separately: `.navcom-space.json` at a
+repository root or discovered app can declare `id` and `supersedes` IDs. Ordinary
+`atlas refresh --space` reads them; app claims never apply to sibling products.
+Declared identities survive moves; first declaring an ID rekeys an automatic ID.
+Missing/conflicting claims remain unresolved; observation times are not dates of
+replacement, and current declarations are excluded from historical views.
 `atlas files PLACE --query WORDS` filters retained file paths and returns exact
 snapshot read commands. Follow its generation-pinned continuation command;
 missing paths remain explicit and budget-limited inventories cannot be paged.
@@ -164,7 +170,7 @@ or new harvest occurs.
 handover document. Preserve the returned catalog SHA with --catalog for paging
 or search-to-open continuity. --offset, --limit and --max-chars bound output.
 This uses the installed native Starship reader, never current host conversations
-or a captain resume. Remote ships remain unavailable.
+or a captain resume. Remote carried-dialogue reads remain unavailable.
 
 Source reads open immutable harvested bytes, never live working files. Preserve
 returned snapshot and published values when following windows. An exact unchanged
@@ -224,8 +230,14 @@ linked-worktree versus independent-copy evidence; --refresh rechecks locations.
 `navcom history land PLACE --cursor PIN --result-key KEY` enters a saved historical product; add --group ID or --query WORDS to inspect its exact native group or source scope.
 `navcom history conversations PLACE --at DATE` reads individually dated indexed turns.
 `navcom atlas ask STAR "question"` prepares a native Hermes handoff.
-`navcom atlas board SHIP --validate` checks a native captain route.
-Use --launch --review TOKEN only to open that reviewed action in a terminal.
+`navcom atlas board SHIP` previews a native captain route. For a recorded remote
+working ship, it discovers the existing fleet/commission receipt and performs
+bounded read-only SSH metadata checks. `--validate` checks the exact native
+thread/workspace using Starship's unchanged lookup helper; no turn is sent.
+`--route` is a local route-file override only. Missing or conflicting evidence
+stops the action; archives cannot board. Use --launch --review TOKEN only to
+revalidate and open the reviewed existing captain in a new terminal. No new
+captain or prompt is created. Terminal dispatch does not prove human takeover.
 `navcom voice status` checks existing local Whisper tools without loading a model.
 `navcom voice transcribe FILE` accepts a short mono 16 kHz PCM WAV.
 Historical ownership, live expert answers and captain takeover remain unverified.

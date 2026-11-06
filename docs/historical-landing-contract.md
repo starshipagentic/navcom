@@ -27,8 +27,11 @@ and execution deadline belong to the server, not the client request.
 
 - The cursor selects one existing immutable plan; `result_key` selects the exact
   saved query/limit result set. Missing results do not trigger current discovery.
-- The product must be a saved plan anchor, match its repository job and original
-  scope, and have a successful validated snapshot receipt.
+- The destination must be a saved plan anchor, or an application candidate
+  reproduced from that plan's pinned native analysis. Both must match their
+  original repository job and retained scope and have a validated snapshot
+  receipt. A derived application does not rewrite the saved plan or enlarge
+  the files it authorized.
 - Product files are the retained paths within that saved scope. A district is a
   suggestion from one existing native group, restricted to its exact members.
   Labels format the native evidence using the existing shared label helper.
@@ -41,10 +44,25 @@ and execution deadline belong to the server, not the client request.
   are not deployment dates. Native exclusions, partial grouping and undated
   conversation limitations remain visible.
 
+Native applications missing from today's address set can appear at their
+committed path. Their identity pins the exact job, commit, tree and application
+root; their label comes from committed authored metadata. They are application
+candidates, not inferred product replacements. An application inside a saved
+experiment remains a district within that moon. Dependency-only candidates and
+unsupported historical lab ownership are not promoted to independent planets.
+The returned present-day address is a navigation exit, not a claim that a current
+product is the historical application's successor.
+
 The bridge retains the origin system viewpoint and the selected product/group,
 result key and pin. Back returns to the earlier viewpoint; reload and links must
 reopen that same saved state. Search changes the query, never the date or pins.
 Explicit Return to present remains the route to current geography.
+
+A leaf application or district shows its committed files in the main workspace,
+with the exact date and commit and full relative paths. Search matches remain
+bound to that same landing receipt. This presentation uses the existing landing
+response; it adds no arrival request or fallback to today's files. The source
+reader and return actions remain the same as on other historical destinations.
 
 Journey links carry the camera. The URL holds `camera=SCALE_X_Y`: the absolute
 scale to four significant digits and the pan in whole pixels, updated with

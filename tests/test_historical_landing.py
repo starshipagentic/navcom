@@ -108,6 +108,43 @@ def test_native_landing_groups_search_reader_and_deleted_current_catalog(landing
     assert "FUTURE PRODUCT" not in json.dumps(warm) and "DIRTY CONTENT" not in json.dumps(warm)
 
 
+def test_current_product_declarations_and_succession_do_not_enter_dated_views(landing_fixture):
+    f = landing_fixture
+    current = json.loads(f["space_cache"].read_text())
+    for node in current["entities"]:
+        node["declared_id"] = "present-only-identity-" + node["id"]
+        node["product_declarations"] = [{"relation": "supersedes", "target": "planet:radar",
+                                         "basis": "present-only-declaration"}]
+    current["edges"].append({"source": "planet:lantern", "target": "planet:radar",
+                             "relation": "supersedes", "basis": "present-only-declaration"})
+    f["space_cache"].write_text(json.dumps(current))
+
+    # Start a fresh dated session from the enriched current chart. Replaying
+    # the fixture's earlier pin alone would not exercise anchor admission.
+    dated = system.view("galaxy:owner", "2025-04-01", space_cache=f["space_cache"],
+                        cache_path=f["cache_path"], seconds=30)
+    assert dated["session_id"] != f["result"]["session_id"]
+    request = dict(cursor=dated["cursor"], place_id=f["product_id"],
+                   result_key=dated["result_key"], cache_path=f["cache_path"])
+    product = landing.landing(**request)
+    group = next(node for node in product["nodes"] if node["kind"] == "district")
+    district = landing.landing(**request, group_id=group["id"])
+    assert product["center"]["label"] == "lantern-classic"
+    assert product["commit"] == district["commit"] == f["commit"]
+    assert [node["id"] for node in district["breadcrumbs"]] == [
+        "galaxy:owner", "system:orchard", "planet:lantern", group["id"]]
+
+    for data in (dated, product, district):
+        surface = {key: data[key] for key in ("nodes", "center", "breadcrumbs", "edges", "product", "selected_place")
+                   if key in data}
+        serialized = json.dumps(surface)
+        for forbidden in ("declared_id", "product_declarations", "supersedes", "present-only-"):
+            assert forbidden not in serialized
+        assert all(edge["relation"] in {"current_navigation_address", "committed_application_address", "committed_native_group"}
+                   for edge in data["edges"])
+    assert json.loads(f["space_cache"].read_text()) == current
+
+
 @pytest.mark.parametrize("changes",[dict(cursor="../bad:0"),dict(result_key="../../bad"),dict(limit=True),dict(seconds=float("nan")),dict(query="x"*501)])
 def test_invalid_landing_inputs_fail_before_process(tmp_path,monkeypatch,changes):
     def forbidden(*args,**kwargs):pytest.fail("Invalid input started a worker")
