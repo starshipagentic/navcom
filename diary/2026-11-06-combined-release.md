@@ -15,3 +15,8 @@ interpretation and product decisions remain the caller's responsibility.
 Raw private browser receipts stay local. The package contains runtime code,
 ship art, and the declared package resources, not those receipts. Existing
 earlier diary claims remain dated observations, not newly repeated tests.
+
+Final installed CLI verification found that `--version` still printed a hard-coded
+0.11.0 although the installed distribution and all packaged files matched 0.13.0.
+Release 0.13.1 corrects that label and adds a regression comparing the CLI with
+the distribution version. Navigation and retrieval behavior are unchanged.
